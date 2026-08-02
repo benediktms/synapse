@@ -1,5 +1,7 @@
 use adapters_sqlite::SqliteStore;
-use domain::{Error, Memory, MemoryId, MemoryKind, Scope, ScopeFilter, Store, Timestamp};
+use domain::{
+    EditRequest, Error, Memory, MemoryId, MemoryKind, Scope, ScopeFilter, Store, Timestamp,
+};
 use tempfile::TempDir;
 
 const MODEL: &str = "test-model";
@@ -25,6 +27,20 @@ fn mem(id: &MemoryId, content: &str, scope: Scope) -> Memory {
         pinned: false,
         created_at: ts(1),
         updated_at: ts(1),
+    }
+}
+
+fn content(text: &str) -> EditRequest {
+    EditRequest {
+        content: Some(text.to_string()),
+        ..EditRequest::default()
+    }
+}
+
+fn pin(pinned: bool) -> EditRequest {
+    EditRequest {
+        pinned: Some(pinned),
+        ..EditRequest::default()
     }
 }
 
@@ -81,21 +97,65 @@ async fn update_persists_fields_and_optionally_embedding() {
 
     memory.pinned = true;
     memory.updated_at = ts(2);
-    store.update(&memory, None).await.unwrap();
+    let returned = store
+        .update(&id, &pin(true), None, &memory.updated_at)
+        .await
+        .unwrap();
+    assert_eq!(returned, memory);
     assert_eq!(store.get(&id).await.unwrap().unwrap(), memory);
     assert_eq!(store.embeddings(&all()).await.unwrap()[0].1, vec4(0.1));
 
     memory.content = "new content".to_string();
     memory.updated_at = ts(3);
-    store.update(&memory, Some(&vec4(0.7))).await.unwrap();
+    store
+        .update(
+            &id,
+            &content("new content"),
+            Some(&vec4(0.7)),
+            &memory.updated_at,
+        )
+        .await
+        .unwrap();
     assert_eq!(store.get(&id).await.unwrap().unwrap(), memory);
     assert_eq!(store.embeddings(&all()).await.unwrap()[0].1, vec4(0.7));
 
-    let missing = mem(&MemoryId::generate(), "ghost", Scope::Workspace);
+    let ghost = MemoryId::generate();
     assert_eq!(
-        store.update(&missing, None).await.unwrap_err(),
-        Error::NotFound(missing.id.clone())
+        store
+            .update(&ghost, &pin(true), None, &ts(4))
+            .await
+            .unwrap_err(),
+        Error::NotFound(ghost)
     );
+}
+
+#[tokio::test]
+async fn interleaved_disjoint_edits_both_survive() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = MemoryId::generate();
+    let memory = mem(&id, "old content", Scope::Workspace);
+    store.insert(&memory, &vec4(0.1)).await.unwrap();
+
+    let editor = store.get(&id).await.unwrap().unwrap();
+    let pinner = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(editor, pinner);
+
+    store
+        .update(&id, &content("new content"), Some(&vec4(0.7)), &ts(2))
+        .await
+        .unwrap();
+    let merged = store.update(&id, &pin(true), None, &ts(3)).await.unwrap();
+
+    assert_eq!(merged.content, "new content");
+    assert!(merged.pinned);
+    assert_eq!(merged.tags, memory.tags);
+    assert_eq!(merged.kind, memory.kind);
+    assert_eq!(merged.scope, memory.scope);
+    assert_eq!(merged.created_at, memory.created_at);
+    assert_eq!(merged.updated_at, ts(3));
+    assert_eq!(store.get(&id).await.unwrap().unwrap(), merged);
+    assert_eq!(store.embeddings(&all()).await.unwrap()[0].1, vec4(0.7));
 }
 
 #[tokio::test]
@@ -117,15 +177,22 @@ async fn fts_stays_in_sync_through_save_edit_delete() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir).await;
     let id = MemoryId::generate();
-    let mut memory = mem(&id, "argocd deploy staging", Scope::Workspace);
+    let memory = mem(&id, "argocd deploy staging", Scope::Workspace);
     store.insert(&memory, &vec4(0.1)).await.unwrap();
     assert_eq!(
         store.keyword_search("argocd", &all(), 10).await.unwrap(),
         vec![id.clone()]
     );
 
-    memory.content = "datadog dashboard verification".to_string();
-    store.update(&memory, Some(&vec4(0.2))).await.unwrap();
+    store
+        .update(
+            &id,
+            &content("datadog dashboard verification"),
+            Some(&vec4(0.2)),
+            &ts(2),
+        )
+        .await
+        .unwrap();
     assert!(
         store
             .keyword_search("argocd", &all(), 10)
@@ -303,6 +370,63 @@ async fn open_is_rerunnable_and_enforces_meta() {
     let path = dir.path().join("ws.db");
     assert!(SqliteStore::open(&path, "other-model", DIM).await.is_err());
     assert!(SqliteStore::open(&path, MODEL, DIM + 1).await.is_err());
+}
+
+#[tokio::test]
+async fn populated_db_without_meta_fails_closed() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ws.db");
+    {
+        let store = open(&dir).await;
+        store
+            .insert(
+                &mem(&MemoryId::generate(), "fact", Scope::Workspace),
+                &vec4(0.1),
+            )
+            .await
+            .unwrap();
+    }
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM meta")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    assert!(SqliteStore::open(&path, "other-model", DIM).await.is_err());
+    assert!(SqliteStore::open(&path, MODEL, DIM).await.is_err());
+    assert!(SqliteStore::open_maintenance(&path).await.is_err());
+}
+
+#[tokio::test]
+async fn emptied_db_without_meta_reinitializes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ws.db");
+    let id = MemoryId::generate();
+    {
+        let store = open(&dir).await;
+        store
+            .insert(&mem(&id, "fact", Scope::Workspace), &vec4(0.1))
+            .await
+            .unwrap();
+        store.delete(&id).await.unwrap();
+    }
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM meta")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let store = SqliteStore::open(&path, "other-model", DIM).await.unwrap();
+    assert_eq!(
+        store.embedding_meta().await.unwrap(),
+        ("other-model".to_string(), DIM)
+    );
 }
 
 #[tokio::test]

@@ -79,30 +79,23 @@ pub async fn edit<S: Store, E: Embedder>(
     req: EditRequest,
     now: Timestamp,
 ) -> Result<Memory, Error> {
-    let mut memory = store
+    let current = store
         .get(id)
         .await?
         .ok_or_else(|| Error::NotFound(id.clone()))?;
-    let new_content = req.content.filter(|content| *content != memory.content);
-    let new_tags = req.tags.filter(|tags| *tags != memory.tags);
-    let new_pinned = req.pinned.filter(|pinned| *pinned != memory.pinned);
-    if new_content.is_none() && new_tags.is_none() && new_pinned.is_none() {
-        return Ok(memory);
+    let patch = EditRequest {
+        content: req.content.filter(|content| *content != current.content),
+        tags: req.tags.filter(|tags| *tags != current.tags),
+        pinned: req.pinned.filter(|pinned| *pinned != current.pinned),
+    };
+    if patch.content.is_none() && patch.tags.is_none() && patch.pinned.is_none() {
+        return Ok(current);
     }
-    let mut embedding = None;
-    if let Some(content) = new_content {
-        embedding = Some(embedder.embed(&content).await?);
-        memory.content = content;
-    }
-    if let Some(tags) = new_tags {
-        memory.tags = tags;
-    }
-    if let Some(pinned) = new_pinned {
-        memory.pinned = pinned;
-    }
-    memory.updated_at = now;
-    store.update(&memory, embedding.as_deref()).await?;
-    Ok(memory)
+    let embedding = match &patch.content {
+        Some(content) => Some(embedder.embed(content).await?),
+        None => None,
+    };
+    store.update(id, &patch, embedding.as_deref(), &now).await
 }
 
 pub async fn forget<S: Store>(store: &S, id: &MemoryId) -> Result<(), Error> {

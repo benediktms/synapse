@@ -2,9 +2,18 @@
 
 SQLite implementation of `domain::Store`. One `SqliteStore` instance owns one
 workspace database file: `SqliteStore::open(path, model, dim)` creates the file
-if missing, runs migrations, initialises the single-row `meta` table on first
-open, and refuses to open a database whose `meta` disagrees with the runtime
-embedding model or dimension.
+if missing, runs migrations, and refuses to open a database whose `meta`
+disagrees with the runtime embedding model or dimension.
+
+The single-row `meta` table is initialised only while `memories` is empty. A
+database that holds memories but no `meta` row fails to open: its vectors
+cannot be attributed to a model, and stamping the runtime model onto them would
+silently fuse two semantic spaces at recall time. Recover it from a backup, or
+re-import its export into a fresh database.
+
+`SqliteStore::update` applies only the fields present in the `EditRequest`
+(`UPDATE … SET col = COALESCE(?, col) … RETURNING`), so two concurrent edits to
+different fields cannot clobber each other.
 
 ## sqlx offline workflow
 

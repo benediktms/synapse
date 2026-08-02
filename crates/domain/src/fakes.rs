@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::error::Error;
-use crate::memory::{Memory, MemoryId};
+use crate::memory::{Memory, MemoryId, Timestamp};
 use crate::ports::{Embedder, ScopeFilter, Store};
+use crate::usecases::EditRequest;
 
 #[derive(Default)]
 pub struct FakeStore {
@@ -57,16 +58,31 @@ impl Store for FakeStore {
         Ok(())
     }
 
-    async fn update(&self, memory: &Memory, embedding: Option<&[f32]>) -> Result<(), Error> {
+    async fn update(
+        &self,
+        id: &MemoryId,
+        patch: &EditRequest,
+        embedding: Option<&[f32]>,
+        now: &Timestamp,
+    ) -> Result<Memory, Error> {
         let mut rows = self.rows.lock().unwrap();
-        let Some(row) = rows.get_mut(&memory.id) else {
-            return Err(Error::NotFound(memory.id.clone()));
+        let Some((memory, stored)) = rows.get_mut(id) else {
+            return Err(Error::NotFound(id.clone()));
         };
-        row.0 = memory.clone();
-        if let Some(embedding) = embedding {
-            row.1 = embedding.to_vec();
+        if let Some(content) = &patch.content {
+            memory.content = content.clone();
         }
-        Ok(())
+        if let Some(tags) = &patch.tags {
+            memory.tags = tags.clone();
+        }
+        if let Some(pinned) = patch.pinned {
+            memory.pinned = pinned;
+        }
+        memory.updated_at = now.clone();
+        if let Some(embedding) = embedding {
+            *stored = embedding.to_vec();
+        }
+        Ok(memory.clone())
     }
 
     async fn delete(&self, id: &MemoryId) -> Result<bool, Error> {

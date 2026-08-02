@@ -1,7 +1,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use domain::{Embedder, Error, Memory, MemoryId, MemoryKind, Scope, ScopeFilter, Store, Timestamp};
+use domain::{
+    EditRequest, Embedder, Error, Memory, MemoryId, MemoryKind, Scope, ScopeFilter, Store,
+    Timestamp,
+};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
@@ -24,15 +27,28 @@ impl SqliteStore {
     ) -> Result<Self, Error> {
         let pool = connect(path, true).await?;
         let dim = i64::try_from(embedding_dim).map_err(store_err)?;
-        sqlx::query!(
-            "INSERT INTO meta (id, embedding_model, embedding_dim) VALUES (1, ?, ?) \
-             ON CONFLICT (id) DO NOTHING",
-            embedding_model,
-            dim
-        )
-        .execute(&pool)
-        .await
-        .map_err(store_err)?;
+        if !meta_exists(&pool).await? {
+            let memories = sqlx::query_scalar!(r#"SELECT COUNT(*) AS "count!" FROM memories"#)
+                .fetch_one(&pool)
+                .await
+                .map_err(store_err)?;
+            if memories > 0 {
+                return Err(Error::Store(format!(
+                    "{memories} memories but no embedding meta row: their vectors cannot be \
+                     attributed to a model and will not be re-embedded — restore the database \
+                     from a backup, or re-import its export into a fresh one"
+                )));
+            }
+            sqlx::query!(
+                "INSERT INTO meta (id, embedding_model, embedding_dim) VALUES (1, ?, ?) \
+                 ON CONFLICT (id) DO NOTHING",
+                embedding_model,
+                dim
+            )
+            .execute(&pool)
+            .await
+            .map_err(store_err)?;
+        }
         let meta = sqlx::query!("SELECT embedding_model, embedding_dim FROM meta WHERE id = 1")
             .fetch_one(&pool)
             .await
@@ -177,53 +193,47 @@ impl Store for SqliteStore {
         }
     }
 
-    async fn update(&self, memory: &Memory, embedding: Option<&[f32]>) -> Result<(), Error> {
-        let id = memory.id.as_str();
-        let kind = memory.kind.as_str();
-        let scope = memory.scope.as_str();
-        let tags = serde_json::to_string(&memory.tags).map_err(store_err)?;
-        let pinned = memory.pinned as i64;
-        let updated_at = memory.updated_at.as_str();
-        let result = match embedding {
-            Some(embedding) => {
-                let blob = encode_embedding(embedding, self.dim)?;
-                sqlx::query!(
-                    "UPDATE memories SET content = ?, kind = ?, scope = ?, tags = ?, \
-                     pinned = ?, embedding = ?, updated_at = ? WHERE id = ?",
-                    memory.content,
-                    kind,
-                    scope,
-                    tags,
-                    pinned,
-                    blob,
-                    updated_at,
-                    id
-                )
-                .execute(&self.pool)
-                .await
-            }
-            None => {
-                sqlx::query!(
-                    "UPDATE memories SET content = ?, kind = ?, scope = ?, tags = ?, \
-                     pinned = ?, updated_at = ? WHERE id = ?",
-                    memory.content,
-                    kind,
-                    scope,
-                    tags,
-                    pinned,
-                    updated_at,
-                    id
-                )
-                .execute(&self.pool)
-                .await
-            }
-        }
-        .map_err(store_err)?;
-        if result.rows_affected() == 0 {
-            Err(Error::NotFound(memory.id.clone()))
-        } else {
-            Ok(())
-        }
+    async fn update(
+        &self,
+        id: &MemoryId,
+        patch: &EditRequest,
+        embedding: Option<&[f32]>,
+        now: &Timestamp,
+    ) -> Result<Memory, Error> {
+        let content = patch.content.as_deref();
+        let tags = patch
+            .tags
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(store_err)?;
+        let pinned = patch.pinned.map(i64::from);
+        let blob = embedding
+            .map(|embedding| encode_embedding(embedding, self.dim))
+            .transpose()?;
+        let updated_at = now.as_str();
+        let key = id.as_str();
+        sqlx::query_as!(
+            MemoryRow,
+            r#"UPDATE memories SET content = COALESCE(?, content), tags = COALESCE(?, tags),
+                   pinned = COALESCE(?, pinned), embedding = COALESCE(?, embedding),
+                   updated_at = ?
+               WHERE id = ?
+               RETURNING id AS "id!", content AS "content!", kind AS "kind!", scope AS "scope!",
+                   tags AS "tags!", pinned AS "pinned!", created_at AS "created_at!",
+                   updated_at AS "updated_at!""#,
+            content,
+            tags,
+            pinned,
+            blob,
+            updated_at,
+            key
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err)?
+        .ok_or_else(|| Error::NotFound(id.clone()))
+        .and_then(Memory::try_from)
     }
 
     async fn delete(&self, id: &MemoryId) -> Result<bool, Error> {
@@ -295,6 +305,14 @@ impl Store for SqliteStore {
             .map(|row| MemoryId::parse(&row.id))
             .collect()
     }
+}
+
+async fn meta_exists(pool: &SqlitePool) -> Result<bool, Error> {
+    sqlx::query_scalar!(r#"SELECT COUNT(*) AS "count!" FROM meta WHERE id = 1"#)
+        .fetch_one(pool)
+        .await
+        .map(|count| count > 0)
+        .map_err(store_err)
 }
 
 async fn connect(path: impl AsRef<Path>, create_if_missing: bool) -> Result<SqlitePool, Error> {
