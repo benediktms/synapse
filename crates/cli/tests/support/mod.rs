@@ -17,6 +17,8 @@ pub struct Recorded {
 pub enum Behavior {
     /// Store the memory, then hang up without answering.
     DropAfterCommit,
+    /// Store the memory, then answer 200 with a body the client cannot decode.
+    UndecodableSuccess,
     Status(u16, String),
 }
 
@@ -69,6 +71,20 @@ impl Stub {
     pub fn with<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
         f(&mut self.state.lock().unwrap())
     }
+}
+
+/// Holds the outbox lock the way a concurrently running `syn` would.
+pub fn flock(path: &std::path::Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .expect("open lock");
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(taken, 0, "lock was already held");
+    file
 }
 
 /// A port nothing is listening on, reusable later by `Stub::start_on`.
@@ -132,6 +148,10 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<State>>) {
                 state.memories.insert(id, body);
                 return;
             }
+            Some(Behavior::UndecodableSuccess) => {
+                state.memories.insert(id, body);
+                return respond(stream, 200, r#"{"id":42,"unexpected":"shape"}"#);
+            }
             None => {}
         }
         let existing = state.memories.insert(id.clone(), body.clone());
@@ -157,6 +177,15 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<State>>) {
             .clone()
             .unwrap_or_else(|| r#"{"pinned":[],"recent_project":[],"shared_user":[]}"#.to_string()),
         "/memories" => r#"{"memories":[]}"#.to_string(),
+        "/export" => {
+            let memories: Vec<serde_json::Value> = state
+                .memories
+                .iter()
+                .map(|(id, body)| serde_json::from_str(&memory_json(id, body)).unwrap())
+                .collect();
+            serde_json::json!({"version": 1, "origin": {"workspace": "work"}, "memories": memories})
+                .to_string()
+        }
         "/workspaces" => r#"{"workspaces":["shared","work"]}"#.to_string(),
         _ => return respond(stream, 404, r#"{"error":"stub has no route"}"#),
     };

@@ -20,6 +20,10 @@ use crate::resolve;
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const BULK_TIMEOUT: Duration = Duration::from_secs(60);
+/// One total budget for the pre-read flush, so a backlog cannot push a read past the
+/// session hook's ten seconds however many items are queued.
+const FLUSH_BUDGET: Duration = Duration::from_secs(2);
+const FLUSH_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub fn run(cli: Cli) -> Result<(), String> {
     let config = Config::load()?;
@@ -63,11 +67,28 @@ impl Context {
     }
 }
 
-/// Read commands drain the outbox first so a queued save becomes recallable at the
-/// first opportunity; an outage here must not fail the read itself.
-fn flush_quietly(client: &SynapseApiClient) {
-    if let Ok(outbox) = Outbox::open() {
-        let _ = outbox.flush(client);
+/// Read commands drain the outbox first so a queued save becomes recallable at the first
+/// opportunity; an outage here must not fail the read, but it must not pass unmentioned
+/// either — whatever stays queued is missing from what the read is about to print.
+fn flush_before_read(ctx: &Context) {
+    let Ok(outbox) = Outbox::open() else {
+        return;
+    };
+    let flushed = ctx
+        .client(FLUSH_SEND_TIMEOUT)
+        .and_then(|client| outbox.flush(&client, Some(FLUSH_BUDGET)));
+    let Ok(report) = flushed else {
+        return;
+    };
+    for (id, failure) in &report.dead_lettered {
+        eprintln!("note: {id} moved to dead-letter: {failure}");
+    }
+    if report.still_queued > 0 {
+        let reason = report.deferred.as_deref().unwrap_or("still unsent");
+        eprintln!(
+            "note: {} saves are queued locally ({reason}); this read may predate them — see: syn list --pending",
+            report.still_queued
+        );
     }
 }
 
@@ -119,7 +140,7 @@ fn queue_and_flush(client: &SynapseApiClient, target: SaveTarget) -> Result<(), 
     };
     let outbox = Outbox::open()?;
     outbox.enqueue(&item)?;
-    let report = outbox.flush(client)?;
+    let report = outbox.flush(client, None)?;
     if report.sent.contains(&id) {
         println!("saved {id} ({where_to})");
         return Ok(());
@@ -143,7 +164,7 @@ fn report_backlog(report: &FlushReport) {
 
 fn recall(ctx: &Context, args: RecallArgs) -> Result<(), String> {
     let client = ctx.client(READ_TIMEOUT)?;
-    flush_quietly(&client);
+    flush_before_read(ctx);
     let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
     let scope = ctx.scope(args.project.as_deref())?;
     let started = Instant::now();
@@ -182,7 +203,7 @@ fn recall(ctx: &Context, args: RecallArgs) -> Result<(), String> {
 
 fn context(ctx: &Context, args: ContextArgs) -> Result<(), String> {
     let client = ctx.client(READ_TIMEOUT)?;
-    flush_quietly(&client);
+    flush_before_read(ctx);
     let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
     let scope = ctx.scope(args.project.as_deref())?;
     let digest = client
@@ -263,7 +284,7 @@ fn list(ctx: &Context, args: ListArgs) -> Result<(), String> {
         return pending(args);
     }
     let client = ctx.client(READ_TIMEOUT)?;
-    flush_quietly(&client);
+    flush_before_read(ctx);
     let target = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
     let memories = match &target {
         Origin::Preference => client.list_preferences(),
@@ -324,7 +345,7 @@ fn age(now: u64, queued_at: u64) -> String {
 
 fn show(ctx: &Context, args: IdArgs) -> Result<(), String> {
     let client = ctx.client(READ_TIMEOUT)?;
-    flush_quietly(&client);
+    flush_before_read(ctx);
     let target = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
     let memory = match &target {
         Origin::Preference => client.get_preference(&args.id),
@@ -394,6 +415,7 @@ fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
 
 fn export(ctx: &Context, args: WorkspaceArgs) -> Result<(), String> {
     let client = ctx.client(BULK_TIMEOUT)?;
+    drain_before_export(&client)?;
     let target = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
     let doc = match &target {
         Origin::Preference => client.export_preferences(),
@@ -402,6 +424,27 @@ fn export(ctx: &Context, args: WorkspaceArgs) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     println!("{json}");
+    Ok(())
+}
+
+/// A dump is only a backup once this machine's queue is on the server, so an unflushable
+/// backlog fails the export rather than writing a quietly incomplete file.
+fn drain_before_export(client: &SynapseApiClient) -> Result<(), String> {
+    let outbox = Outbox::open()?;
+    let report = outbox.flush(client, None)?;
+    report_backlog(&report);
+    if report.still_queued > 0 {
+        return Err(format!(
+            "{} saves are still queued locally and would be missing from this dump (see: syn list --pending)",
+            report.still_queued
+        ));
+    }
+    let dead_lettered = outbox.dead_letters()?.len();
+    if dead_lettered > 0 {
+        eprintln!(
+            "note: {dead_lettered} dead-lettered saves never reached the server and are not in this dump (see: syn list --pending)"
+        );
+    }
     Ok(())
 }
 

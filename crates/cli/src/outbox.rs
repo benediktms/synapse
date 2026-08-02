@@ -2,13 +2,13 @@ use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{PutMemoryBody, PutPreferenceBody};
 use api_client::SynapseApiClient;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{private_dir, state_dir, write_private};
+use crate::config::{private_dir, state_dir, sync_parent, write_private};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "target", rename_all = "lowercase")]
@@ -46,6 +46,7 @@ pub struct FlushReport {
     pub sent: Vec<String>,
     pub dead_lettered: Vec<(String, String)>,
     pub deferred: Option<String>,
+    pub still_queued: usize,
 }
 
 pub struct Outbox {
@@ -86,13 +87,30 @@ impl Outbox {
     }
 
     /// Sends queued saves oldest-first, stopping at the first retryable failure so
-    /// ordering survives an outage. Returns an empty report if another `syn` holds the lock.
-    pub fn flush(&self, client: &SynapseApiClient) -> Result<FlushReport, String> {
+    /// ordering survives an outage. `budget` bounds the whole call — lock wait included —
+    /// for callers that must return within a deadline; `None` waits for the lock and
+    /// drains the queue. `still_queued` always reports what remains unsent.
+    pub fn flush(
+        &self,
+        client: &SynapseApiClient,
+        budget: Option<Duration>,
+    ) -> Result<FlushReport, String> {
         let mut report = FlushReport::default();
-        let Some(_lock) = lock(&self.dir.join(".lock"), false)? else {
+        let deadline = budget.map(|budget| Instant::now() + budget);
+        let held = match deadline {
+            Some(deadline) => lock_until(&self.dir.join(".lock"), deadline)?,
+            None => lock(&self.dir.join(".lock"), true)?,
+        };
+        let Some(_lock) = held else {
+            report.deferred = Some("another syn is flushing the outbox".to_string());
+            report.still_queued = self.pending()?.len();
             return Ok(report);
         };
         for (path, item) in self.pending()? {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                report.deferred = Some("flush budget spent before the queue drained".to_string());
+                break;
+            }
             let sent = match &item.target {
                 SaveTarget::Memory { workspace, body } => {
                     client.save(workspace, &item.id, body).map(drop)
@@ -120,6 +138,7 @@ impl Outbox {
                 }
             }
         }
+        report.still_queued = self.pending()?.len();
         Ok(report)
     }
 
@@ -196,7 +215,8 @@ fn read_items(dir: &Path) -> Result<Vec<(PathBuf, PendingSave)>, String> {
 }
 
 fn remove(path: &Path) -> Result<(), String> {
-    fs::remove_file(path).map_err(|e| format!("cannot remove {}: {e}", path.display()))
+    fs::remove_file(path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
+    sync_parent(path)
 }
 
 pub fn now_millis() -> u64 {
@@ -227,6 +247,18 @@ fn lock(path: &Path, block: bool) -> Result<Option<fs::File>, String> {
     match err.raw_os_error() {
         Some(libc::EWOULDBLOCK) if !block => Ok(None),
         _ => Err(format!("cannot lock {}: {err}", path.display())),
+    }
+}
+
+fn lock_until(path: &Path, deadline: Instant) -> Result<Option<fs::File>, String> {
+    loop {
+        if let Some(file) = lock(path, false)? {
+            return Ok(Some(file));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

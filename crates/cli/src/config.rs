@@ -92,7 +92,8 @@ pub fn private_dir(dir: &Path) -> Result<(), String> {
         .recursive(true)
         .mode(0o700)
         .create(dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    sync_parent(dir)
 }
 
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -108,7 +109,19 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .and_then(|()| file.sync_all())
         .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     drop(file);
-    fs::rename(&tmp, path).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    fs::rename(&tmp, path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    sync_parent(path)
+}
+
+/// A rename or unlink only survives power loss once the directory entry itself is on disk.
+pub fn sync_parent(path: &Path) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|e| format!("cannot sync {}: {e}", dir.display()))
 }
 
 #[cfg(test)]

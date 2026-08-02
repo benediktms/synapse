@@ -101,8 +101,13 @@ Notes that matter when restoring:
   the collision rather than forcing it.
 - Preferences ("applies everywhere" memories, written with `syn remember`) are a separate
   dump. Forgetting `--preference` silently leaves them out of the backup.
-- Anything still sitting in a client's outbox is not in any dump. Flush the clients
-  (`syn list --pending`) before treating a backup as complete.
+- A queued save is not on the server, so it is in no dump. `syn export` drains this
+  machine's outbox first and refuses to write anything while saves remain queued — a
+  backup either includes them or fails. It cannot see *other* machines' outboxes, so run
+  the export from each client that might be holding saves, or clear them there first.
+- Dead-lettered saves were rejected outright and will never reach a dump. `syn export`
+  names them on stderr; `syn list --pending` shows why, and reassign or discard resolves
+  them.
 
 ## Verification drills
 
