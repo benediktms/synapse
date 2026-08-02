@@ -1,5 +1,6 @@
 use crate::error::Error;
-use crate::memory::{Memory, MemoryId, Scope};
+use crate::memory::{Memory, MemoryId, Scope, Timestamp};
+use crate::usecases::EditRequest;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScopeFilter {
@@ -18,7 +19,13 @@ impl ScopeFilter {
 pub trait Store {
     async fn get(&self, id: &MemoryId) -> Result<Option<Memory>, Error>;
     async fn insert(&self, memory: &Memory, embedding: &[f32]) -> Result<(), Error>;
-    async fn update(&self, memory: &Memory, embedding: Option<&[f32]>) -> Result<(), Error>;
+    async fn update(
+        &self,
+        id: &MemoryId,
+        patch: &EditRequest,
+        embedding: Option<&[f32]>,
+        now: &Timestamp,
+    ) -> Result<Memory, Error>;
     async fn delete(&self, id: &MemoryId) -> Result<bool, Error>;
     async fn list(&self) -> Result<Vec<Memory>, Error>;
     async fn embeddings(&self, filter: &ScopeFilter) -> Result<Vec<(MemoryId, Vec<f32>)>, Error>;
