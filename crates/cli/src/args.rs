@@ -15,7 +15,7 @@ pub enum Command {
     Save(SaveArgs),
     /// Save a memory that applies everywhere, in every workspace and project
     Remember(RememberArgs),
-    /// Hybrid search over the active workspace and `shared`
+    /// Hybrid search over the active workspace and the memories that apply everywhere
     Recall(RecallArgs),
     /// Session-start digest for the current project
     Context(ContextArgs),

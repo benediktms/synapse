@@ -3,7 +3,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use support::{Behavior, Stub, dead_port};
+use support::{Behavior, Stub, dead_port, flock};
 use tempfile::TempDir;
 
 struct Machine {
@@ -244,6 +244,126 @@ fn a_5xx_defers_the_queue_instead_of_dead_lettering_it() {
     );
     assert_eq!(json_files(&machine.outbox()).len(), 1);
     assert!(json_files(&machine.outbox().join("dead-letter")).is_empty());
+}
+
+#[test]
+fn export_refuses_an_incomplete_dump_and_flushes_the_queue_once_the_server_returns() {
+    let port = dead_port();
+    let machine = Machine::new(&format!("http://127.0.0.1:{port}"));
+    let queued = machine.run(&["save", "saved during the outage", "--type", "project"]);
+    assert!(
+        stdout(&queued).contains("queued locally"),
+        "{}",
+        stdout(&queued)
+    );
+
+    let refused = machine.run(&["export", "--workspace", "work"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("still queued locally"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        stdout(&refused),
+        "",
+        "an incomplete dump was written anyway"
+    );
+
+    let stub = Stub::start_on(port);
+    let exported = machine.run(&["export", "--workspace", "work"]);
+
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    assert!(json_files(&machine.outbox()).is_empty());
+    assert!(
+        stdout(&exported).contains("saved during the outage"),
+        "the dump omitted the queued save: {}",
+        stdout(&exported)
+    );
+    stub.with(|state| assert_eq!(state.puts().len(), 1));
+}
+
+#[test]
+fn a_read_says_so_when_it_may_predate_a_queued_save() {
+    let machine = Machine::new(&format!("http://127.0.0.1:{}", dead_port()));
+    assert!(
+        machine
+            .run(&["save", "unsendable", "--type", "project"])
+            .status
+            .success()
+    );
+
+    let read = machine.run(&["recall", "unsendable"]);
+
+    assert!(!read.status.success(), "the read itself needs the server");
+    assert!(
+        stderr(&read).contains("1 saves are queued locally")
+            && stderr(&read).contains("this read may predate them"),
+        "{}",
+        stderr(&read)
+    );
+}
+
+#[test]
+fn a_read_stays_within_its_flush_budget_when_another_process_holds_the_lock() {
+    let port = dead_port();
+    let machine = Machine::new(&format!("http://127.0.0.1:{port}"));
+    assert!(
+        machine
+            .run(&["save", "held back", "--type", "project"])
+            .status
+            .success()
+    );
+    let _held = flock(&machine.outbox().join(".lock"));
+    let stub = Stub::start_on(port);
+
+    let started = std::time::Instant::now();
+    let read = machine.run(&["context"]);
+
+    assert!(read.status.success(), "{}", stderr(&read));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "the read waited {:?} on a lock it could not get",
+        started.elapsed()
+    );
+    assert!(
+        stderr(&read).contains("another syn is flushing the outbox"),
+        "{}",
+        stderr(&read)
+    );
+    assert_eq!(json_files(&machine.outbox()).len(), 1);
+    stub.with(|state| assert!(state.puts().is_empty()));
+}
+
+#[test]
+fn an_unreadable_success_is_retried_under_the_same_id_rather_than_dead_lettered() {
+    let stub = Stub::start();
+    stub.script(vec![Behavior::UndecodableSuccess]);
+    let machine = Machine::new(&stub.url());
+
+    let output = machine.run(&["save", "committed but unreadable", "--type", "project"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("queued locally"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(json_files(&machine.outbox()).len(), 1);
+    assert!(
+        json_files(&machine.outbox().join("dead-letter")).is_empty(),
+        "an unreadable 2xx was dead-lettered; the retry would duplicate the memory"
+    );
+
+    let retry = machine.run(&["recall", "anything"]);
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    assert!(json_files(&machine.outbox()).is_empty());
+    stub.with(|state| {
+        let puts = state.puts();
+        assert_eq!(puts.len(), 2, "expected one send plus one retry");
+        assert_eq!(puts[0].path, puts[1].path, "retry minted a new id");
+        assert_eq!(state.memories.len(), 1, "retry created a duplicate memory");
+    });
 }
 
 #[test]

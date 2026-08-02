@@ -20,11 +20,12 @@ pub enum ClientError {
 }
 
 impl ClientError {
+    /// Only a definitive rejection is safe to give up on. An unreadable 2xx may sit on top
+    /// of a committed write, and replaying it under the same id is cheaper than a duplicate.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(_) => true,
+            Self::Transport(_) | Self::Decode(_) => true,
             Self::Status { status, .. } => *status >= 500 || *status == 408 || *status == 429,
-            Self::Decode(_) => false,
         }
     }
 }
@@ -319,6 +320,10 @@ mod tests {
     fn retryability_splits_on_status_class() {
         let transport = ClientError::Transport("connection refused".into());
         assert!(transport.is_retryable());
+        assert!(
+            ClientError::Decode("expected value at line 1".into()).is_retryable(),
+            "an unreadable 2xx may follow a committed write"
+        );
         for status in [500, 502, 503, 408, 429] {
             assert!(
                 ClientError::Status {
