@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE memories SET content = ?, kind = ?, scope = ?, tags = ?, pinned = ?, embedding = ?, updated_at = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "19d59f7755eb9bd09446ca46ff6bed71955ca3689743b256b8b4dae02a8273fe"
+}
