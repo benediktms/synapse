@@ -11,7 +11,8 @@ const SKILL_BODY: &str = include_str!("../../assets/skills/synapse/SKILL.md");
 const HOOK_BODY: &str = include_str!("../../assets/hooks/session-start.sh");
 const MARKER: &str = "synapse:managed 1";
 
-const CODEX_SESSION_NOTE: &str = "\n## No digest is injected here\n\nThis install registers no session-start hook, so nothing puts the digest in\nfront of you. Run `syn context` yourself at the start of a session, before the\nfirst substantive step.\n";
+/// Codex has no match-everything wildcard, so the events are named outright.
+const CODEX_MATCHER: &str = "startup|resume|clear|compact";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Harness {
@@ -98,48 +99,57 @@ pub fn install(
 fn targets(harness: Harness, home: &Path) -> Result<Vec<Target>, String> {
     let skill = Target::Owned(Owned {
         path: home.join("skills/synapse/SKILL.md"),
-        body: skill_body(harness),
+        body: SKILL_BODY.to_string(),
         style: Comment::Html,
         executable: false,
     });
-    match harness {
-        Harness::Codex => Ok(vec![skill]),
+    let (script, hook) = match harness {
         Harness::Claude => {
             let script = home.join("hooks/synapse-session-start.sh");
-            let command = quote(&script)?;
-            Ok(vec![
-                skill,
-                hook_script(script.clone()),
-                Target::JsonHook(JsonHook {
-                    path: home.join("settings.json"),
-                    keys: vec!["hooks".into(), "SessionStart".into()],
-                    defaults: Vec::new(),
-                    entry: json!({
-                        "matcher": "*",
-                        "hooks": [{ "type": "command", "command": command, "timeout": 10 }],
-                    }),
-                    owned_by: path_str(&script)?.to_string(),
-                    label: "SessionStart hook",
-                }),
-            ])
+            let hook = matched_hook(home.join("settings.json"), "*", &script)?;
+            (script, hook)
+        }
+        Harness::Codex => {
+            let script = home.join("hooks/synapse-session-start.sh");
+            let hook = matched_hook(home.join("hooks.json"), CODEX_MATCHER, &script)?;
+            (script, hook)
         }
         Harness::Copilot => {
             let script = home.join("synapse-session-start.sh");
-            let command = format!("{} --json", quote(&script)?);
-            Ok(vec![
-                skill,
-                hook_script(script.clone()),
-                Target::JsonHook(JsonHook {
-                    path: home.join("hooks/synapse.json"),
-                    keys: vec!["hooks".into(), "sessionStart".into()],
-                    defaults: vec![("version".into(), json!(1))],
-                    entry: json!({ "type": "command", "bash": command, "timeoutSec": 10 }),
-                    owned_by: path_str(&script)?.to_string(),
-                    label: "sessionStart hook",
-                }),
-            ])
+            let hook = copilot_hook(home.join("hooks/synapse.json"), &script)?;
+            (script, hook)
         }
-    }
+    };
+    Ok(vec![skill, hook_script(script), hook])
+}
+
+/// Claude Code and Codex CLI share a hook shape: an event holds matcher groups,
+/// each group holding the handlers that run.
+fn matched_hook(path: PathBuf, matcher: &str, script: &Path) -> Result<Target, String> {
+    let command = quote(script)?;
+    Ok(Target::JsonHook(JsonHook {
+        path,
+        keys: vec!["hooks".into(), "SessionStart".into()],
+        defaults: Vec::new(),
+        entry: json!({
+            "matcher": matcher,
+            "hooks": [{ "type": "command", "command": command, "timeout": 10 }],
+        }),
+        owned_by: path_str(script)?.to_string(),
+        label: "SessionStart hook",
+    }))
+}
+
+fn copilot_hook(path: PathBuf, script: &Path) -> Result<Target, String> {
+    let command = format!("{} --json", quote(script)?);
+    Ok(Target::JsonHook(JsonHook {
+        path,
+        keys: vec!["hooks".into(), "sessionStart".into()],
+        defaults: vec![("version".into(), json!(1))],
+        entry: json!({ "type": "command", "bash": command, "timeoutSec": 10 }),
+        owned_by: path_str(script)?.to_string(),
+        label: "sessionStart hook",
+    }))
 }
 
 fn hook_script(path: PathBuf) -> Target {
@@ -149,13 +159,6 @@ fn hook_script(path: PathBuf) -> Target {
         style: Comment::Hash,
         executable: true,
     })
-}
-
-fn skill_body(harness: Harness) -> String {
-    match harness {
-        Harness::Codex => format!("{SKILL_BODY}{CODEX_SESSION_NOTE}"),
-        _ => SKILL_BODY.to_string(),
-    }
 }
 
 enum Target {
@@ -585,6 +588,7 @@ mod tests {
         for (harness, config, event) in [
             (Harness::Claude, "settings.json", "SessionStart"),
             (Harness::Copilot, "hooks/synapse.json", "sessionStart"),
+            (Harness::Codex, "hooks.json", "SessionStart"),
         ] {
             let sandbox = Sandbox::new();
             sandbox.install(harness, &fresh());
@@ -723,13 +727,42 @@ mod tests {
     }
 
     #[test]
-    fn the_codex_skill_says_to_fetch_the_digest_itself() {
+    fn every_harness_gets_the_same_skill() {
         let sandbox = Sandbox::new();
+        let installed: Vec<String> = Harness::all()
+            .iter()
+            .map(|&harness| {
+                sandbox.install(harness, &fresh());
+                fs::read_to_string(sandbox.homes.of(harness).join("skills/synapse/SKILL.md"))
+                    .expect("read")
+            })
+            .collect();
+        assert!(installed.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn the_codex_hook_names_its_session_events_and_spares_the_other_events() {
+        let sandbox = Sandbox::new();
+        let config = sandbox.homes.codex.join("hooks.json");
+        fs::create_dir_all(&sandbox.homes.codex).expect("home");
+        fs::write(
+            &config,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":"audit.sh"}]}]}}"#,
+        )
+        .expect("seed");
+
         sandbox.install(Harness::Codex, &fresh());
-        let skill =
-            fs::read_to_string(sandbox.homes.codex.join("skills/synapse/SKILL.md")).expect("read");
-        assert!(skill.contains("No digest is injected here"));
-        assert!(!skill_body(Harness::Claude).contains("No digest is injected here"));
+        sandbox.install(Harness::Codex, &fresh());
+
+        let root: Value =
+            serde_json::from_str(&fs::read_to_string(&config).expect("read")).expect("JSON");
+        let starts = root["hooks"]["SessionStart"].as_array().expect("array");
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["matcher"], CODEX_MATCHER);
+        assert_eq!(
+            root["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "audit.sh"
+        );
     }
 
     #[test]
