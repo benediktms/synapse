@@ -34,7 +34,7 @@ pub fn digest(context: &ContextResponse) -> Option<String> {
     let ordered = context
         .pinned
         .iter()
-        .chain(&context.shared_user)
+        .chain(&context.preferences)
         .chain(&context.recent_project);
     for entry in ordered {
         if seen.contains(&entry.memory.id) {
@@ -131,7 +131,7 @@ mod tests {
     fn digest_dedups_and_collapses_multiline_content() {
         let context = ContextResponse {
             pinned: vec![entry("m_1", "pinned  fact\nsecond line")],
-            shared_user: vec![DigestEntryDto {
+            preferences: vec![DigestEntryDto {
                 origin: Origin::Preference,
                 memory: memory("m_2", "workspace", "a preference"),
             }],
@@ -151,7 +151,7 @@ mod tests {
     fn an_empty_digest_prints_nothing() {
         let context = ContextResponse {
             pinned: vec![],
-            shared_user: vec![],
+            preferences: vec![],
             recent_project: vec![],
         };
         assert_eq!(digest(&context), None);

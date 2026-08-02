@@ -175,7 +175,7 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<State>>) {
         "/context" => state
             .context
             .clone()
-            .unwrap_or_else(|| r#"{"pinned":[],"recent_project":[],"shared_user":[]}"#.to_string()),
+            .unwrap_or_else(|| r#"{"pinned":[],"recent_project":[],"preferences":[]}"#.to_string()),
         "/memories" => r#"{"memories":[]}"#.to_string(),
         "/export" => {
             let memories: Vec<serde_json::Value> = state

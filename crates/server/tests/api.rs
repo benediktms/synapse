@@ -461,7 +461,7 @@ async fn context_digest_sections() {
     };
     assert_eq!(ids("pinned"), vec![mid(1)]);
     assert_eq!(ids("recent_project"), vec![mid(2)]);
-    assert_eq!(ids("shared_user"), vec![mid(4)]);
+    assert_eq!(ids("preferences"), vec![mid(4)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

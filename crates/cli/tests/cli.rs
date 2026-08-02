@@ -514,7 +514,7 @@ fn context_prints_a_digest_and_stays_silent_when_empty() {
                     "tags": [], "pinned": true, "created_at": "2026-06-02T09:00:00Z",
                     "updated_at": "2026-06-02T09:00:00Z"}],
                 "recent_project": [],
-                "shared_user": []
+                "preferences": []
             })
             .to_string(),
         );

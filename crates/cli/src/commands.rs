@@ -19,7 +19,7 @@ use crate::resolve;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-const BULK_TIMEOUT: Duration = Duration::from_secs(60);
+const BULK_TIMEOUT: Duration = Duration::from_secs(600);
 /// One total budget for the pre-read flush, so a backlog cannot push a read past the
 /// session hook's ten seconds however many items are queued.
 const FLUSH_BUDGET: Duration = Duration::from_secs(2);

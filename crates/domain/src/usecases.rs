@@ -258,7 +258,7 @@ pub struct DigestEntry {
 pub struct ContextDigest {
     pub pinned: Vec<DigestEntry>,
     pub recent_project: Vec<DigestEntry>,
-    pub shared_user: Vec<DigestEntry>,
+    pub preferences: Vec<DigestEntry>,
 }
 
 pub async fn context_digest<S: Store>(
@@ -316,7 +316,7 @@ pub async fn context_digest<S: Store>(
     let shared_workspace = shared
         .map(|(workspace, _)| workspace.clone())
         .or_else(|| active.0.is_shared().then(|| active.0.clone()));
-    let shared_user: Vec<DigestEntry> = match shared_workspace {
+    let preferences: Vec<DigestEntry> = match shared_workspace {
         Some(workspace) => pool
             .iter()
             .filter(|entry| {
@@ -333,7 +333,7 @@ pub async fn context_digest<S: Store>(
     Ok(ContextDigest {
         pinned,
         recent_project,
-        shared_user,
+        preferences,
     })
 }
 
@@ -798,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_selects_pinned_recent_project_and_shared_user() {
+    fn digest_selects_pinned_recent_project_and_preferences() {
         let work_ws = Workspace::new("work").unwrap();
         let shared_ws = Workspace::shared();
         let work = FakeStore::new();
@@ -897,7 +897,7 @@ mod tests {
             vec![mid(26), mid(25), mid(24), mid(23), mid(22)]
         );
         assert_eq!(
-            entry_ids(&digest.shared_user),
+            entry_ids(&digest.preferences),
             vec![mid(35), mid(34), mid(33), mid(32), mid(31)]
         );
     }
@@ -928,7 +928,7 @@ mod tests {
         );
         let digest = block_on(context_digest((&work_ws, &work), None, None)).unwrap();
         assert_eq!(entry_ids(&digest.recent_project), vec![mid(1)]);
-        assert!(digest.shared_user.is_empty());
+        assert!(digest.preferences.is_empty());
     }
 
     #[test]
@@ -952,6 +952,6 @@ mod tests {
             entry_ids(&digest.recent_project),
             vec![mid(6), mid(5), mid(4), mid(3), mid(2)]
         );
-        assert_eq!(entry_ids(&digest.shared_user), vec![mid(1)]);
+        assert_eq!(entry_ids(&digest.preferences), vec![mid(1)]);
     }
 }

@@ -158,7 +158,7 @@ impl From<&DigestEntry> for DigestEntryDto {
 pub struct ContextResponse {
     pub pinned: Vec<DigestEntryDto>,
     pub recent_project: Vec<DigestEntryDto>,
-    pub shared_user: Vec<DigestEntryDto>,
+    pub preferences: Vec<DigestEntryDto>,
 }
 
 impl From<&ContextDigest> for ContextResponse {
@@ -170,8 +170,8 @@ impl From<&ContextDigest> for ContextResponse {
                 .iter()
                 .map(DigestEntryDto::from)
                 .collect(),
-            shared_user: digest
-                .shared_user
+            preferences: digest
+                .preferences
                 .iter()
                 .map(DigestEntryDto::from)
                 .collect(),
