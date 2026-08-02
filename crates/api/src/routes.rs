@@ -14,7 +14,7 @@ use domain::{
 };
 use serde::Deserialize;
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tower_http::trace::{DefaultOnResponse, MakeSpan, TraceLayer};
 use tracing::Level;
 
 use crate::backend::Backend;
@@ -24,11 +24,13 @@ use crate::dto::{
     SearchResponse, WorkspaceDto, WorkspacesResponse,
 };
 use crate::error::ApiError;
-use crate::validate::{validate_content, validate_query, validate_tags, validate_timestamp};
+use crate::validate::{normalize_timestamp, validate_content, validate_query, validate_tags};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(600);
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
+const UNREADY_PUBLIC_REASON: &str = "server is not ready; see server logs for detail";
 
 pub struct AppState<B> {
     backend: B,
@@ -49,6 +51,16 @@ pub fn router<B: Backend>(backend: B, token: &str) -> Router {
         backend,
         token: token.into(),
     };
+    let bulk = Router::new()
+        .route("/import", axum::routing::post(import::<B>))
+        .route(
+            "/preferences/import",
+            axum::routing::post(import_preferences::<B>),
+        )
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            IMPORT_TIMEOUT,
+        ));
     let data = Router::new()
         .route("/workspaces", get(get_workspaces::<B>))
         .route("/workspaces/{ws}", put(put_workspace::<B>))
@@ -70,13 +82,13 @@ pub fn router<B: Backend>(backend: B, token: &str) -> Router {
         )
         .route("/preferences", get(list_preferences::<B>))
         .route("/preferences/export", get(export_preferences::<B>))
-        .route(
-            "/preferences/import",
-            axum::routing::post(import_preferences::<B>),
-        )
         .route("/context", get(context::<B>))
         .route("/export", get(export::<B>))
-        .route("/import", axum::routing::post(import::<B>))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
+        .merge(bulk)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ready_gate::<B>,
@@ -84,18 +96,34 @@ pub fn router<B: Backend>(backend: B, token: &str) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), auth::<B>));
     Router::new()
         .route("/health", get(health::<B>))
-        .merge(data)
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
-        )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
+        .merge(data)
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(PathOnlySpan)
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
+}
+
+/// Records only the method and path: query strings carry recall queries and
+/// headers carry the bearer token, and neither may reach the logs.
+#[derive(Clone, Copy)]
+struct PathOnlySpan;
+
+impl<B> MakeSpan<B> for PathOnlySpan {
+    fn make_span(&mut self, request: &axum::http::Request<B>) -> tracing::Span {
+        tracing::info_span!(
+            "request",
+            method = %request.method(),
+            path = %request.uri().path(),
+            version = ?request.version(),
+        )
+    }
 }
 
 async fn auth<B: Backend>(
@@ -138,14 +166,17 @@ async fn health<B: Backend>(State(state): State<AppState<B>>) -> Response {
             reason: None,
         })
         .into_response(),
-        Err(reason) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(HealthResponse {
-                status: "unready".into(),
-                reason: Some(reason),
-            }),
-        )
-            .into_response(),
+        Err(reason) => {
+            tracing::warn!(%reason, "readiness check failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(HealthResponse {
+                    status: "unready".into(),
+                    reason: Some(UNREADY_PUBLIC_REASON.into()),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -276,6 +307,7 @@ async fn search<B: Backend>(
     State(state): State<AppState<B>>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<SearchResponse>, ApiError> {
+    let ws = params.ws.as_deref().map(parse_ws).transpose()?;
     let query = params
         .q
         .as_deref()
@@ -298,7 +330,8 @@ async fn search<B: Backend>(
             groups: groups.iter().map(HitGroupDto::from).collect(),
         }))
     } else {
-        let ws = require_ws(&WsQuery { ws: params.ws })?;
+        let ws =
+            ws.ok_or_else(|| ApiError::BadRequest("missing required query parameter: ws".into()))?;
         let hits = state.backend.recall(&ws, &request).await?;
         Ok(Json(SearchResponse::Flat {
             hits: hits.iter().map(HitDto::from).collect(),
@@ -512,6 +545,14 @@ async fn import_into<B: Backend>(
             doc.version
         )));
     }
+    let into_preferences = ws.is_shared();
+    if into_preferences != matches!(doc.origin, Origin::Preference) {
+        return Err(ApiError::BadRequest(if into_preferences {
+            "this dump came from a workspace; import it with /import?ws=<workspace>".into()
+        } else {
+            "this dump holds preferences; import it with /preferences/import".into()
+        }));
+    }
     let mut memories: Vec<Memory> = Vec::with_capacity(doc.memories.len());
     for dto in &doc.memories {
         let item = |err: ApiError| match err {
@@ -520,15 +561,36 @@ async fn import_into<B: Backend>(
         };
         validate_content(&state.backend, &dto.content).map_err(item)?;
         validate_tags(&dto.tags).map_err(item)?;
-        validate_timestamp(&dto.created_at).map_err(item)?;
-        validate_timestamp(&dto.updated_at).map_err(item)?;
-        memories.push(dto.to_memory().map_err(|e| item(ApiError::from(e)))?);
+        let created_at = normalize_timestamp(&dto.created_at).map_err(item)?;
+        let updated_at = normalize_timestamp(&dto.updated_at).map_err(item)?;
+        let mut memory = dto.to_memory().map_err(|e| item(ApiError::from(e)))?;
+        if into_preferences && memory.scope != Scope::Workspace {
+            return Err(item(ApiError::BadRequest(format!(
+                "preferences apply everywhere and cannot carry the project scope {:?}",
+                memory.scope.as_str()
+            ))));
+        }
+        memory.created_at = created_at;
+        memory.updated_at = updated_at;
+        memories.push(memory);
     }
-    if !merge && !state.backend.list(ws).await?.is_empty() {
-        return Err(ApiError::Conflict(format!(
-            "{} is not empty; use mode=merge to import into it",
-            Origin::of(ws).label()
-        )));
+    if !merge {
+        let incoming: std::collections::HashSet<&str> =
+            memories.iter().map(|m| m.id.as_str()).collect();
+        let stray = state
+            .backend
+            .list(ws)
+            .await?
+            .into_iter()
+            .find(|existing| !incoming.contains(existing.id.as_str()));
+        if let Some(stray) = stray {
+            return Err(ApiError::Conflict(format!(
+                "{} already holds memory {} which this dump does not contain; \
+                 use mode=merge to import into it",
+                Origin::of(ws).label(),
+                stray.id
+            )));
+        }
     }
     let report = state.backend.restore(ws, memories).await?;
     Ok(Json(ImportReport {

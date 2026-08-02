@@ -314,6 +314,7 @@ async fn shared_is_not_addressable_as_a_workspace() {
         format!("/memories/{}?ws=shared", mid(1)),
         "/memories?ws=shared".to_string(),
         "/memories/search?ws=shared&q=anything".to_string(),
+        "/memories/search?ws=shared&q=anything&all=true".to_string(),
         "/context?ws=shared".to_string(),
         "/export?ws=shared".to_string(),
     ] {
@@ -576,6 +577,21 @@ async fn export_import_round_trip_and_merge_idempotency() {
         "round trip drifted"
     );
 
+    let (status, report) = req(
+        &router,
+        Method::POST,
+        "/import?ws=restore",
+        Some(export.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "repeating the same default import must resume, not 409: {report}"
+    );
+    assert_eq!(report["unchanged"], 2);
+
+    put_memory(&router, "restore", 7, "a fact this dump never had").await;
     let (status, _) = req(
         &router,
         Method::POST,
@@ -583,7 +599,18 @@ async fn export_import_round_trip_and_merge_idempotency() {
         Some(export.clone()),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "default import must refuse a target holding unrelated memories"
+    );
+    req(
+        &router,
+        Method::DELETE,
+        &format!("/memories/{}?ws=restore", mid(7)),
+        None,
+    )
+    .await;
 
     let (status, report) = req(
         &router,
@@ -622,6 +649,128 @@ async fn export_import_round_trip_and_merge_idempotency() {
             .any(|h| h["id"] == mid(2)),
         "imported memory not recallable: {searched}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn import_keeps_preferences_and_workspaces_apart() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    put_memory(&router, "work", 1, "an internal work detail").await;
+    put_preference(&router, 2, "prefers ripgrep").await;
+
+    let (_, work_dump) = req(&router, Method::GET, "/export?ws=work", None).await;
+    let (_, preference_dump) = req(&router, Method::GET, "/preferences/export", None).await;
+
+    for mode in ["", "?mode=merge"] {
+        let (status, body) = req(
+            &router,
+            Method::POST,
+            &format!("/preferences/import{mode}"),
+            Some(work_dump.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a workspace dump became preferences: {body}"
+        );
+
+        let (status, body) = req(
+            &router,
+            Method::POST,
+            &format!("/import?ws=work{}", mode.replace('?', "&")),
+            Some(preference_dump.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a preference dump became workspace memories: {body}"
+        );
+    }
+
+    let (_, listed) = req(&router, Method::GET, "/preferences", None).await;
+    assert_eq!(
+        listed["memories"].as_array().unwrap().len(),
+        1,
+        "the rejected dump still landed: {listed}"
+    );
+
+    let mut project_scoped = preference_dump.clone();
+    project_scoped["memories"][0]["scope"] = json!("fresha/offers");
+    project_scoped["memories"][0]["id"] = json!(mid(3));
+    let (status, body) = req(
+        &router,
+        Method::POST,
+        "/preferences/import?mode=merge",
+        Some(project_scoped),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a project-scoped preference was accepted: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn import_normalizes_timestamps_and_rejects_impossible_ones() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/restore", None).await;
+
+    let dump = |created: &str, updated: &str| {
+        json!({
+            "version": 1,
+            "origin": { "workspace": "restore" },
+            "memories": [{
+                "id": mid(1),
+                "content": "a restored fact",
+                "kind": "project",
+                "scope": "workspace",
+                "tags": [],
+                "pinned": false,
+                "created_at": created,
+                "updated_at": updated,
+            }],
+        })
+    };
+
+    for bad in [
+        "2026-99-99T99:99:99Z",
+        "2026-02-30T00:00:00Z",
+        "2026-08-02T10:00:00+02:00",
+        "2026-08-02 10:00:00Z",
+    ] {
+        let (status, body) = req(
+            &router,
+            Method::POST,
+            "/import?ws=restore&mode=merge",
+            Some(dump(bad, "2026-08-02T10:00:00Z")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "accepted {bad}: {body}");
+    }
+
+    let (status, body) = req(
+        &router,
+        Method::POST,
+        "/import?ws=restore&mode=merge",
+        Some(dump("2026-08-02T10:00:00.500Z", "2026-08-02T10:00:00.999Z")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, stored) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}?ws=restore", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(stored["created_at"], "2026-08-02T10:00:00Z");
+    assert_eq!(stored["updated_at"], "2026-08-02T10:00:00Z");
 }
 
 struct ScriptedEmbedder {
@@ -766,10 +915,7 @@ async fn reembed_to_runtime_model_restores_readiness_and_recall() {
     let (router, _) = boot(dir.path()).await;
     let (status, body) = send(&router, Method::GET, "/health", None, None).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        body["reason"].as_str().unwrap().contains("mismatch"),
-        "{body}"
-    );
+    assert_unrevealing_readiness(&body);
 
     let real = embedder().await;
     let report = server::reembed(dir.path(), MODEL_NAME, DIMENSION, &*real)
@@ -812,10 +958,25 @@ async fn registry_recovers_from_crash_and_rejects_invalid_files() {
     let (router, _) = boot(dir.path()).await;
     let (status, body) = send(&router, Method::GET, "/health", None, None).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_unrevealing_readiness(&body);
+
+    let (status, body) = req(&router, Method::GET, "/workspaces", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(
-        body["reason"].as_str().unwrap().contains("Bad.db"),
-        "{body}"
+        body["error"].as_str().unwrap().contains("Bad.db"),
+        "authenticated callers still need the detail: {body}"
     );
+}
+
+fn assert_unrevealing_readiness(body: &Value) {
+    assert_eq!(body["status"], "unready");
+    let reason = body["reason"].as_str().expect("reason");
+    for secret in ["shared", ".db", "/", "model", "mismatch"] {
+        assert!(
+            !reason.contains(secret),
+            "public readiness reason leaks {secret:?}: {reason}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

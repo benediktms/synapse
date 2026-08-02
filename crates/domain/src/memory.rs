@@ -81,15 +81,27 @@ pub enum Scope {
     Project(String),
 }
 
+const SCOPE_SEGMENT_MAX_LEN: usize = 64;
+
+fn is_scope_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= SCOPE_SEGMENT_MAX_LEN
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 impl Scope {
     pub fn parse(s: &str) -> Result<Self, Error> {
         if s == "workspace" {
             return Ok(Self::Workspace);
         }
-        if s.is_empty() || s.chars().any(char::is_whitespace) {
-            return Err(Error::InvalidScope(s.to_string()));
+        match s.split_once('/') {
+            Some((owner, repo)) if is_scope_segment(owner) && is_scope_segment(repo) => {
+                Ok(Self::Project(s.to_string()))
+            }
+            _ => Err(Error::InvalidScope(s.to_string())),
         }
-        Ok(Self::Project(s.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -183,11 +195,35 @@ mod tests {
     #[test]
     fn scope_parse_distinguishes_workspace_and_project() {
         assert_eq!(Scope::parse("workspace").unwrap(), Scope::Workspace);
-        assert_eq!(
-            Scope::parse("fresha/offers").unwrap(),
-            Scope::Project("fresha/offers".to_string())
-        );
-        assert!(Scope::parse("").is_err());
-        assert!(Scope::parse("has space").is_err());
+        for slug in ["fresha/offers", "my-org/repo.js", "a_b/c-d.e", "0/1"] {
+            assert_eq!(
+                Scope::parse(slug).unwrap(),
+                Scope::Project(slug.to_string()),
+                "rejected {slug:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_parse_enforces_the_owner_repo_grammar() {
+        for bad in [
+            "",
+            "shared",
+            "global",
+            "has space",
+            "fresha",
+            "fresha/",
+            "/offers",
+            "group/sub/repo",
+            "fresha/off ers",
+            "fresha/off\ters",
+            &format!("fresha/{}", "o".repeat(65)),
+        ] {
+            assert_eq!(
+                Scope::parse(bad),
+                Err(Error::InvalidScope(bad.to_string())),
+                "accepted {bad:?}"
+            );
+        }
     }
 }
