@@ -3,8 +3,24 @@ name = "cli"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "syn"
 path = "src/main.rs"
 
 [dependencies]
+api = { path = "../api" }
+api-client = { path = "../api-client" }
+clap = { version = "4", features = ["derive"] }
+domain = { path = "../domain" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

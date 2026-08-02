@@ -1,0 +1,372 @@
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use api::{ExportDoc, PatchMemoryBody, PutMemoryBody, SearchResponse};
+use api_client::SynapseApiClient;
+use domain::MemoryId;
+
+use crate::args::{
+    Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, ListArgs, RecallArgs,
+    SaveArgs, WorkspaceArgs, WorkspaceCommand,
+};
+use crate::config::Config;
+use crate::outbox::{FlushReport, Outbox, PendingSave, now_millis};
+use crate::output;
+use crate::resolve;
+
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const BULK_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub fn run(cli: Cli) -> Result<(), String> {
+    let config = Config::load()?;
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?;
+    let ctx = Context { config, cwd };
+    match cli.command {
+        Command::Save(args) => save(&ctx, args),
+        Command::Recall(args) => recall(&ctx, args),
+        Command::Context(args) => context(&ctx, args),
+        Command::Edit(args) => edit(&ctx, args),
+        Command::Forget(args) => forget(&ctx, args),
+        Command::List(args) => list(&ctx, args),
+        Command::Show(args) => show(&ctx, args),
+        Command::Pin(args) => set_pinned(&ctx, args, true),
+        Command::Unpin(args) => set_pinned(&ctx, args, false),
+        Command::Workspace(command) => workspace(&ctx, command),
+        Command::Export(args) => export(&ctx, args),
+        Command::Import(args) => import(&ctx, args),
+        Command::Config(command) => set_config(ctx.config, command),
+    }
+}
+
+struct Context {
+    config: Config,
+    cwd: PathBuf,
+}
+
+impl Context {
+    fn client(&self, timeout: Duration) -> Result<SynapseApiClient, String> {
+        SynapseApiClient::new(self.config.url(), self.config.token()?, timeout)
+            .map_err(|e| e.to_string())
+    }
+
+    fn workspace(&self, flag: Option<&str>, fail_closed: bool) -> Result<String, String> {
+        resolve::resolve_workspace(&self.config, flag, &self.cwd, fail_closed)
+    }
+
+    fn scope(&self, flag: Option<&str>) -> Result<resolve::ResolvedScope, String> {
+        resolve::resolve_scope(flag, &self.cwd)
+    }
+}
+
+/// Read commands drain the outbox first so a queued save becomes recallable at the
+/// first opportunity; an outage here must not fail the read itself.
+fn flush_quietly(client: &SynapseApiClient) {
+    if let Ok(outbox) = Outbox::open() {
+        let _ = outbox.flush(client);
+    }
+}
+
+fn save(ctx: &Context, args: SaveArgs) -> Result<(), String> {
+    let client = ctx.client(WRITE_TIMEOUT)?;
+    let workspace = ctx.workspace(args.workspace.as_deref(), true)?;
+    let scope = ctx.scope(args.scope.as_deref())?;
+    if let Some(note) = &scope.note {
+        eprintln!("note: {note}");
+    }
+    let id = MemoryId::generate().to_string();
+    let item = PendingSave {
+        id: id.clone(),
+        workspace: workspace.clone(),
+        queued_at: now_millis(),
+        body: PutMemoryBody {
+            content: args.content,
+            kind: args.kind,
+            scope: scope.scope.clone(),
+            tags: args.tags,
+        },
+        failure: None,
+    };
+    let outbox = Outbox::open()?;
+    outbox.enqueue(&item)?;
+    let report = outbox.flush(&client)?;
+    let where_to = format!("{workspace} · {}", scope.scope);
+    if report.sent.contains(&id) {
+        println!("saved {id} ({where_to})");
+        return Ok(());
+    }
+    if let Some((_, failure)) = report.dead_lettered.iter().find(|(dead, _)| *dead == id) {
+        return Err(format!("{failure} (see: syn list --pending)"));
+    }
+    report_backlog(&report);
+    println!("queued {id} ({where_to}) — queued locally, not yet recallable");
+    Ok(())
+}
+
+fn report_backlog(report: &FlushReport) {
+    if let Some(reason) = &report.deferred {
+        eprintln!("note: {reason}");
+    }
+    for (id, failure) in &report.dead_lettered {
+        eprintln!("note: {id} moved to dead-letter: {failure}");
+    }
+}
+
+fn recall(ctx: &Context, args: RecallArgs) -> Result<(), String> {
+    let client = ctx.client(READ_TIMEOUT)?;
+    flush_quietly(&client);
+    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    let scope = ctx.scope(args.project.as_deref())?;
+    let started = Instant::now();
+    let response = client
+        .search(
+            &workspace,
+            &args.query,
+            scope.project(),
+            args.limit,
+            args.all_workspaces,
+        )
+        .map_err(|e| e.to_string())?;
+    let elapsed = started.elapsed().as_millis();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let count = match &response {
+        SearchResponse::Flat { hits } => {
+            for hit in hits {
+                let _ = writeln!(out, "{}", output::hit_line(hit));
+            }
+            hits.len()
+        }
+        SearchResponse::Grouped { groups } => {
+            for group in groups {
+                let _ = writeln!(out, "## {}", group.workspace);
+                for hit in &group.hits {
+                    let _ = writeln!(out, "{}", output::hit_line(hit));
+                }
+            }
+            groups.iter().map(|group| group.hits.len()).sum()
+        }
+    };
+    let _ = writeln!(out, "({count} results, {elapsed}ms)");
+    Ok(())
+}
+
+fn context(ctx: &Context, args: ContextArgs) -> Result<(), String> {
+    let client = ctx.client(READ_TIMEOUT)?;
+    flush_quietly(&client);
+    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    let scope = ctx.scope(args.project.as_deref())?;
+    let digest = client
+        .context(&workspace, scope.project())
+        .map_err(|e| e.to_string())?;
+    if let Some(text) = output::digest(&digest) {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+fn edit(ctx: &Context, args: EditArgs) -> Result<(), String> {
+    let client = ctx.client(WRITE_TIMEOUT)?;
+    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    let body = PatchMemoryBody {
+        content: Some(args.content),
+        ..PatchMemoryBody::default()
+    };
+    let memory = client
+        .edit(&workspace, &args.id, &body)
+        .map_err(|e| e.to_string())?;
+    println!("updated {} ({workspace})", memory.id);
+    Ok(())
+}
+
+fn forget(ctx: &Context, args: IdArgs) -> Result<(), String> {
+    let client = ctx.client(WRITE_TIMEOUT)?;
+    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    client
+        .forget(&workspace, &args.id)
+        .map_err(|e| e.to_string())?;
+    println!("forgot {} ({workspace})", args.id);
+    Ok(())
+}
+
+fn set_pinned(ctx: &Context, args: IdArgs, pinned: bool) -> Result<(), String> {
+    let client = ctx.client(WRITE_TIMEOUT)?;
+    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    let body = PatchMemoryBody {
+        pinned: Some(pinned),
+        ..PatchMemoryBody::default()
+    };
+    let memory = client
+        .edit(&workspace, &args.id, &body)
+        .map_err(|e| e.to_string())?;
+    let verb = if pinned { "pinned" } else { "unpinned" };
+    println!("{verb} {} ({workspace})", memory.id);
+    Ok(())
+}
+
+fn list(ctx: &Context, args: ListArgs) -> Result<(), String> {
+    if args.pending {
+        return pending(args);
+    }
+    let client = ctx.client(READ_TIMEOUT)?;
+    flush_quietly(&client);
+    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    for memory in client.list(&workspace).map_err(|e| e.to_string())? {
+        println!("{}", output::memory_line(&workspace, &memory));
+    }
+    Ok(())
+}
+
+fn pending(args: ListArgs) -> Result<(), String> {
+    let outbox = Outbox::open()?;
+    if let Some(workspace) = &args.reassign {
+        let workspace = resolve::validate_workspace(workspace)?;
+        let moved = outbox.reassign(&workspace, args.id.as_deref())?;
+        println!("reassigned {moved} pending saves to {workspace}");
+        return Ok(());
+    }
+    if args.discard {
+        let discarded = outbox.discard(args.id.as_deref())?;
+        println!("discarded {discarded} pending saves");
+        return Ok(());
+    }
+    let now = now_millis();
+    for (_, item) in outbox.pending()? {
+        println!(
+            "[{}] ({} · {}) queued {}",
+            item.id,
+            item.workspace,
+            item.body.scope,
+            age(now, item.queued_at)
+        );
+    }
+    for (_, item) in outbox.dead_letters()? {
+        println!(
+            "[{}] ({} · {}) dead-letter: {}",
+            item.id,
+            item.workspace,
+            item.body.scope,
+            item.failure.as_deref().unwrap_or("unknown failure")
+        );
+    }
+    Ok(())
+}
+
+fn age(now: u64, queued_at: u64) -> String {
+    let seconds = now.saturating_sub(queued_at) / 1000;
+    match seconds {
+        0..60 => format!("{seconds}s ago"),
+        60..3600 => format!("{}m ago", seconds / 60),
+        3600..86400 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86400),
+    }
+}
+
+fn show(ctx: &Context, args: IdArgs) -> Result<(), String> {
+    let client = ctx.client(READ_TIMEOUT)?;
+    flush_quietly(&client);
+    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    let memory = client
+        .get(&workspace, &args.id)
+        .map_err(|e| e.to_string())?;
+    println!("{}", output::memory_line(&workspace, &memory));
+    if !memory.tags.is_empty() {
+        println!("tags: {}", memory.tags.join(", "));
+    }
+    println!(
+        "kind: {}  pinned: {}  created: {}",
+        memory.kind, memory.pinned, memory.created_at
+    );
+    Ok(())
+}
+
+fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
+    match command {
+        WorkspaceCommand::List => {
+            let client = ctx.client(READ_TIMEOUT)?;
+            let default = ctx.config.default_workspace.as_deref();
+            for workspace in client.workspaces().map_err(|e| e.to_string())? {
+                let marker = if Some(workspace.as_str()) == default {
+                    " (default)"
+                } else {
+                    ""
+                };
+                println!("{workspace}{marker}");
+            }
+            Ok(())
+        }
+        WorkspaceCommand::Create { name } => {
+            let name = resolve::validate_workspace(&name)?;
+            let client = ctx.client(WRITE_TIMEOUT)?;
+            let created = client.create_workspace(&name).map_err(|e| e.to_string())?;
+            println!("workspace {} ready", created.workspace);
+            Ok(())
+        }
+        WorkspaceCommand::Use { name } => {
+            let name = resolve::validate_workspace(&name)?;
+            let mut config = ctx.config.clone();
+            config.default_workspace = Some(name.clone());
+            config.save()?;
+            println!("default workspace set to {name}");
+            Ok(())
+        }
+    }
+}
+
+fn export(ctx: &Context, args: WorkspaceArgs) -> Result<(), String> {
+    let client = ctx.client(BULK_TIMEOUT)?;
+    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    let doc = client.export(&workspace).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    println!("{json}");
+    Ok(())
+}
+
+fn import(ctx: &Context, args: ImportArgs) -> Result<(), String> {
+    let client = ctx.client(BULK_TIMEOUT)?;
+    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|e| format!("cannot read dump from stdin: {e}"))?;
+    let doc: ExportDoc =
+        serde_json::from_str(&input).map_err(|e| format!("invalid dump on stdin: {e}"))?;
+    let report = client
+        .import(&workspace, args.merge, &doc)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "imported {} memories into {workspace} ({} unchanged)",
+        report.imported, report.unchanged
+    );
+    Ok(())
+}
+
+fn set_config(mut config: Config, command: ConfigCommand) -> Result<(), String> {
+    match command {
+        ConfigCommand::SetToken { token } => {
+            config.token = Some(token);
+            config.save()?;
+            println!("token stored in {}", crate::config::config_path().display());
+        }
+        ConfigCommand::SetUrl { url } => {
+            config.url = Some(url.trim_end_matches('/').to_string());
+            config.save()?;
+            println!("server url set to {}", config.url());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::age;
+
+    #[test]
+    fn age_reads_in_the_largest_useful_unit() {
+        assert_eq!(age(5_000, 5_000), "0s ago");
+        assert_eq!(age(95_000, 5_000), "1m ago");
+        assert_eq!(age(7_205_000, 5_000), "2h ago");
+        assert_eq!(age(172_805_000, 5_000), "2d ago");
+    }
+}
