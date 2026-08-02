@@ -8,7 +8,9 @@ use crate::ports::{Embedder, ScopeFilter, Store};
 use crate::similarity::cosine_similarity;
 use crate::workspace::Workspace;
 
-pub const MIN_VECTOR_SIMILARITY: f32 = 0.35;
+// Measured on bge-small-en-v1.5: unrelated short texts score 0.30–0.58,
+// paraphrases ~0.95 — 0.6 sits above the noise band.
+pub const MIN_VECTOR_SIMILARITY: f32 = 0.6;
 pub const RECALL_LIMIT_CAP: usize = 20;
 pub const DIGEST_PINNED_CAP: usize = 10;
 pub const DIGEST_RECENT_PROJECT_CAP: usize = 5;
@@ -574,7 +576,7 @@ mod tests {
                 Scope::Workspace,
                 false,
             ),
-            vec![0.6, 0.8],
+            vec![0.7, 0.7141],
         );
         shared.seed(
             mem(
@@ -584,7 +586,7 @@ mod tests {
                 Scope::Workspace,
                 false,
             ),
-            vec![0.4, 0.9165],
+            vec![0.62, 0.7846],
         );
         let embedder = FakeEmbedder::new().with("deploy staging", vec![1.0, 0.0]);
         let hits = block_on(recall(

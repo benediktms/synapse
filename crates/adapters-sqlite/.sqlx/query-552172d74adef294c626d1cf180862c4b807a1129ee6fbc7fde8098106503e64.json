@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE meta SET embedding_model = ?, embedding_dim = ? WHERE id = 1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "552172d74adef294c626d1cf180862c4b807a1129ee6fbc7fde8098106503e64"
+}

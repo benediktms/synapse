@@ -1,0 +1,2 @@
+[env]
+FASTEMBED_CACHE_DIR = { value = "crates/adapters-fastembed/.fastembed_cache", relative = true }

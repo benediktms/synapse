@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use domain::{Error, Memory, MemoryId, MemoryKind, Scope, ScopeFilter, Store, Timestamp};
+use domain::{Embedder, Error, Memory, MemoryId, MemoryKind, Scope, ScopeFilter, Store, Timestamp};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
@@ -22,20 +22,7 @@ impl SqliteStore {
         embedding_model: &str,
         embedding_dim: usize,
     ) -> Result<Self, Error> {
-        let options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(BUSY_TIMEOUT)
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(MAX_CONNECTIONS)
-            .connect_with(options)
-            .await
-            .map_err(store_err)?;
-        MIGRATOR.run(&pool).await.map_err(store_err)?;
-
+        let pool = connect(path, true).await?;
         let dim = i64::try_from(embedding_dim).map_err(store_err)?;
         sqlx::query!(
             "INSERT INTO meta (id, embedding_model, embedding_dim) VALUES (1, ?, ?) \
@@ -60,6 +47,55 @@ impl SqliteStore {
             pool,
             dim: embedding_dim,
         })
+    }
+
+    pub async fn open_maintenance(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let pool = connect(path, false).await?;
+        let meta = sqlx::query!("SELECT embedding_model, embedding_dim FROM meta WHERE id = 1")
+            .fetch_optional(&pool)
+            .await
+            .map_err(store_err)?
+            .ok_or_else(|| {
+                Error::Store("no embedding meta; boot the server once to initialize".into())
+            })?;
+        let dim = usize::try_from(meta.embedding_dim).map_err(store_err)?;
+        Ok(Self { pool, dim })
+    }
+
+    pub async fn reembed<E: Embedder>(
+        self,
+        embedding_model: &str,
+        embedding_dim: usize,
+        embedder: &E,
+    ) -> Result<usize, Error> {
+        let dim = i64::try_from(embedding_dim).map_err(store_err)?;
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        let rows = sqlx::query!("SELECT id, content FROM memories")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(store_err)?;
+        for row in &rows {
+            let embedding = embedder.embed(&row.content).await?;
+            let blob = encode_embedding(&embedding, embedding_dim)?;
+            sqlx::query!(
+                "UPDATE memories SET embedding = ? WHERE id = ?",
+                blob,
+                row.id
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
+        }
+        sqlx::query!(
+            "UPDATE meta SET embedding_model = ?, embedding_dim = ? WHERE id = 1",
+            embedding_model,
+            dim
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err)?;
+        tx.commit().await.map_err(store_err)?;
+        Ok(rows.len())
     }
 
     pub async fn embedding_meta(&self) -> Result<(String, usize), Error> {
@@ -259,6 +295,23 @@ impl Store for SqliteStore {
             .map(|row| MemoryId::parse(&row.id))
             .collect()
     }
+}
+
+async fn connect(path: impl AsRef<Path>, create_if_missing: bool) -> Result<SqlitePool, Error> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(create_if_missing)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(BUSY_TIMEOUT)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(MAX_CONNECTIONS)
+        .connect_with(options)
+        .await
+        .map_err(store_err)?;
+    MIGRATOR.run(&pool).await.map_err(store_err)?;
+    Ok(pool)
 }
 
 struct MemoryRow {

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 domain = { version = "0.1.0", path = "../domain" }
 fastembed = { version = "5.17.4", default-features = false, features = ["hf-hub-native-tls", "ort-download-binaries-native-tls"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 tokio = { version = "1.53.1", features = ["rt", "sync"] }
 
 [dev-dependencies]
