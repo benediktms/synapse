@@ -4,18 +4,39 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use api::PutMemoryBody;
+use api::{PutMemoryBody, PutPreferenceBody};
 use api_client::SynapseApiClient;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{private_dir, state_dir, write_private};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "target", rename_all = "lowercase")]
+pub enum SaveTarget {
+    Memory {
+        workspace: String,
+        body: PutMemoryBody,
+    },
+    Preference {
+        body: PutPreferenceBody,
+    },
+}
+
+impl SaveTarget {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Memory { workspace, body } => format!("{workspace} \u{b7} {}", body.scope),
+            Self::Preference { .. } => "preference".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PendingSave {
     pub id: String,
-    pub workspace: String,
     pub queued_at: u64,
-    pub body: PutMemoryBody,
+    #[serde(flatten)]
+    pub target: SaveTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
 }
@@ -72,8 +93,14 @@ impl Outbox {
             return Ok(report);
         };
         for (path, item) in self.pending()? {
-            match client.save(&item.workspace, &item.id, &item.body) {
-                Ok(_) => {
+            let sent = match &item.target {
+                SaveTarget::Memory { workspace, body } => {
+                    client.save(workspace, &item.id, body).map(drop)
+                }
+                SaveTarget::Preference { body } => client.save_preference(&item.id, body).map(drop),
+            };
+            match sent {
+                Ok(()) => {
                     remove(&path)?;
                     report.sent.push(item.id);
                 }
@@ -96,12 +123,21 @@ impl Outbox {
         Ok(report)
     }
 
-    pub fn reassign(&self, workspace: &str, id: Option<&str>) -> Result<usize, String> {
+    /// Preferences belong to no workspace, so they are reported as skipped rather
+    /// than silently rewritten into one.
+    pub fn reassign(&self, workspace: &str, id: Option<&str>) -> Result<(usize, usize), String> {
         let _lock = lock(&self.dir.join(".lock"), true)?;
-        let mut moved = 0;
+        let (mut moved, mut skipped) = (0, 0);
         for (path, item) in self.selected(id)? {
+            let SaveTarget::Memory { body, .. } = item.target else {
+                skipped += 1;
+                continue;
+            };
             let item = PendingSave {
-                workspace: workspace.to_string(),
+                target: SaveTarget::Memory {
+                    workspace: workspace.to_string(),
+                    body,
+                },
                 failure: None,
                 ..item
             };
@@ -111,7 +147,7 @@ impl Outbox {
             }
             moved += 1;
         }
-        Ok(moved)
+        Ok((moved, skipped))
     }
 
     pub fn discard(&self, id: Option<&str>) -> Result<usize, String> {
@@ -202,13 +238,30 @@ mod tests {
     fn item(id: &str, queued_at: u64) -> PendingSave {
         PendingSave {
             id: id.to_string(),
-            workspace: "work".into(),
             queued_at,
-            body: PutMemoryBody {
-                content: "fact".into(),
-                kind: "project".into(),
-                scope: "workspace".into(),
-                tags: vec![],
+            target: SaveTarget::Memory {
+                workspace: "work".into(),
+                body: PutMemoryBody {
+                    content: "fact".into(),
+                    kind: "project".into(),
+                    scope: "workspace".into(),
+                    tags: vec![],
+                },
+            },
+            failure: None,
+        }
+    }
+
+    fn preference(id: &str, queued_at: u64) -> PendingSave {
+        PendingSave {
+            id: id.to_string(),
+            queued_at,
+            target: SaveTarget::Preference {
+                body: PutPreferenceBody {
+                    content: "prefers oat milk".into(),
+                    kind: "user".into(),
+                    tags: vec![],
+                },
             },
             failure: None,
         }
@@ -252,16 +305,33 @@ mod tests {
         };
         outbox.write_item(&outbox.dead_dir(), &dead).unwrap();
 
-        assert_eq!(outbox.reassign("personal", None).unwrap(), 1);
+        assert_eq!(outbox.reassign("personal", None).unwrap(), (1, 0));
         assert!(outbox.dead_letters().unwrap().is_empty());
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].1.workspace, "personal");
+        assert_eq!(pending[0].1.target.label(), "personal \u{b7} workspace");
         assert!(pending[0].1.failure.is_none());
 
         assert_eq!(outbox.discard(Some("m_zzz")).unwrap(), 0);
         assert_eq!(outbox.discard(None).unwrap(), 1);
         assert!(outbox.pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preferences_round_trip_and_are_never_reassigned_to_a_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Outbox::at(dir.path().join("outbox")).unwrap();
+        outbox.enqueue(&preference("m_aaa", 100)).unwrap();
+        outbox.enqueue(&item("m_bbb", 200)).unwrap();
+
+        let stored = outbox.pending().unwrap();
+        assert!(matches!(stored[0].1.target, SaveTarget::Preference { .. }));
+        assert_eq!(stored[0].1.target.label(), "preference");
+
+        assert_eq!(outbox.reassign("personal", None).unwrap(), (1, 1));
+        let after = outbox.pending().unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(matches!(after[0].1.target, SaveTarget::Preference { .. }));
     }
 
     #[test]

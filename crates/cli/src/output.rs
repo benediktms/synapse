@@ -1,24 +1,26 @@
-use api::{ContextResponse, DigestEntryDto, HitDto, MemoryDto};
+use api::{ContextResponse, DigestEntryDto, HitDto, MemoryDto, Origin};
 
 pub fn hit_line(hit: &HitDto) -> String {
-    memory_line(&hit.workspace, &hit.memory)
+    memory_line(&hit.origin, &hit.memory)
 }
 
-pub fn memory_line(workspace: &str, memory: &MemoryDto) -> String {
+pub fn memory_line(origin: &Origin, memory: &MemoryDto) -> String {
     format!(
         "[{}] ({}) {}",
         memory.id,
-        provenance(workspace, memory),
+        provenance(origin, memory),
         memory.content
     )
 }
 
-fn provenance(workspace: &str, memory: &MemoryDto) -> String {
+fn provenance(origin: &Origin, memory: &MemoryDto) -> String {
     let date = date(&memory.updated_at);
-    if memory.scope == "workspace" {
-        format!("{workspace}, {date}")
-    } else {
-        format!("{workspace} · {}, {date}", memory.scope)
+    match origin {
+        Origin::Preference => format!("preference, {date}"),
+        Origin::Workspace(workspace) if memory.scope == "workspace" => {
+            format!("{workspace}, {date}")
+        }
+        Origin::Workspace(workspace) => format!("{workspace} · {}, {date}", memory.scope),
     }
 }
 
@@ -79,9 +81,9 @@ mod tests {
         }
     }
 
-    fn entry(id: &str, workspace: &str, content: &str) -> DigestEntryDto {
+    fn entry(id: &str, content: &str) -> DigestEntryDto {
         DigestEntryDto {
-            workspace: workspace.into(),
+            origin: Origin::Workspace("work".into()),
             memory: memory(id, "workspace", content),
         }
     }
@@ -89,7 +91,7 @@ mod tests {
     #[test]
     fn hits_carry_workspace_scope_and_date() {
         let hit = HitDto {
-            workspace: "work".into(),
+            origin: Origin::Workspace("work".into()),
             score: 0.9,
             memory: memory("m_7f2a", "fresha/offers", "Staging deploys via ArgoCD."),
         };
@@ -102,25 +104,38 @@ mod tests {
     #[test]
     fn workspace_scoped_hits_omit_the_redundant_scope_segment() {
         let hit = HitDto {
-            workspace: "shared".into(),
+            origin: Origin::Workspace("work".into()),
             score: 0.5,
+            memory: memory("m_31bc", "workspace", "Team uses trunk-based development."),
+        };
+        assert_eq!(
+            hit_line(&hit),
+            "[m_31bc] (work, 2026-07-14) Team uses trunk-based development."
+        );
+    }
+
+    #[test]
+    fn preference_hits_never_name_a_workspace() {
+        let hit = HitDto {
+            origin: Origin::Preference,
+            score: 0.4,
             memory: memory("m_31bc", "workspace", "Prefers Datadog links."),
         };
         assert_eq!(
             hit_line(&hit),
-            "[m_31bc] (shared, 2026-07-14) Prefers Datadog links."
+            "[m_31bc] (preference, 2026-07-14) Prefers Datadog links."
         );
     }
 
     #[test]
     fn digest_dedups_and_collapses_multiline_content() {
         let context = ContextResponse {
-            pinned: vec![entry("m_1", "work", "pinned  fact\nsecond line")],
-            shared_user: vec![entry("m_2", "shared", "a preference")],
-            recent_project: vec![
-                entry("m_1", "work", "pinned fact"),
-                entry("m_3", "work", "c"),
-            ],
+            pinned: vec![entry("m_1", "pinned  fact\nsecond line")],
+            shared_user: vec![DigestEntryDto {
+                origin: Origin::Preference,
+                memory: memory("m_2", "workspace", "a preference"),
+            }],
+            recent_project: vec![entry("m_1", "pinned fact"), entry("m_3", "c")],
         };
         assert_eq!(
             digest(&context).unwrap(),

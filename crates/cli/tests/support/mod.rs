@@ -117,8 +117,13 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<State>>) {
         body: body.clone(),
     });
 
-    if method == "PUT" && path.starts_with("/memories/") {
-        let id = path.trim_start_matches("/memories/").to_string();
+    let id_path = ["/memories/", "/preferences/"]
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .filter(|id| id.starts_with("m_"))
+        .map(str::to_string);
+
+    if let (Some(id), "PUT") = (id_path.clone(), method.as_str()) {
         match state.script.pop_front() {
             Some(Behavior::Status(status, message)) => {
                 return respond(stream, status, &format!(r#"{{"error":"{message}"}}"#));
@@ -134,10 +139,10 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<State>>) {
         return respond(stream, status, &memory_json(&id, &body));
     }
 
-    if path.starts_with("/memories/m_") {
+    if let Some(id) = id_path {
         return match method.as_str() {
             "DELETE" => respond(stream, 204, ""),
-            "PATCH" | "GET" => respond(stream, 200, &memory_json(&path[10..], &body)),
+            "PATCH" | "GET" => respond(stream, 200, &memory_json(&id, &body)),
             _ => respond(stream, 405, r#"{"error":"stub has no route"}"#),
         };
     }
@@ -160,12 +165,18 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<State>>) {
 
 fn memory_json(id: &str, body: &str) -> String {
     let sent: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let field = |name: &str, fallback: &str| {
+        sent.get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(fallback)
+            .to_string()
+    };
     serde_json::json!({
         "id": id,
-        "content": sent["content"],
-        "kind": sent["kind"],
-        "scope": sent["scope"],
-        "tags": sent.get("tags").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "content": field("content", "stub content"),
+        "kind": field("kind", "user"),
+        "scope": field("scope", "workspace"),
+        "tags": sent.get("tags").filter(|t| t.is_array()).cloned().unwrap_or_else(|| serde_json::json!([])),
         "pinned": false,
         "created_at": "2026-08-02T10:00:00Z",
         "updated_at": "2026-08-02T10:00:00Z",

@@ -273,13 +273,28 @@ fn saves_fail_closed_in_a_git_checkout_with_no_matching_rule() {
         "--type",
         "project",
         "--workspace",
-        "shared",
+        "work",
     ]);
     assert!(explicit.status.success(), "{}", stderr(&explicit));
     assert!(
-        stdout(&explicit).contains("(shared · workspace)"),
+        stdout(&explicit).contains("(work · workspace)"),
         "{}",
         stdout(&explicit)
+    );
+
+    let named_shared = machine.run(&[
+        "save",
+        "risky fact",
+        "--type",
+        "project",
+        "--workspace",
+        "shared",
+    ]);
+    assert!(!named_shared.status.success());
+    assert!(
+        stderr(&named_shared).contains("syn remember"),
+        "{}",
+        stderr(&named_shared)
     );
 
     let read = machine.run(&["recall", "risky"]);
@@ -296,11 +311,11 @@ fn recall_prints_workspace_scope_and_date_per_hit() {
     stub.with(|state| {
         state.search = Some(
             serde_json::json!({"hits": [
-                {"workspace": "work", "score": 0.9, "id": "m_0000000000000000000001",
+                {"origin": {"workspace": "work"}, "score": 0.9, "id": "m_0000000000000000000001",
                  "content": "Staging deploys go through ArgoCD.", "kind": "project",
                  "scope": "fresha/offers", "tags": [], "pinned": false,
                  "created_at": "2026-07-14T09:00:00Z", "updated_at": "2026-07-14T09:00:00Z"},
-                {"workspace": "shared", "score": 0.4, "id": "m_0000000000000000000002",
+                {"origin": "preference", "score": 0.4, "id": "m_0000000000000000000002",
                  "content": "Prefers Datadog links.", "kind": "user",
                  "scope": "workspace", "tags": [], "pinned": false,
                  "created_at": "2026-06-02T09:00:00Z", "updated_at": "2026-06-02T09:00:00Z"}
@@ -320,7 +335,7 @@ fn recall_prints_workspace_scope_and_date_per_hit() {
     );
     assert_eq!(
         lines[1],
-        "[m_0000000000000000000002] (shared, 2026-06-02) Prefers Datadog links."
+        "[m_0000000000000000000002] (preference, 2026-06-02) Prefers Datadog links."
     );
     assert!(lines[2].starts_with("(2 results, "), "{}", lines[2]);
 }
@@ -331,13 +346,13 @@ fn all_workspaces_recall_groups_hits_by_workspace() {
     stub.with(|state| {
         state.search = Some(
             serde_json::json!({"groups": [
-                {"workspace": "work", "hits": [
-                    {"workspace": "work", "score": 0.9, "id": "m_0000000000000000000001",
+                {"origin": {"workspace": "work"}, "hits": [
+                    {"origin": {"workspace": "work"}, "score": 0.9, "id": "m_0000000000000000000001",
                      "content": "work fact", "kind": "project", "scope": "workspace", "tags": [],
                      "pinned": false, "created_at": "2026-07-14T09:00:00Z", "updated_at": "2026-07-14T09:00:00Z"}]},
-                {"workspace": "personal", "hits": [
-                    {"workspace": "personal", "score": 0.5, "id": "m_0000000000000000000003",
-                     "content": "personal fact", "kind": "user", "scope": "workspace", "tags": [],
+                {"origin": "preference", "hits": [
+                    {"origin": "preference", "score": 0.5, "id": "m_0000000000000000000003",
+                     "content": "a preference", "kind": "user", "scope": "workspace", "tags": [],
                      "pinned": false, "created_at": "2026-07-14T09:00:00Z", "updated_at": "2026-07-14T09:00:00Z"}]}
             ]})
             .to_string(),
@@ -354,10 +369,10 @@ fn all_workspaces_recall_groups_hits_by_workspace() {
         lines[1],
         "[m_0000000000000000000001] (work, 2026-07-14) work fact"
     );
-    assert_eq!(lines[2], "## personal");
+    assert_eq!(lines[2], "## preference");
     assert_eq!(
         lines[3],
-        "[m_0000000000000000000003] (personal, 2026-07-14) personal fact"
+        "[m_0000000000000000000003] (preference, 2026-07-14) a preference"
     );
     assert!(lines[4].starts_with("(2 results, "));
 }
@@ -374,7 +389,7 @@ fn context_prints_a_digest_and_stays_silent_when_empty() {
     stub.with(|state| {
         state.context = Some(
             serde_json::json!({
-                "pinned": [{"workspace": "shared", "id": "m_0000000000000000000002",
+                "pinned": [{"origin": "preference", "id": "m_0000000000000000000002",
                     "content": "Prefers Datadog links", "kind": "user", "scope": "workspace",
                     "tags": [], "pinned": true, "created_at": "2026-06-02T09:00:00Z",
                     "updated_at": "2026-06-02T09:00:00Z"}],
@@ -449,11 +464,15 @@ fn id_commands_target_the_workspace_the_hit_came_from() {
         "forget",
         "m_0000000000000000000002",
         "--workspace",
-        "shared",
+        "personal",
     ]);
 
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("(shared)"), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("(personal)"),
+        "{}",
+        stdout(&output)
+    );
     stub.with(|state| {
         let deleted = state
             .recorded
@@ -462,4 +481,165 @@ fn id_commands_target_the_workspace_the_hit_came_from() {
             .expect("delete reached the server");
         assert_eq!(deleted.path, "/memories/m_0000000000000000000002");
     });
+}
+
+#[test]
+fn preference_flag_routes_id_commands_away_from_any_workspace() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let shown = machine.run(&["show", "m_0000000000000000000002", "--preference"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    assert!(
+        stdout(&shown).contains("(preference,"),
+        "{}",
+        stdout(&shown)
+    );
+
+    let pinned = machine.run(&["pin", "m_0000000000000000000002", "--preference"]);
+    assert!(pinned.status.success(), "{}", stderr(&pinned));
+    assert!(
+        stdout(&pinned).contains("(preference)"),
+        "{}",
+        stdout(&pinned)
+    );
+
+    let forgotten = machine.run(&["forget", "m_0000000000000000000002", "--preference"]);
+    assert!(forgotten.status.success(), "{}", stderr(&forgotten));
+
+    stub.with(|state| {
+        for method in ["GET", "PATCH", "DELETE"] {
+            let hit = state
+                .recorded
+                .iter()
+                .find(|r| r.method == method && r.path.starts_with("/preferences/"))
+                .unwrap_or_else(|| panic!("{method} did not reach /preferences"));
+            assert_eq!(hit.path, "/preferences/m_0000000000000000000002");
+        }
+        assert!(
+            state
+                .recorded
+                .iter()
+                .all(|r| !r.path.starts_with("/memories")),
+            "a preference command touched the workspace surface"
+        );
+    });
+}
+
+#[test]
+fn remember_saves_without_naming_a_workspace_or_inheriting_the_repo_scope() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+    std::fs::create_dir_all(machine.cwd.join(".git")).unwrap();
+
+    let output = machine.run(&[
+        "remember",
+        "Benedikt prefers Datadog links over log tailing",
+    ]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).starts_with("saved m_"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("(preference)"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(json_files(&machine.outbox()).is_empty());
+
+    stub.with(|state| {
+        let put = state
+            .recorded
+            .iter()
+            .find(|r| r.method == "PUT")
+            .expect("preference reached the server");
+        assert!(put.path.starts_with("/preferences/"), "{}", put.path);
+        let body: serde_json::Value = serde_json::from_str(&put.body).unwrap();
+        assert_eq!(body["kind"], "user");
+        assert!(
+            body.get("scope").is_none(),
+            "scope leaked into the body: {body}"
+        );
+    });
+}
+
+#[test]
+fn a_queued_preference_replays_as_a_preference() {
+    let port = dead_port();
+    let machine = Machine::new(&format!("http://127.0.0.1:{port}"));
+
+    let queued = machine.run(&["remember", "prefers oat milk"]);
+    assert!(
+        stdout(&queued).contains("queued locally"),
+        "{}",
+        stdout(&queued)
+    );
+
+    let pending = machine.run(&["list", "--pending"]);
+    assert!(
+        stdout(&pending).contains("(preference) queued"),
+        "{}",
+        stdout(&pending)
+    );
+
+    let untouched = machine.run(&["list", "--pending", "--reassign", "personal"]);
+    assert!(
+        stdout(&untouched).contains("left 1 preferences alone"),
+        "{}",
+        stdout(&untouched)
+    );
+
+    let stub = Stub::start_on(port);
+    let flushed = machine.run(&["context"]);
+    assert!(flushed.status.success(), "{}", stderr(&flushed));
+    assert!(json_files(&machine.outbox()).is_empty());
+    stub.with(|state| {
+        let put = state.puts()[0];
+        assert!(put.path.starts_with("/preferences/"), "{}", put.path);
+    });
+}
+
+#[test]
+fn workspace_map_writes_a_path_rule_that_saves_resolve_against() {
+    let stub = Stub::start();
+    let machine = Machine::with_config(&format!("url = \"{}\"\ntoken = \"t\"\n", stub.url()));
+    std::fs::create_dir_all(machine.cwd.join(".git")).unwrap();
+
+    let refused = machine.run(&["save", "a fact", "--type", "project"]);
+    assert!(
+        !refused.status.success(),
+        "no rule and no default: {}",
+        stdout(&refused)
+    );
+
+    let mapped = machine.run(&["workspace", "map", machine.cwd.to_str().unwrap(), "work"]);
+    assert!(mapped.status.success(), "{}", stderr(&mapped));
+    assert!(
+        stdout(&mapped).contains("resolves to workspace work"),
+        "{}",
+        stdout(&mapped)
+    );
+
+    let saved = machine.run(&["save", "a fact", "--type", "project"]);
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    assert!(
+        stdout(&saved).contains("(work · workspace)"),
+        "{}",
+        stdout(&saved)
+    );
+
+    let remapped = machine.run(&[
+        "workspace",
+        "map",
+        machine.cwd.to_str().unwrap(),
+        "personal",
+    ]);
+    assert!(remapped.status.success(), "{}", stderr(&remapped));
+    let config =
+        std::fs::read_to_string(machine.home.path().join("config").join("config.toml")).unwrap();
+    assert_eq!(config.matches("[[workspace_rules]]").count(), 1, "{config}");
+    assert!(config.contains("workspace = \"personal\""), "{config}");
 }

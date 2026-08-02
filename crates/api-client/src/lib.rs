@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use api::{
     ContextResponse, ExportDoc, HealthResponse, ImportReport, ListResponse, MemoryDto,
-    PatchMemoryBody, PutMemoryBody, SearchResponse, WorkspaceDto, WorkspacesResponse,
+    PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse, WorkspaceDto,
+    WorkspacesResponse,
 };
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -125,6 +126,64 @@ impl SynapseApiClient {
         )
     }
 
+    pub fn save_preference(
+        &self,
+        id: &str,
+        body: &PutPreferenceBody,
+    ) -> Result<MemoryDto, ClientError> {
+        json(
+            self.http
+                .put(self.url(&format!("/preferences/{id}")))
+                .json(body),
+        )
+    }
+
+    pub fn edit_preference(
+        &self,
+        id: &str,
+        body: &PatchMemoryBody,
+    ) -> Result<MemoryDto, ClientError> {
+        json(
+            self.http
+                .patch(self.url(&format!("/preferences/{id}")))
+                .json(body),
+        )
+    }
+
+    pub fn forget_preference(&self, id: &str) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .delete(self.url(&format!("/preferences/{id}")))
+            .send()?;
+        check(response).map(drop)
+    }
+
+    pub fn get_preference(&self, id: &str) -> Result<MemoryDto, ClientError> {
+        json(self.http.get(self.url(&format!("/preferences/{id}"))))
+    }
+
+    pub fn list_preferences(&self) -> Result<Vec<MemoryDto>, ClientError> {
+        let body: ListResponse = json(self.http.get(self.url("/preferences")))?;
+        Ok(body.memories)
+    }
+
+    pub fn export_preferences(&self) -> Result<ExportDoc, ClientError> {
+        json(self.http.get(self.url("/preferences/export")))
+    }
+
+    pub fn import_preferences(
+        &self,
+        merge: bool,
+        doc: &ExportDoc,
+    ) -> Result<ImportReport, ClientError> {
+        json(
+            self.http
+                .post(self.url("/preferences/import"))
+                .query(&[("mode", import_mode(merge))])
+                .json(doc),
+        )
+    }
+
     pub fn search(
         &self,
         workspace: &str,
@@ -212,14 +271,17 @@ impl SynapseApiClient {
         merge: bool,
         doc: &ExportDoc,
     ) -> Result<ImportReport, ClientError> {
-        let mode = if merge { "merge" } else { "fail-if-nonempty" };
         json(
             self.http
                 .post(self.url("/import"))
-                .query(&[("ws", workspace), ("mode", mode)])
+                .query(&[("ws", workspace), ("mode", import_mode(merge))])
                 .json(doc),
         )
     }
+}
+
+fn import_mode(merge: bool) -> &'static str {
+    if merge { "merge" } else { "fail-if-nonempty" }
 }
 
 fn json<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, ClientError> {

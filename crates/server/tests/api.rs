@@ -94,6 +94,16 @@ async fn put_memory(router: &Router, ws: &str, n: u32, content: &str) -> (Status
     .await
 }
 
+async fn put_preference(router: &Router, n: u32, content: &str) -> (StatusCode, Value) {
+    req(
+        router,
+        Method::PUT,
+        &format!("/preferences/{}", mid(n)),
+        Some(json!({ "content": content, "kind": "user", "tags": [] })),
+    )
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn health_workspaces_and_name_validation() {
     let dir = TempDir::new().unwrap();
@@ -105,7 +115,7 @@ async fn health_workspaces_and_name_validation() {
 
     let (status, body) = req(&router, Method::GET, "/workspaces", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["workspaces"], json!(["shared"]));
+    assert_eq!(body["workspaces"], json!([]));
 
     let (status, _) = req(&router, Method::PUT, "/workspaces/work", None).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -113,7 +123,7 @@ async fn health_workspaces_and_name_validation() {
     assert_eq!(status, StatusCode::OK);
 
     let (_, body) = req(&router, Method::GET, "/workspaces", None).await;
-    assert_eq!(body["workspaces"], json!(["shared", "work"]));
+    assert_eq!(body["workspaces"], json!(["work"]));
 
     for bad in ["Work", "wo_rk", "shared", &"a".repeat(33)] {
         let (status, _) = req(&router, Method::PUT, &format!("/workspaces/{bad}"), None).await;
@@ -215,7 +225,7 @@ async fn search_fuses_and_respects_workspace_isolation() {
     )
     .await;
     put_memory(&router, "personal", 3, "personal home server deploy notes").await;
-    put_memory(&router, "shared", 4, "prefers oat milk in coffee").await;
+    put_preference(&router, 4, "prefers oat milk in coffee").await;
 
     let (status, body) = req(
         &router,
@@ -231,7 +241,8 @@ async fn search_fuses_and_respects_workspace_isolation() {
         "work deploy memory missing: {body}"
     );
     assert!(
-        hits.iter().all(|h| h["workspace"] != "personal"),
+        hits.iter()
+            .all(|h| h["origin"] != json!({"workspace": "personal"})),
         "personal leaked into work search: {body}"
     );
     assert!(
@@ -265,21 +276,23 @@ async fn search_fuses_and_respects_workspace_isolation() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let groups = body["groups"].as_array().expect("groups");
-    let names: Vec<&str> = groups
-        .iter()
-        .map(|g| g["workspace"].as_str().unwrap())
-        .collect();
+    let names: Vec<String> = groups.iter().map(|g| g["origin"].to_string()).collect();
     assert!(
-        names.contains(&"work") && names.contains(&"personal"),
+        names.contains(&r#"{"workspace":"work"}"#.to_string())
+            && names.contains(&r#"{"workspace":"personal"}"#.to_string()),
         "{body}"
     );
     assert!(
-        names.iter().filter(|n| **n == "shared").count() <= 1,
-        "shared emitted more than once: {body}"
+        !names.iter().any(|n| n.contains("shared")),
+        "the shared database leaked into grouped output: {body}"
+    );
+    assert!(
+        names.iter().filter(|n| *n == "\"preference\"").count() <= 1,
+        "preferences emitted more than once: {body}"
     );
     let personal_group = groups
         .iter()
-        .find(|g| g["workspace"] == "personal")
+        .find(|g| g["origin"] == json!({"workspace": "personal"}))
         .unwrap();
     assert!(
         personal_group["hits"]
@@ -292,25 +305,114 @@ async fn search_fuses_and_respects_workspace_isolation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn search_on_shared_workspace_queries_once() {
+async fn shared_is_not_addressable_as_a_workspace() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;
-    put_memory(&router, "shared", 1, "always use ripgrep for code search").await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+
+    for uri in [
+        format!("/memories/{}?ws=shared", mid(1)),
+        "/memories?ws=shared".to_string(),
+        "/memories/search?ws=shared&q=anything".to_string(),
+        "/context?ws=shared".to_string(),
+        "/export?ws=shared".to_string(),
+    ] {
+        let (status, body) = req(&router, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} was accepted");
+        assert!(
+            body["error"].as_str().unwrap().contains("/preferences"),
+            "{uri}: {body}"
+        );
+    }
+    let (status, _) = req(
+        &router,
+        Method::PUT,
+        &format!("/memories/{}?ws=shared", mid(1)),
+        Some(put_body("sneaking in")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preferences_are_reachable_from_any_workspace_and_project() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    req(&router, Method::PUT, "/workspaces/personal", None).await;
+
+    let (status, body) = put_preference(&router, 1, "always use ripgrep for code search").await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["scope"], "workspace");
+
+    let (status, replay) = put_preference(&router, 1, "always use ripgrep for code search").await;
+    assert_eq!(status, StatusCode::OK, "replay must be idempotent");
+    assert_eq!(replay["id"], body["id"]);
+    let (status, _) = put_preference(&router, 1, "a different payload under the same id").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    for ws in ["work", "personal"] {
+        let (status, body) = req(
+            &router,
+            Method::GET,
+            &format!("/memories/search?ws={ws}&q=ripgrep%20code%20search&scope=fresha/offers"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let hits = body["hits"].as_array().unwrap();
+        let found: Vec<&Value> = hits.iter().filter(|h| h["id"] == mid(1)).collect();
+        assert_eq!(found.len(), 1, "preference missing from {ws}: {body}");
+        assert_eq!(found[0]["origin"], "preference", "{body}");
+    }
 
     let (status, body) = req(
         &router,
         Method::GET,
-        "/memories/search?ws=shared&q=ripgrep%20code%20search",
+        &format!("/preferences/{}", mid(1)),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let hits = body["hits"].as_array().unwrap();
-    assert_eq!(
-        hits.iter().filter(|h| h["id"] == mid(1)).count(),
-        1,
-        "shared hit duplicated or missing: {body}"
-    );
+    assert_eq!(body["id"], mid(1));
+
+    let (status, body) = req(
+        &router,
+        Method::PATCH,
+        &format!("/preferences/{}", mid(1)),
+        Some(json!({ "pinned": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pinned"], true);
+
+    let (status, body) = req(&router, Method::GET, "/preferences", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["memories"].as_array().unwrap().len(), 1);
+
+    let (status, dump) = req(&router, Method::GET, "/preferences/export", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dump["origin"], "preference");
+    assert!(!dump.to_string().contains("shared"), "{dump}");
+
+    let (status, _) = req(
+        &router,
+        Method::DELETE,
+        &format!("/preferences/{}", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, report) = req(
+        &router,
+        Method::POST,
+        "/preferences/import?mode=merge",
+        Some(dump),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(report["imported"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -338,16 +440,7 @@ async fn context_digest_sections() {
     )
     .await;
     put_memory(&router, "work", 3, "workspace wide convention").await;
-    req(
-        &router,
-        Method::PUT,
-        &format!("/memories/{}?ws=shared", mid(4)),
-        Some(
-            json!({ "content": "prefers tables over prose", "kind": "user",
-                     "scope": "workspace", "tags": [] }),
-        ),
-    )
-    .await;
+    put_preference(&router, 4, "prefers tables over prose").await;
 
     let (status, body) = req(
         &router,
@@ -712,7 +805,7 @@ async fn registry_recovers_from_crash_and_rejects_invalid_files() {
     let (status, body) = send(&router, Method::GET, "/health", None, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (_, body) = req(&router, Method::GET, "/workspaces", None).await;
-    assert_eq!(body["workspaces"], json!(["half", "shared"]));
+    assert_eq!(body["workspaces"], json!(["half"]));
 
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("Bad.db"), b"").unwrap();

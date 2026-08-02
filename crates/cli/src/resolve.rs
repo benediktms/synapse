@@ -5,11 +5,13 @@ use domain::{Scope, Workspace};
 
 use crate::config::Config;
 
-pub const SHARED: &str = "shared";
-
 pub fn validate_workspace(name: &str) -> Result<String, String> {
-    if name == SHARED {
-        return Ok(SHARED.to_string());
+    if name == "shared" {
+        return Err(
+            "\"shared\" is not a workspace; use `syn remember` to save a memory that applies \
+             everywhere, or --preference to act on one"
+                .into(),
+        );
     }
     Workspace::new(name)
         .map(|ws| ws.to_string())
@@ -331,13 +333,19 @@ mod tests {
             "personal"
         );
         assert_eq!(
-            resolve_workspace(&config, Some("shared"), &repo, true).unwrap(),
-            "shared"
-        );
-        assert_eq!(
             resolve_workspace(&config, None, root.path(), true).unwrap(),
             "personal"
         );
+    }
+
+    #[test]
+    fn shared_is_not_addressable_as_a_workspace() {
+        let err = validate_workspace("shared").unwrap_err();
+        assert!(err.contains("syn remember"), "{err}");
+        assert!(err.contains("--preference"), "{err}");
+
+        let config = config_with(&[], Some("work"));
+        assert!(resolve_workspace(&config, Some("shared"), Path::new("/"), false).is_err());
     }
 
     #[test]

@@ -1,10 +1,36 @@
 use domain::{
     ContextDigest, DigestEntry, Memory, MemoryId, MemoryKind, RecallHit, Scope, Timestamp,
-    WorkspaceHits,
+    Workspace, WorkspaceHits,
 };
 use serde::{Deserialize, Serialize};
 
 pub const EXPORT_VERSION: u32 = 1;
+
+/// Where a memory came from, as clients are allowed to see it. The shared database
+/// backing preferences is a storage detail and is never named on the wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    Preference,
+    Workspace(String),
+}
+
+impl Origin {
+    pub fn of(workspace: &Workspace) -> Self {
+        if workspace.is_shared() {
+            Self::Preference
+        } else {
+            Self::Workspace(workspace.to_string())
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Preference => "preference",
+            Self::Workspace(name) => name,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemoryDto {
@@ -57,6 +83,14 @@ pub struct PutMemoryBody {
     pub tags: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PutPreferenceBody {
+    pub content: String,
+    pub kind: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PatchMemoryBody {
     pub content: Option<String>,
@@ -66,7 +100,7 @@ pub struct PatchMemoryBody {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HitDto {
-    pub workspace: String,
+    pub origin: Origin,
     pub score: f64,
     #[serde(flatten)]
     pub memory: MemoryDto,
@@ -75,7 +109,7 @@ pub struct HitDto {
 impl From<&RecallHit> for HitDto {
     fn from(hit: &RecallHit) -> Self {
         Self {
-            workspace: hit.workspace.to_string(),
+            origin: Origin::of(&hit.workspace),
             score: hit.score,
             memory: MemoryDto::from(&hit.memory),
         }
@@ -83,15 +117,15 @@ impl From<&RecallHit> for HitDto {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WorkspaceHitsDto {
-    pub workspace: String,
+pub struct HitGroupDto {
+    pub origin: Origin,
     pub hits: Vec<HitDto>,
 }
 
-impl From<&WorkspaceHits> for WorkspaceHitsDto {
+impl From<&WorkspaceHits> for HitGroupDto {
     fn from(group: &WorkspaceHits) -> Self {
         Self {
-            workspace: group.workspace.to_string(),
+            origin: Origin::of(&group.workspace),
             hits: group.hits.iter().map(HitDto::from).collect(),
         }
     }
@@ -100,13 +134,13 @@ impl From<&WorkspaceHits> for WorkspaceHitsDto {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SearchResponse {
-    Grouped { groups: Vec<WorkspaceHitsDto> },
+    Grouped { groups: Vec<HitGroupDto> },
     Flat { hits: Vec<HitDto> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DigestEntryDto {
-    pub workspace: String,
+    pub origin: Origin,
     #[serde(flatten)]
     pub memory: MemoryDto,
 }
@@ -114,7 +148,7 @@ pub struct DigestEntryDto {
 impl From<&DigestEntry> for DigestEntryDto {
     fn from(entry: &DigestEntry) -> Self {
         Self {
-            workspace: entry.workspace.to_string(),
+            origin: Origin::of(&entry.workspace),
             memory: MemoryDto::from(&entry.memory),
         }
     }
@@ -153,7 +187,7 @@ pub struct ListResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExportDoc {
     pub version: u32,
-    pub workspace: String,
+    pub origin: Origin,
     pub memories: Vec<MemoryDto>,
 }
 
@@ -178,4 +212,55 @@ pub struct HealthResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory() -> MemoryDto {
+        MemoryDto {
+            id: "m_0000000000000000000001".into(),
+            content: "a fact".into(),
+            kind: "user".into(),
+            scope: "workspace".into(),
+            tags: vec![],
+            pinned: false,
+            created_at: "2026-08-02T10:00:00Z".into(),
+            updated_at: "2026-08-02T10:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn shared_becomes_preference_and_never_names_the_backing_workspace() {
+        assert_eq!(Origin::of(&Workspace::shared()), Origin::Preference);
+        assert_eq!(
+            Origin::of(&Workspace::new("work").unwrap()),
+            Origin::Workspace("work".into())
+        );
+        let json = serde_json::to_string(&HitDto {
+            origin: Origin::Preference,
+            score: 0.5,
+            memory: memory(),
+        })
+        .unwrap();
+        assert!(json.contains(r#""origin":"preference""#), "{json}");
+        assert!(!json.contains("shared"), "{json}");
+    }
+
+    #[test]
+    fn hits_survive_a_wire_roundtrip_alongside_the_flattened_memory() {
+        for origin in [Origin::Preference, Origin::Workspace("work".into())] {
+            let hit = HitDto {
+                origin: origin.clone(),
+                score: 0.75,
+                memory: memory(),
+            };
+            let text = serde_json::to_string(&hit).unwrap();
+            let back: HitDto = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.origin, origin);
+            assert_eq!(back.score, 0.75);
+            assert_eq!(back.memory.id, hit.memory.id);
+        }
+    }
 }

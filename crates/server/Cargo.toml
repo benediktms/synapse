@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 adapters-fastembed = { path = "../adapters-fastembed" }
 adapters-sqlite = { path = "../adapters-sqlite" }
-api = { path = "../api" }
+api = { path = "../api", features = ["server"] }
 axum = "0.8"
 domain = { path = "../domain" }
 humantime = "2"

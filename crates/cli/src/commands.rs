@@ -2,16 +2,18 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use api::{ExportDoc, PatchMemoryBody, PutMemoryBody, SearchResponse};
+use api::{
+    ExportDoc, MemoryDto, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse,
+};
 use api_client::SynapseApiClient;
 use domain::MemoryId;
 
 use crate::args::{
     Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, ListArgs, RecallArgs,
-    SaveArgs, WorkspaceArgs, WorkspaceCommand,
+    RememberArgs, SaveArgs, WorkspaceArgs, WorkspaceCommand,
 };
-use crate::config::Config;
-use crate::outbox::{FlushReport, Outbox, PendingSave, now_millis};
+use crate::config::{Config, WorkspaceRule};
+use crate::outbox::{FlushReport, Outbox, PendingSave, SaveTarget, now_millis};
 use crate::output;
 use crate::resolve;
 
@@ -25,6 +27,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
     let ctx = Context { config, cwd };
     match cli.command {
         Command::Save(args) => save(&ctx, args),
+        Command::Remember(args) => remember(&ctx, args),
         Command::Recall(args) => recall(&ctx, args),
         Command::Context(args) => context(&ctx, args),
         Command::Edit(args) => edit(&ctx, args),
@@ -75,23 +78,48 @@ fn save(ctx: &Context, args: SaveArgs) -> Result<(), String> {
     if let Some(note) = &scope.note {
         eprintln!("note: {note}");
     }
+    queue_and_flush(
+        &client,
+        SaveTarget::Memory {
+            workspace,
+            body: PutMemoryBody {
+                content: args.content,
+                kind: args.kind,
+                scope: scope.scope,
+                tags: args.tags,
+            },
+        },
+    )
+}
+
+fn remember(ctx: &Context, args: RememberArgs) -> Result<(), String> {
+    let client = ctx.client(WRITE_TIMEOUT)?;
+    queue_and_flush(
+        &client,
+        SaveTarget::Preference {
+            body: PutPreferenceBody {
+                content: args.content,
+                kind: args.kind,
+                tags: args.tags,
+            },
+        },
+    )
+}
+
+/// The outbox is written before the first send, so a reply lost in flight replays
+/// against the same id and the idempotent PUT collapses it.
+fn queue_and_flush(client: &SynapseApiClient, target: SaveTarget) -> Result<(), String> {
     let id = MemoryId::generate().to_string();
+    let where_to = target.label();
     let item = PendingSave {
         id: id.clone(),
-        workspace: workspace.clone(),
         queued_at: now_millis(),
-        body: PutMemoryBody {
-            content: args.content,
-            kind: args.kind,
-            scope: scope.scope.clone(),
-            tags: args.tags,
-        },
+        target,
         failure: None,
     };
     let outbox = Outbox::open()?;
     outbox.enqueue(&item)?;
-    let report = outbox.flush(&client)?;
-    let where_to = format!("{workspace} · {}", scope.scope);
+    let report = outbox.flush(client)?;
     if report.sent.contains(&id) {
         println!("saved {id} ({where_to})");
         return Ok(());
@@ -140,7 +168,7 @@ fn recall(ctx: &Context, args: RecallArgs) -> Result<(), String> {
         }
         SearchResponse::Grouped { groups } => {
             for group in groups {
-                let _ = writeln!(out, "## {}", group.workspace);
+                let _ = writeln!(out, "## {}", group.origin.label());
                 for hit in &group.hits {
                     let _ = writeln!(out, "{}", output::hit_line(hit));
                 }
@@ -166,42 +194,67 @@ fn context(ctx: &Context, args: ContextArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Which store an id-based command acts on. `--preference` skips workspace
+/// resolution entirely — preferences belong to no workspace.
+fn resolve_target(
+    ctx: &Context,
+    workspace: Option<&str>,
+    preference: bool,
+) -> Result<Origin, String> {
+    if preference {
+        Ok(Origin::Preference)
+    } else {
+        ctx.workspace(workspace, false).map(Origin::Workspace)
+    }
+}
+
+fn patch(
+    client: &SynapseApiClient,
+    target: &Origin,
+    id: &str,
+    body: &PatchMemoryBody,
+) -> Result<MemoryDto, String> {
+    match target {
+        Origin::Preference => client.edit_preference(id, body),
+        Origin::Workspace(workspace) => client.edit(workspace, id, body),
+    }
+    .map_err(|e| e.to_string())
+}
+
 fn edit(ctx: &Context, args: EditArgs) -> Result<(), String> {
     let client = ctx.client(WRITE_TIMEOUT)?;
-    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    let target = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
     let body = PatchMemoryBody {
         content: Some(args.content),
         ..PatchMemoryBody::default()
     };
-    let memory = client
-        .edit(&workspace, &args.id, &body)
-        .map_err(|e| e.to_string())?;
-    println!("updated {} ({workspace})", memory.id);
+    let memory = patch(&client, &target, &args.id, &body)?;
+    println!("updated {} ({})", memory.id, target.label());
     Ok(())
 }
 
 fn forget(ctx: &Context, args: IdArgs) -> Result<(), String> {
     let client = ctx.client(WRITE_TIMEOUT)?;
-    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
-    client
-        .forget(&workspace, &args.id)
-        .map_err(|e| e.to_string())?;
-    println!("forgot {} ({workspace})", args.id);
+    let target = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
+    match &target {
+        Origin::Preference => client.forget_preference(&args.id),
+        Origin::Workspace(workspace) => client.forget(workspace, &args.id),
+    }
+    .map_err(|e| e.to_string())?;
+    println!("forgot {} ({})", args.id, target.label());
     Ok(())
 }
 
 fn set_pinned(ctx: &Context, args: IdArgs, pinned: bool) -> Result<(), String> {
     let client = ctx.client(WRITE_TIMEOUT)?;
-    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    let target = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
     let body = PatchMemoryBody {
         pinned: Some(pinned),
         ..PatchMemoryBody::default()
     };
-    let memory = client
-        .edit(&workspace, &args.id, &body)
-        .map_err(|e| e.to_string())?;
+    let memory = patch(&client, &target, &args.id, &body)?;
     let verb = if pinned { "pinned" } else { "unpinned" };
-    println!("{verb} {} ({workspace})", memory.id);
+    println!("{verb} {} ({})", memory.id, target.label());
     Ok(())
 }
 
@@ -211,9 +264,14 @@ fn list(ctx: &Context, args: ListArgs) -> Result<(), String> {
     }
     let client = ctx.client(READ_TIMEOUT)?;
     flush_quietly(&client);
-    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
-    for memory in client.list(&workspace).map_err(|e| e.to_string())? {
-        println!("{}", output::memory_line(&workspace, &memory));
+    let target = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
+    let memories = match &target {
+        Origin::Preference => client.list_preferences(),
+        Origin::Workspace(workspace) => client.list(workspace),
+    }
+    .map_err(|e| e.to_string())?;
+    for memory in memories {
+        println!("{}", output::memory_line(&target, &memory));
     }
     Ok(())
 }
@@ -222,8 +280,11 @@ fn pending(args: ListArgs) -> Result<(), String> {
     let outbox = Outbox::open()?;
     if let Some(workspace) = &args.reassign {
         let workspace = resolve::validate_workspace(workspace)?;
-        let moved = outbox.reassign(&workspace, args.id.as_deref())?;
+        let (moved, skipped) = outbox.reassign(&workspace, args.id.as_deref())?;
         println!("reassigned {moved} pending saves to {workspace}");
+        if skipped > 0 {
+            println!("left {skipped} preferences alone; they belong to no workspace");
+        }
         return Ok(());
     }
     if args.discard {
@@ -234,19 +295,17 @@ fn pending(args: ListArgs) -> Result<(), String> {
     let now = now_millis();
     for (_, item) in outbox.pending()? {
         println!(
-            "[{}] ({} · {}) queued {}",
+            "[{}] ({}) queued {}",
             item.id,
-            item.workspace,
-            item.body.scope,
+            item.target.label(),
             age(now, item.queued_at)
         );
     }
     for (_, item) in outbox.dead_letters()? {
         println!(
-            "[{}] ({} · {}) dead-letter: {}",
+            "[{}] ({}) dead-letter: {}",
             item.id,
-            item.workspace,
-            item.body.scope,
+            item.target.label(),
             item.failure.as_deref().unwrap_or("unknown failure")
         );
     }
@@ -266,11 +325,13 @@ fn age(now: u64, queued_at: u64) -> String {
 fn show(ctx: &Context, args: IdArgs) -> Result<(), String> {
     let client = ctx.client(READ_TIMEOUT)?;
     flush_quietly(&client);
-    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
-    let memory = client
-        .get(&workspace, &args.id)
-        .map_err(|e| e.to_string())?;
-    println!("{}", output::memory_line(&workspace, &memory));
+    let target = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
+    let memory = match &target {
+        Origin::Preference => client.get_preference(&args.id),
+        Origin::Workspace(workspace) => client.get(workspace, &args.id),
+    }
+    .map_err(|e| e.to_string())?;
+    println!("{}", output::memory_line(&target, &memory));
     if !memory.tags.is_empty() {
         println!("tags: {}", memory.tags.join(", "));
     }
@@ -311,13 +372,34 @@ fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
             println!("default workspace set to {name}");
             Ok(())
         }
+        WorkspaceCommand::Map { path, name } => {
+            let name = resolve::validate_workspace(&name)?;
+            let path = path
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?
+                .to_string_lossy()
+                .to_string();
+            let mut config = ctx.config.clone();
+            config.workspace_rules.retain(|rule| rule.path != path);
+            config.workspace_rules.push(WorkspaceRule {
+                path: path.clone(),
+                workspace: name.clone(),
+            });
+            config.save()?;
+            println!("{path} now resolves to workspace {name}");
+            Ok(())
+        }
     }
 }
 
 fn export(ctx: &Context, args: WorkspaceArgs) -> Result<(), String> {
     let client = ctx.client(BULK_TIMEOUT)?;
-    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
-    let doc = client.export(&workspace).map_err(|e| e.to_string())?;
+    let target = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
+    let doc = match &target {
+        Origin::Preference => client.export_preferences(),
+        Origin::Workspace(workspace) => client.export(workspace),
+    }
+    .map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     println!("{json}");
     Ok(())
@@ -325,19 +407,23 @@ fn export(ctx: &Context, args: WorkspaceArgs) -> Result<(), String> {
 
 fn import(ctx: &Context, args: ImportArgs) -> Result<(), String> {
     let client = ctx.client(BULK_TIMEOUT)?;
-    let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
+    let target = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
         .map_err(|e| format!("cannot read dump from stdin: {e}"))?;
     let doc: ExportDoc =
         serde_json::from_str(&input).map_err(|e| format!("invalid dump on stdin: {e}"))?;
-    let report = client
-        .import(&workspace, args.merge, &doc)
-        .map_err(|e| e.to_string())?;
+    let report = match &target {
+        Origin::Preference => client.import_preferences(args.merge, &doc),
+        Origin::Workspace(workspace) => client.import(workspace, args.merge, &doc),
+    }
+    .map_err(|e| e.to_string())?;
     println!(
-        "imported {} memories into {workspace} ({} unchanged)",
-        report.imported, report.unchanged
+        "imported {} memories into {} ({} unchanged)",
+        report.imported,
+        target.label(),
+        report.unchanged
     );
     Ok(())
 }

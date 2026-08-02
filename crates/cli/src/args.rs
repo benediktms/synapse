@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -9,8 +11,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Save a durable memory
+    /// Save a durable memory in the resolved workspace
     Save(SaveArgs),
+    /// Save a memory that applies everywhere, in every workspace and project
+    Remember(RememberArgs),
     /// Hybrid search over the active workspace and `shared`
     Recall(RecallArgs),
     /// Session-start digest for the current project
@@ -55,6 +59,15 @@ pub struct SaveArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct RememberArgs {
+    pub content: String,
+    #[arg(long = "type", value_name = "KIND", default_value = "user", value_parser = ["user", "feedback", "project", "reference"])]
+    pub kind: String,
+    #[arg(long, value_delimiter = ',')]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct RecallArgs {
     pub query: String,
     #[arg(long)]
@@ -80,21 +93,30 @@ pub struct ContextArgs {
 pub struct EditArgs {
     pub id: String,
     pub content: String,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "preference")]
     pub workspace: Option<String>,
+    /// Target a memory that applies everywhere
+    #[arg(long)]
+    pub preference: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct IdArgs {
     pub id: String,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "preference")]
     pub workspace: Option<String>,
+    /// Target a memory that applies everywhere
+    #[arg(long)]
+    pub preference: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    #[arg(long)]
+    #[arg(long, conflicts_with = "preference")]
     pub workspace: Option<String>,
+    /// List memories that apply everywhere
+    #[arg(long, conflicts_with = "pending")]
+    pub preference: bool,
     /// Show locally queued saves and dead-lettered items instead
     #[arg(long)]
     pub pending: bool,
@@ -111,15 +133,21 @@ pub struct ListArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkspaceArgs {
-    #[arg(long)]
+    #[arg(long, conflicts_with = "preference")]
     pub workspace: Option<String>,
+    /// Dump the memories that apply everywhere
+    #[arg(long)]
+    pub preference: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct ImportArgs {
-    #[arg(long)]
+    #[arg(long, conflicts_with = "preference")]
     pub workspace: Option<String>,
-    /// Merge into a non-empty workspace instead of failing
+    /// Restore into the memories that apply everywhere
+    #[arg(long)]
+    pub preference: bool,
+    /// Merge into a non-empty target instead of failing
     #[arg(long)]
     pub merge: bool,
 }
@@ -132,6 +160,8 @@ pub enum WorkspaceCommand {
     Create { name: String },
     /// Set this machine's default workspace
     Use { name: String },
+    /// Bind a directory tree to a workspace, so saves under it resolve without a flag
+    Map { path: PathBuf, name: String },
 }
 
 #[derive(Debug, Subcommand)]

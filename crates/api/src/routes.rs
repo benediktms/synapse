@@ -19,9 +19,9 @@ use tracing::Level;
 
 use crate::backend::Backend;
 use crate::dto::{
-    ContextResponse, EXPORT_VERSION, ExportDoc, HealthResponse, HitDto, ImportReport, ListResponse,
-    MemoryDto, PatchMemoryBody, PutMemoryBody, SearchResponse, WorkspaceDto, WorkspaceHitsDto,
-    WorkspacesResponse,
+    ContextResponse, EXPORT_VERSION, ExportDoc, HealthResponse, HitDto, HitGroupDto, ImportReport,
+    ListResponse, MemoryDto, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody,
+    SearchResponse, WorkspaceDto, WorkspacesResponse,
 };
 use crate::error::ApiError;
 use crate::validate::{validate_content, validate_query, validate_tags, validate_timestamp};
@@ -61,6 +61,19 @@ pub fn router<B: Backend>(backend: B, token: &str) -> Router {
         )
         .route("/memories", get(list_memories::<B>))
         .route("/memories/search", get(search::<B>))
+        .route(
+            "/preferences/{id}",
+            put(put_preference::<B>)
+                .patch(patch_preference::<B>)
+                .delete(delete_preference::<B>)
+                .get(get_preference::<B>),
+        )
+        .route("/preferences", get(list_preferences::<B>))
+        .route("/preferences/export", get(export_preferences::<B>))
+        .route(
+            "/preferences/import",
+            axum::routing::post(import_preferences::<B>),
+        )
         .route("/context", get(context::<B>))
         .route("/export", get(export::<B>))
         .route("/import", axum::routing::post(import::<B>))
@@ -143,10 +156,12 @@ struct WsQuery {
 
 fn parse_ws(name: &str) -> Result<Workspace, ApiError> {
     if name == "shared" {
-        Ok(Workspace::shared())
-    } else {
-        Workspace::new(name).map_err(ApiError::from)
+        return Err(ApiError::BadRequest(
+            "\"shared\" is not a workspace; memories that apply everywhere live under /preferences"
+                .into(),
+        ));
     }
+    Workspace::new(name).map_err(ApiError::from)
 }
 
 fn require_ws(query: &WsQuery) -> Result<Workspace, ApiError> {
@@ -195,20 +210,20 @@ async fn get_workspaces<B: Backend>(
         .workspaces()
         .await?
         .iter()
+        .filter(|ws| !ws.is_shared())
         .map(Workspace::to_string)
         .collect();
     workspaces.sort();
     Ok(Json(WorkspacesResponse { workspaces }))
 }
 
-async fn put_memory<B: Backend>(
-    State(state): State<AppState<B>>,
-    Path(id): Path<String>,
-    Query(query): Query<WsQuery>,
-    Json(body): Json<PutMemoryBody>,
+async fn save_into<B: Backend>(
+    state: &AppState<B>,
+    ws: &Workspace,
+    id: &str,
+    body: PutMemoryBody,
 ) -> Result<(StatusCode, Json<MemoryDto>), ApiError> {
-    let ws = require_ws(&query)?;
-    let id = MemoryId::parse(&id)?;
+    let id = MemoryId::parse(id)?;
     validate_content(&state.backend, &body.content)?;
     validate_tags(&body.tags)?;
     let request = SaveRequest {
@@ -218,10 +233,34 @@ async fn put_memory<B: Backend>(
         scope: Scope::parse(&body.scope)?,
         tags: body.tags,
     };
-    match state.backend.save(&ws, request).await? {
+    match state.backend.save(ws, request).await? {
         SaveOutcome::Created(memory) => Ok((StatusCode::CREATED, Json(MemoryDto::from(&memory)))),
         SaveOutcome::Unchanged(memory) => Ok((StatusCode::OK, Json(MemoryDto::from(&memory)))),
     }
+}
+
+async fn put_memory<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Query(query): Query<WsQuery>,
+    Json(body): Json<PutMemoryBody>,
+) -> Result<(StatusCode, Json<MemoryDto>), ApiError> {
+    let ws = require_ws(&query)?;
+    save_into(&state, &ws, &id, body).await
+}
+
+async fn put_preference<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Json(body): Json<PutPreferenceBody>,
+) -> Result<(StatusCode, Json<MemoryDto>), ApiError> {
+    let body = PutMemoryBody {
+        content: body.content,
+        kind: body.kind,
+        scope: Scope::Workspace.as_str().to_string(),
+        tags: body.tags,
+    };
+    save_into(&state, &Workspace::shared(), &id, body).await
 }
 
 #[derive(Deserialize)]
@@ -256,7 +295,7 @@ async fn search<B: Backend>(
     if params.all.unwrap_or(false) {
         let groups = state.backend.recall_all(&request).await?;
         Ok(Json(SearchResponse::Grouped {
-            groups: groups.iter().map(WorkspaceHitsDto::from).collect(),
+            groups: groups.iter().map(HitGroupDto::from).collect(),
         }))
     } else {
         let ws = require_ws(&WsQuery { ws: params.ws })?;
@@ -283,14 +322,13 @@ async fn context<B: Backend>(
     Ok(Json(ContextResponse::from(&digest)))
 }
 
-async fn patch_memory<B: Backend>(
-    State(state): State<AppState<B>>,
-    Path(id): Path<String>,
-    Query(query): Query<WsQuery>,
-    Json(body): Json<PatchMemoryBody>,
+async fn edit_in<B: Backend>(
+    state: &AppState<B>,
+    ws: &Workspace,
+    id: &str,
+    body: PatchMemoryBody,
 ) -> Result<Json<MemoryDto>, ApiError> {
-    let ws = require_ws(&query)?;
-    let id = MemoryId::parse(&id)?;
+    let id = MemoryId::parse(id)?;
     if let Some(content) = &body.content {
         validate_content(&state.backend, content)?;
     }
@@ -302,8 +340,36 @@ async fn patch_memory<B: Backend>(
         tags: body.tags,
         pinned: body.pinned,
     };
-    let memory = state.backend.edit(&ws, &id, request).await?;
+    let memory = state.backend.edit(ws, &id, request).await?;
     Ok(Json(MemoryDto::from(&memory)))
+}
+
+async fn patch_memory<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Query(query): Query<WsQuery>,
+    Json(body): Json<PatchMemoryBody>,
+) -> Result<Json<MemoryDto>, ApiError> {
+    let ws = require_ws(&query)?;
+    edit_in(&state, &ws, &id, body).await
+}
+
+async fn patch_preference<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchMemoryBody>,
+) -> Result<Json<MemoryDto>, ApiError> {
+    edit_in(&state, &Workspace::shared(), &id, body).await
+}
+
+async fn forget_in<B: Backend>(
+    state: &AppState<B>,
+    ws: &Workspace,
+    id: &str,
+) -> Result<StatusCode, ApiError> {
+    let id = MemoryId::parse(id)?;
+    state.backend.forget(ws, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_memory<B: Backend>(
@@ -312,9 +378,28 @@ async fn delete_memory<B: Backend>(
     Query(query): Query<WsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let ws = require_ws(&query)?;
-    let id = MemoryId::parse(&id)?;
-    state.backend.forget(&ws, &id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    forget_in(&state, &ws, &id).await
+}
+
+async fn delete_preference<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    forget_in(&state, &Workspace::shared(), &id).await
+}
+
+async fn fetch_in<B: Backend>(
+    state: &AppState<B>,
+    ws: &Workspace,
+    id: &str,
+) -> Result<Json<MemoryDto>, ApiError> {
+    let id = MemoryId::parse(id)?;
+    let memory = state
+        .backend
+        .get(ws, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found")))?;
+    Ok(Json(MemoryDto::from(&memory)))
 }
 
 async fn get_memory<B: Backend>(
@@ -323,13 +408,24 @@ async fn get_memory<B: Backend>(
     Query(query): Query<WsQuery>,
 ) -> Result<Json<MemoryDto>, ApiError> {
     let ws = require_ws(&query)?;
-    let id = MemoryId::parse(&id)?;
-    let memory = state
-        .backend
-        .get(&ws, &id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found")))?;
-    Ok(Json(MemoryDto::from(&memory)))
+    fetch_in(&state, &ws, &id).await
+}
+
+async fn get_preference<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+) -> Result<Json<MemoryDto>, ApiError> {
+    fetch_in(&state, &Workspace::shared(), &id).await
+}
+
+async fn list_in<B: Backend>(
+    state: &AppState<B>,
+    ws: &Workspace,
+) -> Result<Json<ListResponse>, ApiError> {
+    let memories = state.backend.list(ws).await?;
+    Ok(Json(ListResponse {
+        memories: memories.iter().map(MemoryDto::from).collect(),
+    }))
 }
 
 async fn list_memories<B: Backend>(
@@ -337,8 +433,23 @@ async fn list_memories<B: Backend>(
     Query(query): Query<WsQuery>,
 ) -> Result<Json<ListResponse>, ApiError> {
     let ws = require_ws(&query)?;
-    let memories = state.backend.list(&ws).await?;
-    Ok(Json(ListResponse {
+    list_in(&state, &ws).await
+}
+
+async fn list_preferences<B: Backend>(
+    State(state): State<AppState<B>>,
+) -> Result<Json<ListResponse>, ApiError> {
+    list_in(&state, &Workspace::shared()).await
+}
+
+async fn export_in<B: Backend>(
+    state: &AppState<B>,
+    ws: &Workspace,
+) -> Result<Json<ExportDoc>, ApiError> {
+    let memories = state.backend.list(ws).await?;
+    Ok(Json(ExportDoc {
+        version: EXPORT_VERSION,
+        origin: Origin::of(ws),
         memories: memories.iter().map(MemoryDto::from).collect(),
     }))
 }
@@ -348,12 +459,13 @@ async fn export<B: Backend>(
     Query(query): Query<WsQuery>,
 ) -> Result<Json<ExportDoc>, ApiError> {
     let ws = require_ws(&query)?;
-    let memories = state.backend.list(&ws).await?;
-    Ok(Json(ExportDoc {
-        version: EXPORT_VERSION,
-        workspace: ws.to_string(),
-        memories: memories.iter().map(MemoryDto::from).collect(),
-    }))
+    export_in(&state, &ws).await
+}
+
+async fn export_preferences<B: Backend>(
+    State(state): State<AppState<B>>,
+) -> Result<Json<ExportDoc>, ApiError> {
+    export_in(&state, &Workspace::shared()).await
 }
 
 #[derive(Deserialize)]
@@ -368,7 +480,24 @@ async fn import<B: Backend>(
     Json(doc): Json<ExportDoc>,
 ) -> Result<Json<ImportReport>, ApiError> {
     let ws = require_ws(&WsQuery { ws: params.ws })?;
-    let merge = match params.mode.as_deref() {
+    import_into(&state, &ws, params.mode.as_deref(), doc).await
+}
+
+async fn import_preferences<B: Backend>(
+    State(state): State<AppState<B>>,
+    Query(params): Query<ImportParams>,
+    Json(doc): Json<ExportDoc>,
+) -> Result<Json<ImportReport>, ApiError> {
+    import_into(&state, &Workspace::shared(), params.mode.as_deref(), doc).await
+}
+
+async fn import_into<B: Backend>(
+    state: &AppState<B>,
+    ws: &Workspace,
+    mode: Option<&str>,
+    doc: ExportDoc,
+) -> Result<Json<ImportReport>, ApiError> {
+    let merge = match mode {
         None | Some("fail-if-nonempty") => false,
         Some("merge") => true,
         Some(other) => {
@@ -395,12 +524,13 @@ async fn import<B: Backend>(
         validate_timestamp(&dto.updated_at).map_err(item)?;
         memories.push(dto.to_memory().map_err(|e| item(ApiError::from(e)))?);
     }
-    if !merge && !state.backend.list(&ws).await?.is_empty() {
+    if !merge && !state.backend.list(ws).await?.is_empty() {
         return Err(ApiError::Conflict(format!(
-            "workspace {ws} is not empty; use mode=merge to import into it"
+            "{} is not empty; use mode=merge to import into it",
+            Origin::of(ws).label()
         )));
     }
-    let report = state.backend.restore(&ws, memories).await?;
+    let report = state.backend.restore(ws, memories).await?;
     Ok(Json(ImportReport {
         imported: report.imported,
         unchanged: report.unchanged,
