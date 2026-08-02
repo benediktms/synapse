@@ -1,0 +1,6 @@
+[package]
+name = "adapters-fastembed"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

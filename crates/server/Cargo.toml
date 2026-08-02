@@ -1,0 +1,10 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "synapse-server"
+path = "src/main.rs"
+
+[dependencies]

@@ -1,0 +1,6 @@
+[package]
+name = "adapters-sqlite"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
