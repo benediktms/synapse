@@ -8,9 +8,16 @@ file and an offline outbox.
 
 ```sh
 export SYNAPSE_TOKEN="$(openssl rand -hex 24)"
+mkdir -p data                          # the bind mount, owned by you
+printf 'SYNAPSE_TOKEN=%s\nSYNAPSE_UID=%s\nSYNAPSE_GID=%s\n' \
+  "$SYNAPSE_TOKEN" "$(id -u)" "$(id -g)" > .env
 docker compose up -d --build
 curl -s localhost:8737/health          # {"status":"ready"}
 ```
+
+`.env` is what makes this stick: `docker compose` reads it in the project directory, so
+every later command runs the container as you rather than as the image's uid 10001. It
+holds the token, so keep it out of version control (`.gitignore` already does).
 
 The image bakes the embedding model (bge-small-en-v1.5) into its layers, so a container
 starts with no network access to the Hugging Face hub and no API keys. Migrations run on
@@ -38,12 +45,11 @@ syn workspace map ~/code/work work    # saves under this tree resolve to `work`
 | `RUST_LOG` | `info` | Request logs redact the token and all bodies. |
 
 `docker-compose.yml` bind-mounts `./data`, which makes the databases inspectable from the
-host during verification. The image runs as an unprivileged `synapse` user (uid 10001), so
-set `SYNAPSE_UID` / `SYNAPSE_GID` to your own ids when `./data` belongs to you:
-
-```sh
-export SYNAPSE_UID=$(id -u) SYNAPSE_GID=$(id -g)
-```
+host during verification. The image runs as an unprivileged `synapse` user (uid 10001),
+which cannot write a directory that belongs to you — hence `SYNAPSE_UID` / `SYNAPSE_GID`
+in `.env`. The mount is declared with `create_host_path: false`, so a missing `./data`
+fails the start outright instead of being created as root and leaving the server unable
+to open its databases.
 
 ### Maintenance commands
 
@@ -52,9 +58,9 @@ directory.
 
 ```sh
 docker compose stop
-docker run --rm -v "$PWD/data:/data" --user "$SYNAPSE_UID:$SYNAPSE_GID" \
+docker run --rm -v "$PWD/data:/data" --user "$(id -u):$(id -g)" \
   synapse-server:local reembed --model bge-small-en-v1.5
-docker run --rm -v "$PWD/data:/data" --user "$SYNAPSE_UID:$SYNAPSE_GID" \
+docker run --rm -v "$PWD/data:/data" --user "$(id -u):$(id -g)" \
   synapse-server:local fts-rebuild
 docker compose start
 ```
