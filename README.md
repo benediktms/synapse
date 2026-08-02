@@ -85,7 +85,10 @@ syn export --preference > backup/preferences.json
 Restore into an empty server:
 
 ```sh
-# 1. bring up a server on the (new or wiped) volume
+# 1. bring up a server on the new or wiped data directory.
+#    wipe the contents, not the directory itself — compose refuses to start
+#    if ./data is missing, rather than letting Docker create it as root.
+mkdir -p data
 docker compose up -d
 curl -s localhost:8737/health
 
