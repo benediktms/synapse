@@ -125,17 +125,16 @@ fn targets(harness: Harness, home: &Path) -> Result<Vec<Target>, String> {
 
 /// Claude Code and Codex CLI share a hook shape: an event holds matcher groups,
 /// each group holding the handlers that run.
-fn matched_hook(path: PathBuf, matcher: &str, script: &Path) -> Result<Target, String> {
+fn matched_hook(path: PathBuf, matcher: &'static str, script: &Path) -> Result<Target, String> {
     let command = quote(script)?;
     Ok(Target::JsonHook(JsonHook {
         path,
         keys: vec!["hooks".into(), "SessionStart".into()],
         defaults: Vec::new(),
-        entry: json!({
-            "matcher": matcher,
-            "hooks": [{ "type": "command", "command": command, "timeout": 10 }],
-        }),
-        owned_by: path_str(script)?.to_string(),
+        handler: json!({ "type": "command", "command": command.clone(), "timeout": 10 }),
+        command_key: "command",
+        command,
+        matcher: Some(matcher),
         label: "SessionStart hook",
     }))
 }
@@ -146,8 +145,10 @@ fn copilot_hook(path: PathBuf, script: &Path) -> Result<Target, String> {
         path,
         keys: vec!["hooks".into(), "sessionStart".into()],
         defaults: vec![("version".into(), json!(1))],
-        entry: json!({ "type": "command", "bash": command, "timeoutSec": 10 }),
-        owned_by: path_str(script)?.to_string(),
+        handler: json!({ "type": "command", "bash": command.clone(), "timeoutSec": 10 }),
+        command_key: "bash",
+        command,
+        matcher: None,
         label: "sessionStart hook",
     }))
 }
@@ -270,16 +271,28 @@ enum Ownership {
     Unmanaged,
 }
 
-/// A hook entry merged into a config file that may hold unrelated entries. Ours
-/// is recognised by the script path it invokes, so repeated installs replace it
-/// rather than stacking duplicates.
+/// A hook handler merged into a config file that may hold unrelated handlers.
+/// Ours is the one whose command is exactly the command we write, so repeated
+/// installs replace that handler alone and leave everything beside it — in the
+/// same matcher group or elsewhere — untouched.
 struct JsonHook {
     path: PathBuf,
     keys: Vec<String>,
     defaults: Vec<(String, Value)>,
-    entry: Value,
-    owned_by: String,
+    handler: Value,
+    command_key: &'static str,
+    command: String,
+    /// `Some` for the harnesses whose entries are matcher groups of handlers,
+    /// `None` for Copilot, whose entries are the handlers themselves.
+    matcher: Option<&'static str>,
     label: &'static str,
+}
+
+/// Where an installed handler sits: the entry index, plus its index inside that
+/// entry's group for the grouped harnesses.
+struct Spot {
+    entry: usize,
+    handler: Option<usize>,
 }
 
 impl JsonHook {
@@ -299,7 +312,7 @@ impl JsonHook {
             },
             _ => json!({}),
         };
-        let merged = match self.merge(root.clone()) {
+        let merged = match self.merge(root.clone(), options) {
             Ok(merged) => merged,
             Err(reason) => return Ok(action(Outcome::Blocked(reason))),
         };
@@ -318,7 +331,7 @@ impl JsonHook {
         }))
     }
 
-    fn merge(&self, mut root: Value) -> Result<Value, String> {
+    fn merge(&self, mut root: Value, options: &InstallOptions) -> Result<Value, String> {
         let object = root
             .as_object_mut()
             .ok_or_else(|| "top level is not a JSON object".to_string())?;
@@ -326,18 +339,84 @@ impl JsonHook {
             object.entry(key.clone()).or_insert_with(|| value.clone());
         }
         let entries = array_at(object, &self.keys)?;
-        let mut kept: Vec<Value> = entries
-            .iter()
-            .filter(|entry| !self.owns(entry))
-            .cloned()
-            .collect();
-        kept.push(self.entry.clone());
-        *entries = kept;
+        let installed = self.installed(entries);
+        let intact = matches!(installed.as_slice(), [spot] if self.intact(entries, spot));
+        if !intact {
+            if !installed.is_empty() && !options.force {
+                return Err(format!(
+                    "the registered {} is not the one this installer writes; \
+                     re-run with --force to replace it",
+                    self.label
+                ));
+            }
+            self.strip(entries);
+            entries.push(self.entry());
+        }
         Ok(root)
     }
 
-    fn owns(&self, entry: &Value) -> bool {
-        entry.to_string().contains(&self.owned_by)
+    fn entry(&self) -> Value {
+        match self.matcher {
+            Some(matcher) => json!({ "matcher": matcher, "hooks": [self.handler.clone()] }),
+            None => self.handler.clone(),
+        }
+    }
+
+    fn installed(&self, entries: &[Value]) -> Vec<Spot> {
+        let mut spots = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            if self.matcher.is_none() {
+                if self.ours(entry) {
+                    spots.push(Spot {
+                        entry: index,
+                        handler: None,
+                    });
+                }
+                continue;
+            }
+            let Some(handlers) = entry.get("hooks").and_then(Value::as_array) else {
+                continue;
+            };
+            for (inner, handler) in handlers.iter().enumerate() {
+                if self.ours(handler) {
+                    spots.push(Spot {
+                        entry: index,
+                        handler: Some(inner),
+                    });
+                }
+            }
+        }
+        spots
+    }
+
+    fn intact(&self, entries: &[Value], spot: &Spot) -> bool {
+        let entry = &entries[spot.entry];
+        match spot.handler {
+            None => *entry == self.handler,
+            Some(inner) => {
+                entry.get("matcher").and_then(Value::as_str) == self.matcher
+                    && entry["hooks"][inner] == self.handler
+            }
+        }
+    }
+
+    fn strip(&self, entries: &mut Vec<Value>) {
+        if self.matcher.is_none() {
+            entries.retain(|entry| !self.ours(entry));
+            return;
+        }
+        entries.retain_mut(|entry| {
+            let Some(handlers) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            let before = handlers.len();
+            handlers.retain(|handler| !self.ours(handler));
+            before == handlers.len() || !handlers.is_empty()
+        });
+    }
+
+    fn ours(&self, handler: &Value) -> bool {
+        handler.get(self.command_key).and_then(Value::as_str) == Some(self.command.as_str())
     }
 }
 
@@ -624,6 +703,88 @@ mod tests {
         assert_eq!(starts[0]["hooks"][0]["command"], "echo hi");
         assert_eq!(root["model"], "opus");
         assert!(root["hooks"]["Stop"].is_array());
+    }
+
+    fn config_of(sandbox: &Sandbox, harness: Harness) -> PathBuf {
+        sandbox.homes.of(harness).join(match harness {
+            Harness::Claude => "settings.json",
+            Harness::Copilot => "hooks/synapse.json",
+            Harness::Codex => "hooks.json",
+        })
+    }
+
+    fn json_at(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).expect("read")).expect("JSON")
+    }
+
+    #[test]
+    fn a_handler_beside_ours_in_the_same_group_survives_a_reinstall() {
+        for harness in [Harness::Claude, Harness::Codex] {
+            let sandbox = Sandbox::new();
+            sandbox.install(harness, &fresh());
+            let config = config_of(&sandbox, harness);
+
+            let mut root = json_at(&config);
+            root["hooks"]["SessionStart"][0]["hooks"]
+                .as_array_mut()
+                .expect("our group")
+                .push(json!({ "type": "command", "command": "echo hi" }));
+            fs::write(&config, serde_json::to_string(&root).expect("render")).expect("seed");
+
+            let report = sandbox.install(harness, &fresh());
+            assert!(!report.blocked(), "{harness:?}");
+
+            let root = json_at(&config);
+            let groups = root["hooks"]["SessionStart"].as_array().expect("array");
+            assert_eq!(groups.len(), 1, "{harness:?} groups");
+            let handlers = groups[0]["hooks"].as_array().expect("handlers");
+            assert_eq!(handlers.len(), 2, "{harness:?} handlers");
+            assert_eq!(handlers[1]["command"], "echo hi", "{harness:?}");
+        }
+    }
+
+    #[test]
+    fn an_edited_registration_blocks_until_forced() {
+        for harness in Harness::all() {
+            let sandbox = Sandbox::new();
+            sandbox.install(*harness, &fresh());
+            let config = config_of(&sandbox, *harness);
+
+            let mut root = json_at(&config);
+            match harness {
+                Harness::Copilot => root["hooks"]["sessionStart"][0]["timeoutSec"] = json!(60),
+                _ => root["hooks"]["SessionStart"][0]["hooks"][0]["timeout"] = json!(60),
+            }
+            let edited = serde_json::to_string(&root).expect("render");
+            fs::write(&config, &edited).expect("seed");
+
+            let report = sandbox.install(*harness, &fresh());
+            assert!(report.blocked(), "{harness:?}");
+            assert_eq!(fs::read_to_string(&config).expect("read"), edited);
+
+            let forced = sandbox.install(
+                *harness,
+                &InstallOptions {
+                    dry_run: false,
+                    force: true,
+                },
+            );
+            assert!(!forced.blocked(), "{harness:?}");
+            let root = json_at(&config);
+            match harness {
+                Harness::Copilot => {
+                    let entries = root["hooks"]["sessionStart"].as_array().expect("array");
+                    assert_eq!(entries.len(), 1, "{harness:?}");
+                    assert_eq!(entries[0]["timeoutSec"], 10, "{harness:?}");
+                }
+                _ => {
+                    let groups = root["hooks"]["SessionStart"].as_array().expect("array");
+                    assert_eq!(groups.len(), 1, "{harness:?}");
+                    assert_eq!(groups[0]["hooks"].as_array().expect("handlers").len(), 1);
+                    assert_eq!(groups[0]["hooks"][0]["timeout"], 10, "{harness:?}");
+                }
+            }
+        }
     }
 
     #[test]
