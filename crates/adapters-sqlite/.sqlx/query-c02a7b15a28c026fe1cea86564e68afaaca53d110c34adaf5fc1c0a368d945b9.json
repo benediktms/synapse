@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT embedding_model, embedding_dim FROM meta WHERE id = 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "embedding_model",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "embedding_dim",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "c02a7b15a28c026fe1cea86564e68afaaca53d110c34adaf5fc1c0a368d945b9"
+}
