@@ -79,9 +79,13 @@ on the outermost working tree.
 Workspace resolution follows a fixed order — the first tier that matches wins:
 
 1. `--workspace <name>` on the command line.
-2. A path rule (`syn workspace map <path> <ws>`), longest matching prefix; a rule against
-   the current directory wins over one against an outer worktree's main checkout, so an
-   explicit worktree rule can still diverge from where its main checkout resolves.
+2. A path rule (`syn workspace map <path> <ws>`). The current-directory tier is tried
+   first — *any* matching rule there wins, however broad, before the anchor tier (a linked
+   worktree's main checkout) is even considered; the two tiers compete on which one
+   matched, not on which rule is more specific. So a blanket rule like
+   `syn workspace map ~/.traycer/worktrees personal` beats an exact rule mapping one repo's
+   main checkout, for every worktree under it. Within a single tier, the longest matching
+   prefix wins.
 3. An org rule (`syn workspace map-org <org> <ws>`), matched against the repo's `owner`
    case-insensitively (GitHub/GitLab treat `FreshaEngineering` and `freshaengineering` as
    the same org) — but only once no path rule matched at all.
@@ -110,11 +114,14 @@ syn workspace map ~/code work
 syn workspace map-org freshaengineering work
 ```
 
-If `git` is missing or misbehaves, an explicit `--workspace`/`--project` pair still saves
-without touching it, and a command that needs inference hard-errors rather than silently
-defaulting. The one exception is `syn context`: the installed session-start hook swallows
-any CLI failure, so a broken `git` degrades to *no digest* rather than a broken session —
-silent, but safe, and the first thing to check when a digest goes missing.
+Only an explicit `--workspace` together with an explicit `--project`/`--scope` saves
+without touching `git` at all. `syn export`/`syn import`, and any save, list, edit, forget,
+move, or show that would otherwise infer its workspace or scope — including a save that
+names `--workspace` but not `--scope` — hard-error when `git` is missing or misbehaves,
+rather than silently defaulting or falling back to `workspace` scope. The one exception is
+`syn context`: the installed session-start hook swallows any CLI failure, so a broken
+`git` degrades to *no digest* rather than a broken session — silent, but safe, and the
+first thing to check when a digest goes missing.
 
 ### Routing migration
 
