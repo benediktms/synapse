@@ -61,6 +61,8 @@ pub fn validate_org(org: &str) -> Result<String, String> {
 }
 
 /// Org-rule tier of the ladder: only consulted once no path rule (cwd or anchor) matched.
+/// GitHub/GitLab org names are case-insensitive, so a rule matches an owner byte-wise
+/// folded (the grammar is ASCII-only); the stored `org` spelling is never rewritten.
 fn org_rule_match(config: &Config, owner: Option<&str>) -> Result<Option<String>, String> {
     let Some(owner) = owner else {
         return Ok(None);
@@ -68,7 +70,7 @@ fn org_rule_match(config: &Config, owner: Option<&str>) -> Result<Option<String>
     let mut matched: Option<String> = None;
     let mut ambiguous: Vec<String> = Vec::new();
     for rule in &config.org_rules {
-        if rule.org != owner {
+        if !rule.org.eq_ignore_ascii_case(owner) {
             continue;
         }
         match &matched {
@@ -533,6 +535,90 @@ mod tests {
         let facts = GitFacts {
             slug: Some("freshaengineering/widgets".into()),
             owner: Some("freshaengineering".into()),
+            ..facts_at(&repo)
+        };
+        assert_eq!(
+            resolve_workspace(&config, None, &repo, Some(&facts), true).unwrap(),
+            "work"
+        );
+    }
+
+    #[test]
+    fn a_rule_matches_an_owner_regardless_of_case() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut config = config_with(&[], Some("personal"));
+        config.org_rules.push(OrgRule {
+            org: "freshaengineering".into(),
+            workspace: "work".into(),
+        });
+        let facts = GitFacts {
+            slug: Some("FreshaEngineering/widgets".into()),
+            owner: Some("FreshaEngineering".into()),
+            ..facts_at(&repo)
+        };
+        assert_eq!(
+            resolve_workspace(&config, None, &repo, Some(&facts), true).unwrap(),
+            "work"
+        );
+
+        let mut config = config_with(&[], Some("personal"));
+        config.org_rules.push(OrgRule {
+            org: "FreshaEngineering".into(),
+            workspace: "work".into(),
+        });
+        let facts = GitFacts {
+            slug: Some("freshaengineering/widgets".into()),
+            owner: Some("freshaengineering".into()),
+            ..facts_at(&repo)
+        };
+        assert_eq!(
+            resolve_workspace(&config, None, &repo, Some(&facts), true).unwrap(),
+            "work"
+        );
+    }
+
+    #[test]
+    fn case_differing_org_rules_naming_different_workspaces_are_ambiguous() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut config = config_with(&[], None);
+        config.org_rules.push(OrgRule {
+            org: "Fresha".into(),
+            workspace: "work".into(),
+        });
+        config.org_rules.push(OrgRule {
+            org: "fresha".into(),
+            workspace: "personal".into(),
+        });
+        let facts = GitFacts {
+            slug: Some("fresha/widgets".into()),
+            owner: Some("fresha".into()),
+            ..facts_at(&repo)
+        };
+        let err = resolve_workspace(&config, None, &repo, Some(&facts), true).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn case_differing_org_rules_naming_the_same_workspace_coalesce() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut config = config_with(&[], None);
+        config.org_rules.push(OrgRule {
+            org: "Fresha".into(),
+            workspace: "work".into(),
+        });
+        config.org_rules.push(OrgRule {
+            org: "fresha".into(),
+            workspace: "work".into(),
+        });
+        let facts = GitFacts {
+            slug: Some("fresha/widgets".into()),
+            owner: Some("fresha".into()),
             ..facts_at(&repo)
         };
         assert_eq!(
