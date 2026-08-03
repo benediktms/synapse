@@ -114,11 +114,12 @@ syn workspace map ~/code work
 syn workspace map-org freshaengineering work
 ```
 
-Only an explicit `--workspace` together with an explicit `--project`/`--scope` saves
-without touching `git` at all. `syn export`/`syn import`, and any save, list, edit, forget,
-move, or show that would otherwise infer its workspace or scope — including a save that
-names `--workspace` but not `--scope` — hard-error when `git` is missing or misbehaves,
-rather than silently defaulting or falling back to `workspace` scope. The one exception is
+Every command that infers its workspace or scope hard-errors when `git` is missing or
+misbehaves, rather than silently defaulting or falling back to `workspace` scope. Naming
+both halves explicitly is what keeps a command git-free: `--workspace` together with
+`--project`/`--scope` for a save, `--workspace` or `--preference` for `syn export` and
+`syn import`. A save that names `--workspace` but not `--scope` still needs `git`, because
+the scope comes from the repo's origin. The one exception is
 `syn context`: the installed session-start hook swallows any CLI failure, so a broken
 `git` degrades to *no digest* rather than a broken session — silent, but safe, and the
 first thing to check when a digest goes missing.
