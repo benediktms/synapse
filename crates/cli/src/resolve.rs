@@ -79,11 +79,11 @@ fn rule_match(config: &Config, cwd: &Path) -> Result<Option<String>, String> {
     Ok(best.map(|(_, workspace)| workspace))
 }
 
-fn canonical(path: &Path) -> PathBuf {
+pub(crate) fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn starts_with_components(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn starts_with_components(path: &Path, prefix: &Path) -> bool {
     let mut path = path.components();
     for component in prefix.components() {
         if path.next() != Some(component) {

@@ -1,6 +1,7 @@
 pub mod args;
 pub mod commands;
 pub mod config;
+pub mod git;
 pub mod outbox;
 pub mod output;
 pub mod resolve;
