@@ -1,5 +1,6 @@
 mod support;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -38,16 +39,35 @@ impl Machine {
 
     /// The routing ladder now confirms a checkout via a real `git rev-parse`, so a
     /// fixture testing fail-closed behaviour needs a real repository, not a bare `.git`.
+    /// The initial commit gives `git worktree add -b` a branch to check out.
     fn init_git_repo(&self) {
+        self.git(&["-c", "init.defaultBranch=main", "init", "-q"]);
+        self.git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    fn init_git_repo_with_origin(&self, origin: &str) {
+        self.init_git_repo();
+        self.git(&["remote", "add", "origin", origin]);
+    }
+
+    fn git(&self, args: &[&str]) {
         let status = Command::new("git")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .arg("-C")
             .arg(&self.cwd)
-            .args(["-c", "init.defaultBranch=main", "init", "-q"])
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
             .status()
-            .expect("run git init");
-        assert!(status.success(), "git init failed");
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -922,5 +942,132 @@ fn a_save_needing_inference_errors_rather_than_defaulting_without_git() {
     assert!(
         json_files(&machine.outbox()).is_empty(),
         "a hard git failure must not queue a save"
+    );
+}
+
+#[test]
+fn map_org_round_trips_through_list_and_keeps_the_config_private() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let mapped = machine.run(&["workspace", "map-org", "acme", "acme-ws"]);
+    assert!(mapped.status.success(), "{}", stderr(&mapped));
+    assert!(stdout(&mapped).contains("acme"), "{}", stdout(&mapped));
+    assert!(stdout(&mapped).contains("acme-ws"), "{}", stdout(&mapped));
+
+    let listed = machine.run(&["workspace", "list"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    assert!(
+        stdout(&listed).contains("acme -> acme-ws"),
+        "{}",
+        stdout(&listed)
+    );
+
+    let config_path = machine.home.path().join("config").join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains("[[org_rules]]"), "{config}");
+    assert!(config.contains("org = \"acme\""), "{config}");
+
+    let mode = std::fs::metadata(&config_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn an_org_rule_routes_an_unmapped_repo_and_its_worktree() {
+    let stub = Stub::start();
+    let machine = Machine::with_config(&format!("url = \"{}\"\ntoken = \"t\"\n", stub.url()));
+    machine.init_git_repo_with_origin("git@github.com:acme/widgets.git");
+
+    let refused = machine.run(&["save", "a fact", "--type", "project"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+
+    let mapped = machine.run(&["workspace", "map-org", "acme", "acme-ws"]);
+    assert!(mapped.status.success(), "{}", stderr(&mapped));
+
+    let saved = machine.run(&["save", "a fact", "--type", "project"]);
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    assert!(
+        stdout(&saved).contains("(acme-ws · acme/widgets)"),
+        "{}",
+        stdout(&saved)
+    );
+
+    let worktree = machine.home.path().join("wt");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&machine.cwd)
+        .args([
+            "worktree",
+            "add",
+            "-q",
+            worktree.to_str().unwrap(),
+            "-b",
+            "wt",
+        ])
+        .status()
+        .expect("git worktree add");
+    assert!(status.success(), "git worktree add failed");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_syn"))
+        .args(["save", "a fact", "--type", "project"])
+        .current_dir(&worktree)
+        .env("SYNAPSE_CONFIG_DIR", machine.home.path().join("config"))
+        .env("SYNAPSE_STATE_DIR", machine.state_dir())
+        .env("HOME", machine.home.path())
+        .output()
+        .expect("run syn in worktree");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("(acme-ws · acme/widgets)"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn a_nested_path_rule_still_beats_an_org_rule_for_the_same_repo() {
+    let stub = Stub::start();
+    let machine = Machine::with_config(&format!("url = \"{}\"\ntoken = \"t\"\n", stub.url()));
+    machine.init_git_repo_with_origin("git@github.com:acme/widgets.git");
+
+    let org_mapped = machine.run(&["workspace", "map-org", "acme", "acme-ws"]);
+    assert!(org_mapped.status.success(), "{}", stderr(&org_mapped));
+
+    let path_mapped = machine.run(&[
+        "workspace",
+        "map",
+        machine.cwd.to_str().unwrap(),
+        "client-a-ws",
+    ]);
+    assert!(path_mapped.status.success(), "{}", stderr(&path_mapped));
+
+    let saved = machine.run(&["save", "a fact", "--type", "project"]);
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    assert!(
+        stdout(&saved).contains("(client-a-ws · acme/widgets)"),
+        "{}",
+        stdout(&saved)
+    );
+}
+
+#[test]
+fn an_origin_less_repo_falls_through_org_rules_without_crashing() {
+    let stub = Stub::start();
+    let machine = Machine::with_config(&format!("url = \"{}\"\ntoken = \"t\"\n", stub.url()));
+    machine.init_git_repo();
+
+    let mapped = machine.run(&["workspace", "map-org", "acme", "acme-ws"]);
+    assert!(mapped.status.success(), "{}", stderr(&mapped));
+
+    let refused = machine.run(&["save", "a fact", "--type", "project"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("no workspace rule matches"),
+        "{}",
+        stderr(&refused)
     );
 }

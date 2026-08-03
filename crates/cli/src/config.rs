@@ -15,11 +15,19 @@ pub struct Config {
     pub default_workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_rules: Vec<WorkspaceRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub org_rules: Vec<OrgRule>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkspaceRule {
     pub path: String,
+    pub workspace: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OrgRule {
+    pub org: String,
     pub workspace: String,
 }
 
@@ -141,6 +149,10 @@ mod tests {
                 path: "/Users/x/work".into(),
                 workspace: "work".into(),
             }],
+            org_rules: vec![OrgRule {
+                org: "freshaengineering".into(),
+                workspace: "work".into(),
+            }],
         };
         config.save_to(&path).unwrap();
 
@@ -153,9 +165,13 @@ mod tests {
             & 0o777;
         assert_eq!(dir_mode, 0o700);
 
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[org_rules]]"), "{text}");
+
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded.token.as_deref(), Some("secret"));
         assert_eq!(loaded.workspace_rules[0].workspace, "work");
+        assert_eq!(loaded.org_rules[0].org, "freshaengineering");
     }
 
     #[test]
