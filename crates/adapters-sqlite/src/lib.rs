@@ -150,6 +150,33 @@ impl Store for SqliteStore {
         .transpose()
     }
 
+    async fn get_with_embedding(&self, id: &MemoryId) -> Result<Option<(Memory, Vec<f32>)>, Error> {
+        let key = id.as_str();
+        let row = sqlx::query!(
+            "SELECT id, content, kind, scope, tags, pinned, embedding, created_at, updated_at \
+             FROM memories WHERE id = ?",
+            key
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let embedding = decode_embedding(&row.embedding, self.dim)?;
+        let memory = Memory::try_from(MemoryRow {
+            id: row.id,
+            content: row.content,
+            kind: row.kind,
+            scope: row.scope,
+            tags: row.tags,
+            pinned: row.pinned,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })?;
+        Ok(Some((memory, embedding)))
+    }
+
     async fn insert(&self, memory: &Memory, embedding: &[f32]) -> Result<(), Error> {
         let blob = encode_embedding(embedding, self.dim)?;
         let id = memory.id.as_str();

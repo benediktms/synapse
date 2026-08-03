@@ -539,6 +539,279 @@ async fn patch_reembeds_and_delete_removes() {
     );
 }
 
+async fn move_memory(router: &Router, n: u32, from: Value, to: Value) -> (StatusCode, Value) {
+    req(
+        router,
+        Method::POST,
+        &format!("/memories/{}/move", mid(n)),
+        Some(json!({ "from": from, "to": to })),
+    )
+    .await
+}
+
+async fn put_scoped(
+    router: &Router,
+    ws: &str,
+    n: u32,
+    content: &str,
+    scope: &str,
+) -> (StatusCode, Value) {
+    req(
+        router,
+        Method::PUT,
+        &format!("/memories/{}?ws={ws}", mid(n)),
+        Some(json!({ "content": content, "kind": "project", "scope": scope, "tags": ["alpha"] })),
+    )
+    .await
+}
+
+fn finds(body: &Value, n: u32) -> bool {
+    body["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|hit| hit["id"] == mid(n))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_relocates_a_memory_without_changing_its_identity() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    req(&router, Method::PUT, "/workspaces/personal", None).await;
+    let (_, created) = put_scoped(
+        &router,
+        "work",
+        1,
+        "the home server runs nixos on a mini pc",
+        "me/homelab",
+    )
+    .await;
+
+    let (status, body) = move_memory(
+        &router,
+        1,
+        json!({ "workspace": "work" }),
+        json!({ "workspace": "personal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["moved"], true);
+    assert_eq!(body["from_scope"], "me/homelab");
+    assert_eq!(body["scope"], "me/homelab");
+    assert_eq!(body["created_at"], created["created_at"]);
+    assert_ne!(body["updated_at"], Value::Null);
+    assert_eq!(body["tags"], json!(["alpha"]));
+
+    let (status, _) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}?ws=work", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "source still holds it");
+    let (status, moved) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}?ws=personal", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(moved["created_at"], created["created_at"]);
+
+    let query = "/memories/search?q=nixos%20home%20server&scope=me/homelab";
+    let (_, personal) = req(&router, Method::GET, &format!("{query}&ws=personal"), None).await;
+    assert!(
+        finds(&personal, 1),
+        "not recallable from target: {personal}"
+    );
+    let (_, work) = req(&router, Method::GET, &format!("{query}&ws=work"), None).await;
+    assert!(!finds(&work, 1), "still recallable from source: {work}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_into_preferences_widens_scope_and_moving_out_narrows_reach() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    req(&router, Method::PUT, "/workspaces/personal", None).await;
+    put_scoped(
+        &router,
+        "work",
+        1,
+        "benedikt writes commit subjects in the imperative mood",
+        "fresha/offers",
+    )
+    .await;
+
+    let (status, body) = move_memory(
+        &router,
+        1,
+        json!({ "workspace": "work" }),
+        json!("preference"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["from_scope"], "fresha/offers");
+    assert_eq!(body["scope"], "workspace", "project scope must be widened");
+
+    let query = "/memories/search?q=imperative%20mood%20commit%20subjects";
+    let (_, elsewhere) = req(&router, Method::GET, &format!("{query}&ws=personal"), None).await;
+    assert!(
+        finds(&elsewhere, 1),
+        "preference did not travel: {elsewhere}"
+    );
+    assert_eq!(
+        elsewhere["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit["id"] == mid(1))
+            .unwrap()["origin"],
+        "preference"
+    );
+
+    let (status, body) = move_memory(
+        &router,
+        1,
+        json!("preference"),
+        json!({ "workspace": "personal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["scope"], "workspace", "workspace scope is kept");
+    let (_, work) = req(&router, Method::GET, &format!("{query}&ws=work"), None).await;
+    assert!(!finds(&work, 1), "still reaching other workspaces: {work}");
+    let (status, _) = req(
+        &router,
+        Method::GET,
+        &format!("/preferences/{}", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_move_finishes_and_a_colliding_id_conflicts() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    req(&router, Method::PUT, "/workspaces/personal", None).await;
+
+    let payload = "the espresso machine needs descaling every two months";
+    put_scoped(&router, "work", 1, payload, "workspace").await;
+    put_scoped(&router, "personal", 1, payload, "workspace").await;
+    let (status, body) = move_memory(
+        &router,
+        1,
+        json!({ "workspace": "work" }),
+        json!({ "workspace": "personal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["moved"], true);
+    let (status, _) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}?ws=work", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "source was not cleared");
+
+    put_scoped(&router, "work", 2, "one thing", "workspace").await;
+    put_scoped(&router, "personal", 2, "a different thing", "workspace").await;
+    let (status, body) = move_memory(
+        &router,
+        2,
+        json!({ "workspace": "work" }),
+        json!({ "workspace": "personal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, kept) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}?ws=work", mid(2)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a conflict deleted the source");
+    assert_eq!(kept["content"], "one thing");
+    let (_, target) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}?ws=personal", mid(2)),
+        None,
+    )
+    .await;
+    assert_eq!(target["content"], "a different thing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_rejects_shared_by_name_and_reports_nothing_moved_in_place() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    put_memory(&router, "work", 1, "a fact that stays put").await;
+
+    for (from, to) in [
+        (
+            json!({ "workspace": "shared" }),
+            json!({ "workspace": "work" }),
+        ),
+        (
+            json!({ "workspace": "work" }),
+            json!({ "workspace": "shared" }),
+        ),
+    ] {
+        let (status, body) = move_memory(&router, 1, from, to).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("/preferences"),
+            "{body}"
+        );
+    }
+
+    let (status, body) = move_memory(
+        &router,
+        1,
+        json!({ "workspace": "work" }),
+        json!({ "workspace": "work" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["moved"], false);
+    let (status, _) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}?ws=work", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a self-move deleted the memory");
+
+    let (status, _) = move_memory(
+        &router,
+        1,
+        json!({ "workspace": "work" }),
+        json!({ "workspace": "nope" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = move_memory(
+        &router,
+        9,
+        json!({ "workspace": "work" }),
+        json!("preference"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn export_import_round_trip_and_merge_idempotency() {
     let dir = TempDir::new().unwrap();

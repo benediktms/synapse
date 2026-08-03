@@ -1,8 +1,8 @@
 use std::future::Future;
 
 use domain::{
-    ContextDigest, EditRequest, Error, Memory, MemoryId, RecallHit, RecallRequest, SaveOutcome,
-    SaveRequest, Timestamp, Workspace, WorkspaceHits,
+    ContextDigest, EditRequest, Error, Memory, MemoryId, MoveOutcome, RecallHit, RecallRequest,
+    SaveOutcome, SaveRequest, Timestamp, Workspace, WorkspaceHits,
 };
 
 #[derive(Clone, Debug)]
@@ -49,6 +49,12 @@ pub trait Backend: Clone + Send + Sync + 'static {
         ws: &Workspace,
         id: &MemoryId,
     ) -> impl Future<Output = Result<(), BackendError>> + Send;
+    fn move_memory(
+        &self,
+        from: &Workspace,
+        to: &Workspace,
+        id: &MemoryId,
+    ) -> impl Future<Output = Result<MoveOutcome, BackendError>> + Send;
     fn get(
         &self,
         ws: &Workspace,

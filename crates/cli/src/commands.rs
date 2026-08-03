@@ -3,14 +3,15 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use api::{
-    ExportDoc, MemoryDto, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse,
+    ExportDoc, MemoryDto, MoveBody, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody,
+    SearchResponse,
 };
 use api_client::SynapseApiClient;
 use domain::MemoryId;
 
 use crate::args::{
-    Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, ListArgs, RecallArgs,
-    RememberArgs, SaveArgs, WorkspaceArgs, WorkspaceCommand,
+    Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, ListArgs, MoveArgs,
+    RecallArgs, RememberArgs, SaveArgs, WorkspaceArgs, WorkspaceCommand,
 };
 use crate::config::{Config, WorkspaceRule};
 use crate::outbox::{FlushReport, Outbox, PendingSave, SaveTarget, now_millis};
@@ -36,6 +37,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Command::Context(args) => context(&ctx, args),
         Command::Edit(args) => edit(&ctx, args),
         Command::Forget(args) => forget(&ctx, args),
+        Command::Move(args) => move_memory(&ctx, args),
         Command::List(args) => list(&ctx, args),
         Command::Show(args) => show(&ctx, args),
         Command::Pin(args) => set_pinned(&ctx, args, true),
@@ -263,6 +265,42 @@ fn forget(ctx: &Context, args: IdArgs) -> Result<(), String> {
     }
     .map_err(|e| e.to_string())?;
     println!("forgot {} ({})", args.id, target.label());
+    Ok(())
+}
+
+fn move_memory(ctx: &Context, args: MoveArgs) -> Result<(), String> {
+    let client = ctx.client(WRITE_TIMEOUT)?;
+    let from = resolve_target(ctx, args.workspace.as_deref(), args.preference)?;
+    let to = match args.to {
+        Some(name) => Origin::Workspace(resolve::validate_workspace(&name)?),
+        None => Origin::Preference,
+    };
+    let body = MoveBody {
+        from: from.clone(),
+        to: to.clone(),
+    };
+    let response = client
+        .move_memory(&args.id, &body)
+        .map_err(|e| e.to_string())?;
+    let source = output::place(&from, &response.from_scope);
+    if !response.moved {
+        println!(
+            "nothing moved: {} is already in {source}",
+            response.memory.id
+        );
+        return Ok(());
+    }
+    if response.from_scope != response.memory.scope {
+        eprintln!(
+            "note: scope widened from {} to workspace; it applies everywhere now",
+            response.from_scope
+        );
+    }
+    println!(
+        "moved {} ({source} → {})",
+        response.memory.id,
+        output::place(&to, &response.memory.scope)
+    );
     Ok(())
 }
 

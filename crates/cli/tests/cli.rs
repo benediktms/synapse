@@ -647,6 +647,85 @@ fn preference_flag_routes_id_commands_away_from_any_workspace() {
 }
 
 #[test]
+fn move_names_both_ends_and_defaults_its_source_to_the_resolved_workspace() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let output = machine.run(&["move", "m_0000000000000000000002", "--to", "personal"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).trim(),
+        "moved m_0000000000000000000002 (work → personal)"
+    );
+    stub.with(|state| {
+        let sent = state
+            .recorded
+            .iter()
+            .find(|r| r.method == "POST")
+            .expect("move reached the server");
+        assert_eq!(sent.path, "/memories/m_0000000000000000000002/move");
+        let body: serde_json::Value = serde_json::from_str(&sent.body).unwrap();
+        assert_eq!(body["from"], serde_json::json!({ "workspace": "work" }));
+        assert_eq!(body["to"], serde_json::json!({ "workspace": "personal" }));
+    });
+}
+
+#[test]
+fn moving_into_preferences_reports_the_widened_scope() {
+    let stub = Stub::start();
+    stub.with(|state| state.move_from_scope = Some("fresha/offers".into()));
+    let machine = Machine::new(&stub.url());
+
+    let output = machine.run(&["move", "m_0000000000000000000002", "--to-preference"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).trim(),
+        "moved m_0000000000000000000002 (work · fresha/offers → preference)"
+    );
+    assert!(
+        stderr(&output).contains("applies everywhere now"),
+        "{}",
+        stderr(&output)
+    );
+    stub.with(|state| {
+        let sent = state.recorded.iter().find(|r| r.method == "POST").unwrap();
+        let body: serde_json::Value = serde_json::from_str(&sent.body).unwrap();
+        assert_eq!(body["to"], serde_json::json!("preference"));
+    });
+}
+
+#[test]
+fn move_needs_a_destination_and_refuses_to_name_the_backing_store() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let no_target = machine.run(&["move", "m_0000000000000000000002"]);
+    assert!(!no_target.status.success());
+    assert!(
+        stderr(&no_target).contains("--to"),
+        "{}",
+        stderr(&no_target)
+    );
+
+    let reserved = machine.run(&["move", "m_0000000000000000000002", "--to", "shared"]);
+    assert!(!reserved.status.success());
+    assert!(
+        stderr(&reserved).contains("--preference"),
+        "{}",
+        stderr(&reserved)
+    );
+
+    stub.with(|state| {
+        assert!(
+            state.recorded.is_empty(),
+            "a rejected move still called out"
+        )
+    });
+}
+
+#[test]
 fn remember_saves_without_naming_a_workspace_or_inheriting_the_repo_scope() {
     let stub = Stub::start();
     let machine = Machine::new(&stub.url());

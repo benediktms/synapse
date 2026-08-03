@@ -70,6 +70,26 @@ async fn insert_get_roundtrip_preserves_all_fields() {
 }
 
 #[tokio::test]
+async fn get_with_embedding_returns_the_stored_vector_verbatim() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = MemoryId::generate();
+    let memory = mem(&id, "a fact worth moving", Scope::Workspace);
+    store.insert(&memory, &vec4(0.3)).await.unwrap();
+
+    let (fetched, embedding) = store.get_with_embedding(&id).await.unwrap().unwrap();
+    assert_eq!(fetched, memory);
+    assert_eq!(embedding, vec4(0.3));
+    assert_eq!(
+        store
+            .get_with_embedding(&MemoryId::generate())
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn insert_same_payload_is_noop_different_payload_conflicts() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir).await;

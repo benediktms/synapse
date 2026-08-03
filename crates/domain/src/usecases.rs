@@ -98,6 +98,53 @@ pub async fn edit<S: Store, E: Embedder>(
     store.update(id, &patch, embedding.as_deref(), &now).await
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoveOutcome {
+    pub memory: Memory,
+    pub from_scope: Scope,
+    pub moved: bool,
+}
+
+pub async fn move_memory<S: Store>(
+    source: (&Workspace, &S),
+    target: (&Workspace, &S),
+    id: &MemoryId,
+    now: Timestamp,
+) -> Result<MoveOutcome, Error> {
+    let (memory, embedding) = source
+        .1
+        .get_with_embedding(id)
+        .await?
+        .ok_or_else(|| Error::NotFound(id.clone()))?;
+    let from_scope = memory.scope.clone();
+    if source.0 == target.0 {
+        return Ok(MoveOutcome {
+            memory,
+            from_scope,
+            moved: false,
+        });
+    }
+    let mut moved = memory;
+    if target.0.is_shared() {
+        moved.scope = Scope::Workspace;
+    }
+    moved.updated_at = now;
+    // A crash between these two leaves a recoverable duplicate; the reverse order loses
+    // the memory outright.
+    target.1.insert(&moved, &embedding).await?;
+    let stored = target
+        .1
+        .get(id)
+        .await?
+        .ok_or_else(|| Error::NotFound(id.clone()))?;
+    source.1.delete(id).await?;
+    Ok(MoveOutcome {
+        memory: stored,
+        from_scope,
+        moved: true,
+    })
+}
+
 pub async fn forget<S: Store>(store: &S, id: &MemoryId) -> Result<(), Error> {
     if store.delete(id).await? {
         Ok(())
@@ -516,6 +563,190 @@ mod tests {
             block_on(forget(&store, &mid(1))).unwrap_err(),
             Error::NotFound(mid(1))
         );
+    }
+
+    fn workspaces() -> (Workspace, Workspace) {
+        (Workspace::new("work").unwrap(), Workspace::shared())
+    }
+
+    #[test]
+    fn move_carries_the_memory_and_its_vector_and_empties_the_source() {
+        let work = Workspace::new("work").unwrap();
+        let personal = Workspace::new("personal").unwrap();
+        let source = FakeStore::new();
+        let target = FakeStore::new();
+        source.seed(
+            mem(
+                1,
+                "fact",
+                MemoryKind::Project,
+                Scope::Project("me/side-project".to_string()),
+                true,
+            ),
+            vec![0.25, 0.75],
+        );
+        let outcome = block_on(move_memory(
+            (&work, &source),
+            (&personal, &target),
+            &mid(1),
+            ts(30),
+        ))
+        .unwrap();
+
+        assert!(outcome.moved);
+        assert_eq!(outcome.from_scope, Scope::Project("me/side-project".into()));
+        assert_eq!(
+            outcome.memory.scope,
+            Scope::Project("me/side-project".into())
+        );
+        assert_eq!(outcome.memory.created_at, ts(1));
+        assert_eq!(outcome.memory.updated_at, ts(30));
+        assert!(outcome.memory.pinned);
+        assert!(source.is_empty());
+        assert_eq!(target.embedding_of(&mid(1)), Some(vec![0.25, 0.75]));
+    }
+
+    #[test]
+    fn moving_into_preferences_widens_a_project_scope() {
+        let (work, shared) = workspaces();
+        let source = FakeStore::new();
+        let target = FakeStore::new();
+        source.seed(
+            mem(
+                1,
+                "prefers oat milk",
+                MemoryKind::User,
+                Scope::Project("fresha/offers".to_string()),
+                false,
+            ),
+            vec![1.0, 0.0],
+        );
+        let outcome = block_on(move_memory(
+            (&work, &source),
+            (&shared, &target),
+            &mid(1),
+            ts(30),
+        ))
+        .unwrap();
+        assert_eq!(outcome.from_scope, Scope::Project("fresha/offers".into()));
+        assert_eq!(outcome.memory.scope, Scope::Workspace);
+    }
+
+    #[test]
+    fn moving_out_of_preferences_keeps_workspace_scope() {
+        let (work, shared) = workspaces();
+        let source = FakeStore::new();
+        let target = FakeStore::new();
+        source.seed(
+            mem(1, "a preference", MemoryKind::User, Scope::Workspace, false),
+            vec![1.0, 0.0],
+        );
+        let outcome = block_on(move_memory(
+            (&shared, &source),
+            (&work, &target),
+            &mid(1),
+            ts(30),
+        ))
+        .unwrap();
+        assert!(outcome.moved);
+        assert_eq!(outcome.memory.scope, Scope::Workspace);
+        assert!(source.is_empty());
+    }
+
+    #[test]
+    fn moving_where_it_already_lives_changes_nothing() {
+        let work = Workspace::new("work").unwrap();
+        let store = FakeStore::new();
+        store.seed(
+            mem(1, "fact", MemoryKind::Project, Scope::Workspace, false),
+            vec![1.0, 0.0],
+        );
+        let outcome = block_on(move_memory(
+            (&work, &store),
+            (&work, &store),
+            &mid(1),
+            ts(30),
+        ))
+        .unwrap();
+        assert!(!outcome.moved);
+        assert_eq!(outcome.memory.updated_at, ts(1));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn a_retried_move_finishes_instead_of_conflicting() {
+        let work = Workspace::new("work").unwrap();
+        let personal = Workspace::new("personal").unwrap();
+        let source = FakeStore::new();
+        let target = FakeStore::new();
+        let memory = mem(1, "fact", MemoryKind::Project, Scope::Workspace, false);
+        source.seed(memory.clone(), vec![1.0, 0.0]);
+        let mut already = memory;
+        already.updated_at = ts(20);
+        target.seed(already, vec![1.0, 0.0]);
+
+        let outcome = block_on(move_memory(
+            (&work, &source),
+            (&personal, &target),
+            &mid(1),
+            ts(30),
+        ))
+        .unwrap();
+        assert!(outcome.moved);
+        assert_eq!(outcome.memory.updated_at, ts(20), "reports the stored row");
+        assert!(source.is_empty());
+        assert_eq!(target.len(), 1);
+    }
+
+    #[test]
+    fn a_different_memory_under_the_same_id_conflicts_and_keeps_the_source() {
+        let work = Workspace::new("work").unwrap();
+        let personal = Workspace::new("personal").unwrap();
+        let source = FakeStore::new();
+        let target = FakeStore::new();
+        source.seed(
+            mem(1, "fact", MemoryKind::Project, Scope::Workspace, false),
+            vec![1.0, 0.0],
+        );
+        target.seed(
+            mem(
+                1,
+                "something else",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![0.0, 1.0],
+        );
+        let err = block_on(move_memory(
+            (&work, &source),
+            (&personal, &target),
+            &mid(1),
+            ts(30),
+        ))
+        .unwrap_err();
+        assert_eq!(err, Error::Conflict(mid(1)));
+        assert_eq!(source.len(), 1);
+        assert_eq!(
+            block_on(target.get(&mid(1))).unwrap().unwrap().content,
+            "something else"
+        );
+    }
+
+    #[test]
+    fn moving_a_memory_the_source_does_not_hold_is_not_found() {
+        let (work, shared) = workspaces();
+        let source = FakeStore::new();
+        let target = FakeStore::new();
+        let err = block_on(move_memory(
+            (&work, &source),
+            (&shared, &target),
+            &mid(9),
+            ts(30),
+        ))
+        .unwrap_err();
+        assert_eq!(err, Error::NotFound(mid(9)));
+        assert!(target.is_empty());
     }
 
     #[test]

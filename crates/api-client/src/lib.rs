@@ -2,8 +2,8 @@ use std::fmt;
 use std::time::Duration;
 
 use api::{
-    ContextResponse, ExportDoc, HealthResponse, ImportReport, ListResponse, MemoryDto,
-    PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse, WorkspaceDto,
+    ContextResponse, ExportDoc, HealthResponse, ImportReport, ListResponse, MemoryDto, MoveBody,
+    MoveResponse, PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse, WorkspaceDto,
     WorkspacesResponse,
 };
 use reqwest::blocking::{Client, RequestBuilder};
@@ -239,6 +239,14 @@ impl SynapseApiClient {
             .query(&[("ws", workspace)])
             .send()?;
         check(response).map(drop)
+    }
+
+    pub fn move_memory(&self, id: &str, body: &MoveBody) -> Result<MoveResponse, ClientError> {
+        json(
+            self.http
+                .post(self.url(&format!("/memories/{id}/move")))
+                .json(body),
+        )
     }
 
     pub fn get(&self, workspace: &str, id: &str) -> Result<MemoryDto, ClientError> {

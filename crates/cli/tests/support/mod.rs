@@ -29,6 +29,8 @@ pub struct State {
     pub script: VecDeque<Behavior>,
     pub search: Option<String>,
     pub context: Option<String>,
+    /// Scope a moved memory carried before the move, echoed as `from_scope`.
+    pub move_from_scope: Option<String>,
 }
 
 impl State {
@@ -138,6 +140,26 @@ fn handle(stream: TcpStream, state: &Arc<Mutex<State>>) {
         .find_map(|prefix| path.strip_prefix(prefix))
         .filter(|id| id.starts_with("m_"))
         .map(str::to_string);
+
+    let move_id = id_path
+        .as_deref()
+        .and_then(|path| path.strip_suffix("/move"))
+        .map(str::to_string);
+    if let (Some(id), "POST") = (move_id, method.as_str()) {
+        let sent: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        let mut response: serde_json::Value =
+            serde_json::from_str(&memory_json(&id, "{}")).unwrap();
+        response["moved"] = serde_json::json!(sent["from"] != sent["to"]);
+        response["from"] = sent["from"].clone();
+        response["to"] = sent["to"].clone();
+        response["from_scope"] = serde_json::json!(
+            state
+                .move_from_scope
+                .clone()
+                .unwrap_or_else(|| "workspace".to_string())
+        );
+        return respond(stream, 200, &response.to_string());
+    }
 
     if let (Some(id), "PUT") = (id_path.clone(), method.as_str()) {
         match state.script.pop_front() {

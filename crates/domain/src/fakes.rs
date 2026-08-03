@@ -50,11 +50,24 @@ impl Store for FakeStore {
             .map(|(memory, _)| memory.clone()))
     }
 
+    async fn get_with_embedding(&self, id: &MemoryId) -> Result<Option<(Memory, Vec<f32>)>, Error> {
+        Ok(self.rows.lock().unwrap().get(id).cloned())
+    }
+
     async fn insert(&self, memory: &Memory, embedding: &[f32]) -> Result<(), Error> {
-        self.rows
-            .lock()
-            .unwrap()
-            .insert(memory.id.clone(), (memory.clone(), embedding.to_vec()));
+        let mut rows = self.rows.lock().unwrap();
+        if let Some((existing, _)) = rows.get(&memory.id) {
+            let same_payload = existing.content == memory.content
+                && existing.kind == memory.kind
+                && existing.scope == memory.scope
+                && existing.tags == memory.tags;
+            return if same_payload {
+                Ok(())
+            } else {
+                Err(Error::Conflict(memory.id.clone()))
+            };
+        }
+        rows.insert(memory.id.clone(), (memory.clone(), embedding.to_vec()));
         Ok(())
     }
 
