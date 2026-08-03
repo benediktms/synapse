@@ -490,6 +490,9 @@ fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
             });
             config.save()?;
             println!("org {org} now resolves to workspace {name}");
+            eprintln!(
+                "note: existing memories do not move; see \"Routing migration\" in the README before deleting a path rule"
+            );
             Ok(())
         }
     }

@@ -69,6 +69,88 @@ docker compose start
 per transaction. If it dies mid-run the marker survives, the server refuses to report
 `ready`, and re-running it skips the databases already converted and finishes the rest.
 
+## Routing
+
+Every `save`, `recall`, `context`, and id-based command needs to resolve which workspace
+to use and which scope within it. Absent an explicit `--workspace`/`--project` flag, both
+come from one git-facts probe per invocation (`git rev-parse` plus the origin URL), keyed
+on the outermost working tree.
+
+Workspace resolution follows a fixed order — the first tier that matches wins:
+
+1. `--workspace <name>` on the command line.
+2. A path rule (`syn workspace map <path> <ws>`), longest matching prefix; a rule against
+   the current directory wins over one against an outer worktree's main checkout, so an
+   explicit worktree rule can still diverge from where its main checkout resolves.
+3. An org rule (`syn workspace map-org <org> <ws>`), matched against the repo's `owner`
+   case-insensitively (GitHub/GitLab treat `FreshaEngineering` and `freshaengineering` as
+   the same org) — but only once no path rule matched at all.
+4. Inside a working tree while saving: fail closed with an error naming the config path,
+   rather than guessing.
+5. The machine's default workspace (`syn workspace use <name>`), or an error if none is set.
+
+`syn workspace list` prints path rules and org rules in this same order, so precedence is
+visible instead of folklore.
+
+Scope is separate from workspace: it always comes from the *innermost* repo's `owner/repo`
+slug (`git config remote.origin.url`), regardless of which tier resolved the workspace. A
+repo with no usable origin — no remote, or one that doesn't parse to `owner/repo` — falls
+back to the `workspace` scope, sharing one bucket with every other origin-less repo in that
+workspace. Adding a remote is the fix; there is no per-directory synthetic identity to fall
+back to instead, since anything path-derived would be orphaned by a later rename.
+
+A worked example — the pair of rules the org-rule tier exists to replace:
+
+```sh
+# before: every Traycer worktree needs its own rule, and ~/code can only guess
+syn workspace map ~/.traycer/worktrees/freshaengineering__app-b2c-api-gateway work
+syn workspace map ~/code work
+
+# after: one org rule catches every Fresha repo, wherever it's cloned or worktreed
+syn workspace map-org freshaengineering work
+```
+
+If `git` is missing or misbehaves, an explicit `--workspace`/`--project` pair still saves
+without touching it, and a command that needs inference hard-errors rather than silently
+defaulting. The one exception is `syn context`: the installed session-start hook swallows
+any CLI failure, so a broken `git` degrades to *no digest* rather than a broken session —
+silent, but safe, and the first thing to check when a digest goes missing.
+
+### Routing migration
+
+**Enabling an org rule is a routing migration, not a config tweak.** Stored memories don't
+move by themselves — they stay in whichever workspace's SQLite file they were originally
+written to. Path rules still win over org rules, so adding an org rule only reroutes the
+repos no path rule already covers; a repo with an existing path rule keeps resolving
+exactly as before until that rule is removed.
+
+The moment a repo's *resolved* workspace would actually change, its existing memories are
+stuck on the old side of a split: recall from the new route looks like it lost history,
+and new saves land beside neither. There is no schema migration to warn you, so this
+procedure is the only safeguard.
+
+Per affected repo:
+
+1. Record its currently resolved workspace before changing anything — `syn workspace list`
+   shows the path rule that covers it today.
+2. Add the org rule with `syn workspace map-org`. Keep the existing path rule in place —
+   it still wins, so nothing reroutes yet.
+3. Find every memory that belongs to this repo but lives in the old workspace:
+   `syn list --workspace <old>`. Move each one: `syn move <id> --to <new>`. Run this from
+   inside the repo — the path rule you kept in step 2 still resolves the move's source
+   workspace correctly, so no `--workspace` override is needed.
+4. Verify the memories landed correctly with `syn recall <query> --workspace <new>` (an
+   explicit `--workspace`, not a bare `syn recall` from inside the repo — the path rule is
+   still in place at this point and still wins, so ambient recall keeps searching `<old>`
+   until the rule is gone; that's the moment described above where it looks like the
+   history is lost).
+5. Only then delete the superseded path rule. There is no `syn workspace unmap` — remove
+   the corresponding `[[workspace_rules]]` entry from the config file directly. Ambient
+   `syn recall`/`syn save` from inside the repo now resolve `<new>`.
+
+`syn move` exists for exactly this. There is no bulk "move every memory for this repo"
+command yet — worth building if the per-id procedure above proves tedious in practice.
+
 ## Backup and restore
 
 Dumps are a versioned logical format — ids, content, kind, scope, tags, pinned flag and

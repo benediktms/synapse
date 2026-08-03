@@ -954,6 +954,11 @@ fn map_org_round_trips_through_list_and_keeps_the_config_private() {
     assert!(mapped.status.success(), "{}", stderr(&mapped));
     assert!(stdout(&mapped).contains("acme"), "{}", stdout(&mapped));
     assert!(stdout(&mapped).contains("acme-ws"), "{}", stdout(&mapped));
+    assert!(
+        stderr(&mapped).contains("existing memories do not move"),
+        "{}",
+        stderr(&mapped)
+    );
 
     let listed = machine.run(&["workspace", "list"]);
     assert!(listed.status.success(), "{}", stderr(&listed));
