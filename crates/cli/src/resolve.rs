@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use domain::{Scope, Workspace};
 
 use crate::config::Config;
+use crate::git::GitFacts;
 
 pub fn validate_workspace(name: &str) -> Result<String, String> {
     if name == "shared" {
@@ -22,6 +22,7 @@ pub fn resolve_workspace(
     config: &Config,
     flag: Option<&str>,
     cwd: &Path,
+    facts: Option<&GitFacts>,
     fail_closed: bool,
 ) -> Result<String, String> {
     if let Some(name) = flag {
@@ -30,7 +31,15 @@ pub fn resolve_workspace(
     if let Some(name) = rule_match(config, cwd)? {
         return validate_workspace(&name);
     }
-    if fail_closed && in_git_checkout(cwd) {
+    if let Some(facts) = facts
+        && let Some(name) = rule_match(config, &facts.anchor)?
+    {
+        return validate_workspace(&name);
+    }
+    if let Some(name) = org_rule_match(facts.and_then(|facts| facts.owner.as_deref())) {
+        return validate_workspace(&name);
+    }
+    if fail_closed && facts.is_some() {
         return Err(format!(
             "no workspace rule matches {}; pass --workspace <ws> or add a path rule to {}",
             cwd.display(),
@@ -45,13 +54,19 @@ pub fn resolve_workspace(
     }
 }
 
-fn rule_match(config: &Config, cwd: &Path) -> Result<Option<String>, String> {
-    let cwd = canonical(cwd);
+/// Org-rule tier of the ladder: wired in now so the ladder's shape is settled, populated
+/// in a later ticket once `[[org_rules]]` config parsing and `syn workspace map-org` exist.
+fn org_rule_match(_owner: Option<&str>) -> Option<String> {
+    None
+}
+
+fn rule_match(config: &Config, path: &Path) -> Result<Option<String>, String> {
+    let path = canonical(path);
     let mut best: Option<(usize, String)> = None;
     let mut ambiguous: Vec<String> = Vec::new();
     for rule in &config.workspace_rules {
         let root = canonical(Path::new(&rule.path));
-        if !starts_with_components(&cwd, &root) {
+        if !starts_with_components(&path, &root) {
             continue;
         }
         let depth = root.components().count();
@@ -72,7 +87,7 @@ fn rule_match(config: &Config, cwd: &Path) -> Result<Option<String>, String> {
         ambiguous.sort();
         return Err(format!(
             "workspace rules for {} are ambiguous ({}); pass --workspace to disambiguate",
-            cwd.display(),
+            path.display(),
             ambiguous.join(", ")
         ));
     }
@@ -93,12 +108,6 @@ pub(crate) fn starts_with_components(path: &Path, prefix: &Path) -> bool {
     true
 }
 
-pub fn in_git_checkout(cwd: &Path) -> bool {
-    canonical(cwd)
-        .ancestors()
-        .any(|dir| dir.join(".git").exists())
-}
-
 pub struct ResolvedScope {
     pub scope: String,
     pub note: Option<String>,
@@ -110,45 +119,36 @@ impl ResolvedScope {
     }
 }
 
-pub fn resolve_scope(flag: Option<&str>, cwd: &Path) -> Result<ResolvedScope, String> {
+/// `Ok(Some(_))` for a flag that fully determines scope without touching the facts probe;
+/// `Ok(None)` for `None` or the `project` sentinel, meaning "infer from git".
+pub fn explicit_scope(flag: Option<&str>) -> Result<Option<ResolvedScope>, String> {
     match flag {
-        Some("workspace") => Ok(ResolvedScope {
+        Some("workspace") => Ok(Some(ResolvedScope {
             scope: "workspace".into(),
             note: None,
-        }),
+        })),
         Some(slug) if slug != "project" => {
             let scope = Scope::parse(slug).map_err(|e| e.to_string())?;
-            Ok(ResolvedScope {
+            Ok(Some(ResolvedScope {
                 scope: scope.as_str().to_string(),
                 note: None,
-            })
+            }))
         }
-        _ => Ok(
-            match git_origin(cwd).as_deref().and_then(parse_origin_url) {
-                Some(slug) => ResolvedScope {
-                    scope: slug,
-                    note: None,
-                },
-                None => ResolvedScope {
-                    scope: "workspace".into(),
-                    note: Some("no git origin here; using scope 'workspace'".into()),
-                },
-            },
-        ),
+        _ => Ok(None),
     }
 }
 
-fn git_origin(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+pub fn scope_from_facts(facts: Option<&GitFacts>) -> ResolvedScope {
+    match facts.and_then(|facts| facts.slug.clone()) {
+        Some(slug) => ResolvedScope {
+            scope: slug,
+            note: None,
+        },
+        None => ResolvedScope {
+            scope: "workspace".into(),
+            note: Some("no git origin here; using scope 'workspace'".into()),
+        },
+    }
 }
 
 pub fn parse_origin_url(url: &str) -> Option<String> {
@@ -200,6 +200,15 @@ mod tests {
                 })
                 .collect(),
             ..Config::default()
+        }
+    }
+
+    fn facts_at(path: &Path) -> GitFacts {
+        GitFacts {
+            anchor: canonical(path),
+            toplevel: canonical(path),
+            slug: None,
+            owner: None,
         }
     }
 
@@ -258,11 +267,11 @@ mod tests {
             Some("personal"),
         );
         assert_eq!(
-            resolve_workspace(&config, None, &nested, true).unwrap(),
+            resolve_workspace(&config, None, &nested, None, true).unwrap(),
             "acme"
         );
         assert_eq!(
-            resolve_workspace(&config, None, root.path(), true).unwrap(),
+            resolve_workspace(&config, None, root.path(), None, true).unwrap(),
             "work"
         );
     }
@@ -276,7 +285,7 @@ mod tests {
         fs::create_dir_all(&cwd).unwrap();
         let config = config_with(&[(rule_dir.to_str().unwrap(), "work")], Some("personal"));
         assert_eq!(
-            resolve_workspace(&config, None, &cwd, false).unwrap(),
+            resolve_workspace(&config, None, &cwd, None, false).unwrap(),
             "personal"
         );
     }
@@ -291,7 +300,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let config = config_with(&[(link.to_str().unwrap(), "work")], None);
         assert_eq!(
-            resolve_workspace(&config, None, &project, true).unwrap(),
+            resolve_workspace(&config, None, &project, None, true).unwrap(),
             "work"
         );
     }
@@ -310,10 +319,10 @@ mod tests {
             ],
             None,
         );
-        let err = resolve_workspace(&config, None, &real, true).unwrap_err();
+        let err = resolve_workspace(&config, None, &real, None, true).unwrap_err();
         assert!(err.contains("ambiguous"), "{err}");
         assert_eq!(
-            resolve_workspace(&config, Some("work"), &real, true).unwrap(),
+            resolve_workspace(&config, Some("work"), &real, None, true).unwrap(),
             "work"
         );
     }
@@ -322,20 +331,79 @@ mod tests {
     fn saves_fail_closed_inside_an_unmapped_git_checkout() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
-        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&repo).unwrap();
         let config = config_with(&[], Some("personal"));
+        let facts = facts_at(&repo);
 
-        let err = resolve_workspace(&config, None, &repo, true).unwrap_err();
+        let err = resolve_workspace(&config, None, &repo, Some(&facts), true).unwrap_err();
         assert!(err.contains("no workspace rule matches"), "{err}");
 
         assert_eq!(
-            resolve_workspace(&config, None, &repo, false).unwrap(),
+            resolve_workspace(&config, None, &repo, Some(&facts), false).unwrap(),
             "personal"
         );
+        // Outside the checkout there are no facts, so fail-closed never fires.
         assert_eq!(
-            resolve_workspace(&config, None, root.path(), true).unwrap(),
+            resolve_workspace(&config, None, root.path(), None, true).unwrap(),
             "personal"
         );
+    }
+
+    #[test]
+    fn with_no_worktree_rule_routing_follows_the_anchor_rule() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let worktree = root.path().join("wt");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        let config = config_with(&[(main.to_str().unwrap(), "work")], Some("personal"));
+        let facts = GitFacts {
+            anchor: canonical(&main),
+            ..facts_at(&worktree)
+        };
+        assert_eq!(
+            resolve_workspace(&config, None, &worktree, Some(&facts), true).unwrap(),
+            "work"
+        );
+    }
+
+    #[test]
+    fn an_explicit_worktree_rule_beats_the_inherited_anchor_rule() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let worktree = root.path().join("wt");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        let config = config_with(
+            &[
+                (main.to_str().unwrap(), "work"),
+                (worktree.to_str().unwrap(), "wt-only"),
+            ],
+            Some("personal"),
+        );
+        let facts = GitFacts {
+            anchor: canonical(&main),
+            ..facts_at(&worktree)
+        };
+        assert_eq!(
+            resolve_workspace(&config, None, &worktree, Some(&facts), true).unwrap(),
+            "wt-only"
+        );
+    }
+
+    #[test]
+    fn org_tier_is_an_empty_slot_that_falls_through_to_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let config = config_with(&[], Some("personal"));
+        let facts = GitFacts {
+            slug: Some("freshaengineering/widgets".into()),
+            owner: Some("freshaengineering".into()),
+            ..facts_at(&repo)
+        };
+        let err = resolve_workspace(&config, None, &repo, Some(&facts), true).unwrap_err();
+        assert!(err.contains("no workspace rule matches"), "{err}");
     }
 
     #[test]
@@ -345,42 +413,41 @@ mod tests {
         assert!(err.contains("--preference"), "{err}");
 
         let config = config_with(&[], Some("work"));
-        assert!(resolve_workspace(&config, Some("shared"), Path::new("/"), false).is_err());
-    }
-
-    #[test]
-    fn git_worktree_files_count_as_a_checkout() {
-        let root = tempfile::tempdir().unwrap();
-        let worktree = root.path().join("wt");
-        fs::create_dir_all(&worktree).unwrap();
-        fs::write(
-            worktree.join(".git"),
-            "gitdir: /elsewhere/.git/worktrees/wt",
-        )
-        .unwrap();
-        assert!(in_git_checkout(&worktree));
-        assert!(!in_git_checkout(root.path()));
+        assert!(resolve_workspace(&config, Some("shared"), Path::new("/"), None, false).is_err());
     }
 
     #[test]
     fn explicit_scope_flags_bypass_git_inference() {
-        let cwd = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_scope(Some("workspace"), cwd.path()).unwrap().scope,
+            explicit_scope(Some("workspace")).unwrap().unwrap().scope,
             "workspace"
         );
-        let explicit = resolve_scope(Some("fresha/offers"), cwd.path()).unwrap();
+        let explicit = explicit_scope(Some("fresha/offers")).unwrap().unwrap();
         assert_eq!(explicit.scope, "fresha/offers");
         assert!(explicit.note.is_none());
-        assert!(resolve_scope(Some("has space"), cwd.path()).is_err());
+        assert!(explicit_scope(Some("has space")).is_err());
+        assert!(explicit_scope(None).unwrap().is_none());
+        assert!(explicit_scope(Some("project")).unwrap().is_none());
     }
 
     #[test]
     fn scope_falls_back_to_workspace_with_a_note_outside_a_repo() {
-        let cwd = tempfile::tempdir().unwrap();
-        let resolved = resolve_scope(None, cwd.path()).unwrap();
+        let resolved = scope_from_facts(None);
         assert_eq!(resolved.scope, "workspace");
         assert!(resolved.note.is_some());
         assert_eq!(resolved.project(), None);
+    }
+
+    #[test]
+    fn scope_takes_the_slug_from_facts_without_shelling_out() {
+        let root = tempfile::tempdir().unwrap();
+        let facts = GitFacts {
+            slug: Some("fresha/offers".into()),
+            owner: Some("fresha".into()),
+            ..facts_at(root.path())
+        };
+        let resolved = scope_from_facts(Some(&facts));
+        assert_eq!(resolved.scope, "fresha/offers");
+        assert!(resolved.note.is_none());
     }
 }

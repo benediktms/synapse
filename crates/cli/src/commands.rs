@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ use crate::args::{
     RecallArgs, RememberArgs, SaveArgs, WorkspaceArgs, WorkspaceCommand,
 };
 use crate::config::{Config, WorkspaceRule};
+use crate::git::GitFacts;
 use crate::outbox::{FlushReport, Outbox, PendingSave, SaveTarget, now_millis};
 use crate::output;
 use crate::resolve;
@@ -29,7 +31,11 @@ const FLUSH_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 pub fn run(cli: Cli) -> Result<(), String> {
     let config = Config::load()?;
     let cwd = std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?;
-    let ctx = Context { config, cwd };
+    let ctx = Context {
+        config,
+        cwd,
+        facts: OnceCell::new(),
+    };
     match cli.command {
         Command::Save(args) => save(&ctx, args),
         Command::Remember(args) => remember(&ctx, args),
@@ -52,6 +58,9 @@ pub fn run(cli: Cli) -> Result<(), String> {
 struct Context {
     config: Config,
     cwd: PathBuf,
+    /// Lazy and memoized: probing git is skipped entirely by commands that never
+    /// resolve a workspace or scope, and never repeated within one invocation.
+    facts: OnceCell<Result<Option<GitFacts>, String>>,
 }
 
 impl Context {
@@ -60,12 +69,27 @@ impl Context {
             .map_err(|e| e.to_string())
     }
 
+    fn facts(&self) -> Result<Option<&GitFacts>, String> {
+        match self.facts.get_or_init(|| GitFacts::discover(&self.cwd)) {
+            Ok(facts) => Ok(facts.as_ref()),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
     fn workspace(&self, flag: Option<&str>, fail_closed: bool) -> Result<String, String> {
-        resolve::resolve_workspace(&self.config, flag, &self.cwd, fail_closed)
+        if let Some(name) = flag {
+            return resolve::validate_workspace(name);
+        }
+        let facts = self.facts()?;
+        resolve::resolve_workspace(&self.config, None, &self.cwd, facts, fail_closed)
     }
 
     fn scope(&self, flag: Option<&str>) -> Result<resolve::ResolvedScope, String> {
-        resolve::resolve_scope(flag, &self.cwd)
+        if let Some(explicit) = resolve::explicit_scope(flag)? {
+            return Ok(explicit);
+        }
+        let facts = self.facts()?;
+        Ok(resolve::scope_from_facts(facts))
     }
 }
 

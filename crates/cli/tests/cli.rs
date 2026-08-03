@@ -36,6 +36,20 @@ impl Machine {
         self.state_dir().join("outbox")
     }
 
+    /// The routing ladder now confirms a checkout via a real `git rev-parse`, so a
+    /// fixture testing fail-closed behaviour needs a real repository, not a bare `.git`.
+    fn init_git_repo(&self) {
+        let status = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .arg("-C")
+            .arg(&self.cwd)
+            .args(["-c", "init.defaultBranch=main", "init", "-q"])
+            .status()
+            .expect("run git init");
+        assert!(status.success(), "git init failed");
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_syn"))
             .args(args)
@@ -43,6 +57,22 @@ impl Machine {
             .env("SYNAPSE_CONFIG_DIR", self.home.path().join("config"))
             .env("SYNAPSE_STATE_DIR", self.state_dir())
             .env("HOME", self.home.path())
+            .output()
+            .expect("run syn")
+    }
+
+    /// A `PATH` with nothing on it, so any command that shells out to `git` fails to
+    /// spawn — proves facts are never probed eagerly for commands that don't need them.
+    fn run_without_git(&self, args: &[&str]) -> Output {
+        let empty_path = self.home.path().join("no-git-path");
+        std::fs::create_dir_all(&empty_path).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_syn"))
+            .args(args)
+            .current_dir(&self.cwd)
+            .env("SYNAPSE_CONFIG_DIR", self.home.path().join("config"))
+            .env("SYNAPSE_STATE_DIR", self.state_dir())
+            .env("HOME", self.home.path())
+            .env("PATH", &empty_path)
             .output()
             .expect("run syn")
     }
@@ -373,7 +403,7 @@ fn saves_fail_closed_in_a_git_checkout_with_no_matching_rule() {
         "url = \"{}\"\ntoken = \"t\"\ndefault_workspace = \"work\"\n",
         stub.url()
     ));
-    std::fs::create_dir_all(machine.cwd.join(".git")).unwrap();
+    machine.init_git_repo();
 
     let refused = machine.run(&["save", "risky fact", "--type", "project"]);
     assert!(!refused.status.success());
@@ -805,7 +835,7 @@ fn a_queued_preference_replays_as_a_preference() {
 fn workspace_map_writes_a_path_rule_that_saves_resolve_against() {
     let stub = Stub::start();
     let machine = Machine::with_config(&format!("url = \"{}\"\ntoken = \"t\"\n", stub.url()));
-    std::fs::create_dir_all(machine.cwd.join(".git")).unwrap();
+    machine.init_git_repo();
 
     let refused = machine.run(&["save", "a fact", "--type", "project"]);
     assert!(
@@ -841,4 +871,56 @@ fn workspace_map_writes_a_path_rule_that_saves_resolve_against() {
         std::fs::read_to_string(machine.home.path().join("config").join("config.toml")).unwrap();
     assert_eq!(config.matches("[[workspace_rules]]").count(), 1, "{config}");
     assert!(config.contains("workspace = \"personal\""), "{config}");
+}
+
+#[test]
+fn routing_free_commands_work_with_git_absent_from_path() {
+    let machine = Machine::with_config("token = \"t\"\n");
+
+    let set = machine.run_without_git(&["config", "set-token", "abc123"]);
+    assert!(set.status.success(), "{}", stderr(&set));
+
+    let pending = machine.run_without_git(&["list", "--pending"]);
+    assert!(pending.status.success(), "{}", stderr(&pending));
+}
+
+#[test]
+fn explicit_workspace_and_scope_save_succeeds_without_git() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let saved = machine.run_without_git(&[
+        "save",
+        "a fact",
+        "--type",
+        "project",
+        "--workspace",
+        "work",
+        "--scope",
+        "acme/repo",
+    ]);
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    assert!(
+        stdout(&saved).contains("(work · acme/repo)"),
+        "{}",
+        stdout(&saved)
+    );
+}
+
+#[test]
+fn a_save_needing_inference_errors_rather_than_defaulting_without_git() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let refused = machine.run_without_git(&["save", "a fact", "--type", "project"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("could not run git"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        json_files(&machine.outbox()).is_empty(),
+        "a hard git failure must not queue a save"
+    );
 }
