@@ -14,7 +14,7 @@ use crate::args::{
     Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, ListArgs, MoveArgs,
     RecallArgs, RememberArgs, SaveArgs, WorkspaceArgs, WorkspaceCommand,
 };
-use crate::config::{Config, WorkspaceRule};
+use crate::config::{Config, OrgRule, WorkspaceRule};
 use crate::git::GitFacts;
 use crate::outbox::{FlushReport, Outbox, PendingSave, SaveTarget, now_millis};
 use crate::output;
@@ -438,6 +438,13 @@ fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
                 };
                 println!("{workspace}{marker}");
             }
+            // Ladder order: path rules beat org rules, so they print first.
+            for rule in &ctx.config.workspace_rules {
+                println!("{} -> {} (path rule)", rule.path, rule.workspace);
+            }
+            for rule in &ctx.config.org_rules {
+                println!("{} -> {} (org rule)", rule.org, rule.workspace);
+            }
             Ok(())
         }
         WorkspaceCommand::Create { name } => {
@@ -470,6 +477,19 @@ fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
             });
             config.save()?;
             println!("{path} now resolves to workspace {name}");
+            Ok(())
+        }
+        WorkspaceCommand::MapOrg { org, name } => {
+            let org = resolve::validate_org(&org)?;
+            let name = resolve::validate_workspace(&name)?;
+            let mut config = ctx.config.clone();
+            config.org_rules.retain(|rule| rule.org != org);
+            config.org_rules.push(OrgRule {
+                org: org.clone(),
+                workspace: name.clone(),
+            });
+            config.save()?;
+            println!("org {org} now resolves to workspace {name}");
             Ok(())
         }
     }

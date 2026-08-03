@@ -104,6 +104,16 @@ impl Scope {
         }
     }
 
+    /// The grammar `parse` enforces on each half of `owner/repo`, applied to a bare
+    /// owner segment (an org name in an org rule has no accompanying repo).
+    pub fn validate_owner(owner: &str) -> Result<(), Error> {
+        if is_scope_segment(owner) {
+            Ok(())
+        } else {
+            Err(Error::InvalidScope(owner.to_string()))
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
             Self::Workspace => "workspace",
@@ -221,6 +231,20 @@ mod tests {
         ] {
             assert_eq!(
                 Scope::parse(bad),
+                Err(Error::InvalidScope(bad.to_string())),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_owner_shares_the_grammar_parse_enforces_on_each_half() {
+        for good in ["fresha", "my-org", "a_b.c"] {
+            assert_eq!(Scope::validate_owner(good), Ok(()), "rejected {good:?}");
+        }
+        for bad in ["", "has space", "off/ers", &"o".repeat(65)] {
+            assert_eq!(
+                Scope::validate_owner(bad),
                 Err(Error::InvalidScope(bad.to_string())),
                 "accepted {bad:?}"
             );

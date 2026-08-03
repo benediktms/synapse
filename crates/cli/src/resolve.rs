@@ -36,7 +36,7 @@ pub fn resolve_workspace(
     {
         return validate_workspace(&name);
     }
-    if let Some(name) = org_rule_match(facts.and_then(|facts| facts.owner.as_deref())) {
+    if let Some(name) = org_rule_match(config, facts.and_then(|facts| facts.owner.as_deref()))? {
         return validate_workspace(&name);
     }
     if fail_closed && facts.is_some() {
@@ -54,10 +54,39 @@ pub fn resolve_workspace(
     }
 }
 
-/// Org-rule tier of the ladder: wired in now so the ladder's shape is settled, populated
-/// in a later ticket once `[[org_rules]]` config parsing and `syn workspace map-org` exist.
-fn org_rule_match(_owner: Option<&str>) -> Option<String> {
-    None
+pub fn validate_org(org: &str) -> Result<String, String> {
+    Scope::validate_owner(org)
+        .map(|()| org.to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Org-rule tier of the ladder: only consulted once no path rule (cwd or anchor) matched.
+fn org_rule_match(config: &Config, owner: Option<&str>) -> Result<Option<String>, String> {
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let mut matched: Option<String> = None;
+    let mut ambiguous: Vec<String> = Vec::new();
+    for rule in &config.org_rules {
+        if rule.org != owner {
+            continue;
+        }
+        match &matched {
+            Some(workspace) if workspace == &rule.workspace => {}
+            Some(workspace) => {
+                ambiguous = vec![workspace.clone(), rule.workspace.clone()];
+            }
+            None => matched = Some(rule.workspace.clone()),
+        }
+    }
+    if !ambiguous.is_empty() {
+        ambiguous.sort();
+        return Err(format!(
+            "org rules for {owner} are ambiguous ({}); pass --workspace to disambiguate",
+            ambiguous.join(", ")
+        ));
+    }
+    Ok(matched)
 }
 
 fn rule_match(config: &Config, path: &Path) -> Result<Option<String>, String> {
@@ -186,7 +215,7 @@ fn slug(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WorkspaceRule;
+    use crate::config::{OrgRule, WorkspaceRule};
     use std::fs;
 
     fn config_with(rules: &[(&str, &str)], default: Option<&str>) -> Config {
@@ -392,18 +421,153 @@ mod tests {
     }
 
     #[test]
-    fn org_tier_is_an_empty_slot_that_falls_through_to_fail_closed() {
+    fn org_rule_routes_a_repo_that_no_path_rule_matched() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         fs::create_dir_all(&repo).unwrap();
-        let config = config_with(&[], Some("personal"));
+        let mut config = config_with(&[], Some("personal"));
+        config.org_rules.push(OrgRule {
+            org: "freshaengineering".into(),
+            workspace: "work".into(),
+        });
+        let facts = GitFacts {
+            slug: Some("freshaengineering/widgets".into()),
+            owner: Some("freshaengineering".into()),
+            ..facts_at(&repo)
+        };
+        assert_eq!(
+            resolve_workspace(&config, None, &repo, Some(&facts), true).unwrap(),
+            "work"
+        );
+    }
+
+    #[test]
+    fn org_rule_routes_a_worktree_of_the_repo_too() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let worktree = root.path().join("wt");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        let mut config = config_with(&[], Some("personal"));
+        config.org_rules.push(OrgRule {
+            org: "freshaengineering".into(),
+            workspace: "work".into(),
+        });
+        let facts = GitFacts {
+            anchor: canonical(&main),
+            slug: Some("freshaengineering/widgets".into()),
+            owner: Some("freshaengineering".into()),
+            ..facts_at(&worktree)
+        };
+        assert_eq!(
+            resolve_workspace(&config, None, &worktree, Some(&facts), true).unwrap(),
+            "work"
+        );
+    }
+
+    #[test]
+    fn a_nested_path_rule_still_beats_an_org_rule_for_the_same_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("clients/acme");
+        fs::create_dir_all(&nested).unwrap();
+        let mut config = config_with(
+            &[(nested.to_str().unwrap(), "client-a-ws")],
+            Some("personal"),
+        );
+        config.org_rules.push(OrgRule {
+            org: "freshaengineering".into(),
+            workspace: "work".into(),
+        });
+        let facts = GitFacts {
+            slug: Some("freshaengineering/widgets".into()),
+            owner: Some("freshaengineering".into()),
+            ..facts_at(&nested)
+        };
+        assert_eq!(
+            resolve_workspace(&config, None, &nested, Some(&facts), true).unwrap(),
+            "client-a-ws"
+        );
+    }
+
+    #[test]
+    fn conflicting_org_rules_naming_different_workspaces_are_ambiguous() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut config = config_with(&[], None);
+        config.org_rules.push(OrgRule {
+            org: "freshaengineering".into(),
+            workspace: "work".into(),
+        });
+        config.org_rules.push(OrgRule {
+            org: "freshaengineering".into(),
+            workspace: "personal".into(),
+        });
         let facts = GitFacts {
             slug: Some("freshaengineering/widgets".into()),
             owner: Some("freshaengineering".into()),
             ..facts_at(&repo)
         };
         let err = resolve_workspace(&config, None, &repo, Some(&facts), true).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert_eq!(
+            resolve_workspace(&config, Some("work"), &repo, Some(&facts), true).unwrap(),
+            "work"
+        );
+    }
+
+    #[test]
+    fn identical_duplicate_org_rules_coalesce_silently() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut config = config_with(&[], None);
+        config.org_rules.push(OrgRule {
+            org: "freshaengineering".into(),
+            workspace: "work".into(),
+        });
+        config.org_rules.push(OrgRule {
+            org: "freshaengineering".into(),
+            workspace: "work".into(),
+        });
+        let facts = GitFacts {
+            slug: Some("freshaengineering/widgets".into()),
+            owner: Some("freshaengineering".into()),
+            ..facts_at(&repo)
+        };
+        assert_eq!(
+            resolve_workspace(&config, None, &repo, Some(&facts), true).unwrap(),
+            "work"
+        );
+    }
+
+    #[test]
+    fn an_origin_less_repo_falls_through_org_rules_without_crashing() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut config = config_with(&[], Some("personal"));
+        config.org_rules.push(OrgRule {
+            org: "freshaengineering".into(),
+            workspace: "work".into(),
+        });
+        let facts = facts_at(&repo);
+        assert_eq!(facts.owner, None);
+        assert_eq!(
+            resolve_workspace(&config, None, &repo, Some(&facts), false).unwrap(),
+            "personal"
+        );
+        let err = resolve_workspace(&config, None, &repo, Some(&facts), true).unwrap_err();
         assert!(err.contains("no workspace rule matches"), "{err}");
+    }
+
+    #[test]
+    fn validate_org_shares_the_owner_grammar() {
+        assert_eq!(
+            validate_org("freshaengineering").unwrap(),
+            "freshaengineering"
+        );
+        assert!(validate_org("has space").is_err());
     }
 
     #[test]

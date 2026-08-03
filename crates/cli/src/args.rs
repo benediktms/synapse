@@ -186,6 +186,8 @@ pub enum WorkspaceCommand {
     Use { name: String },
     /// Bind a directory tree to a workspace, so saves under it resolve without a flag
     Map { path: PathBuf, name: String },
+    /// Bind every repo under a GitHub/GitLab org to a workspace; path rules still win
+    MapOrg { org: String, name: String },
 }
 
 #[derive(Debug, Subcommand)]
