@@ -55,6 +55,10 @@ struct Structural {
 
 // `--show-superproject-working-tree` prints nothing outside a submodule, and a bare
 // repo prints the two dirs then fails `--show-toplevel`, so the count is the signal.
+// A zero-line failure is ambiguous between "no repository here" and "repository here,
+// but git refuses to use it" (missing gitdir, safe.directory, GIT_CEILING_DIRECTORIES) —
+// a `.git` entry on an ancestor disambiguates it to the latter, a routing error rather
+// than a silent absence.
 fn structural(dir: &Path, deadline: Instant) -> Result<Option<Structural>, String> {
     let output = run_git(
         dir,
@@ -72,7 +76,7 @@ fn structural(dir: &Path, deadline: Instant) -> Result<Option<Structural>, Strin
     let lines: Vec<&str> = stdout.lines().collect();
     if !output.status.success() {
         return match lines.len() {
-            0 => Ok(None),
+            0 if !has_dot_git_ancestor(dir) => Ok(None),
             2 => Ok(None),
             _ => Err(format!(
                 "git rev-parse failed in {}: {}",
@@ -164,6 +168,10 @@ fn primary_worktree(tree: &Structural, deadline: Instant) -> Result<PathBuf, Str
     Ok(canonical(Path::new(path)))
 }
 
+fn has_dot_git_ancestor(dir: &Path) -> bool {
+    canonical(dir).ancestors().any(|d| d.join(".git").exists())
+}
+
 fn origin_slug(dir: &Path, deadline: Instant) -> Result<Option<String>, String> {
     let output = run_git(dir, &["config", "--get", "remote.origin.url"], deadline)?;
     if !output.status.success() {
@@ -180,6 +188,7 @@ fn run_git(dir: &Path, args: &[&str], deadline: Instant) -> Result<Output, Strin
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_CEILING_DIRECTORIES")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -363,6 +372,37 @@ mod tests {
         assert_eq!(GitFacts::discover(&store).unwrap(), None);
         assert_eq!(GitFacts::discover(&store.join("refs")).unwrap(), None);
         assert_eq!(GitFacts::discover(root.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_bare_repo_nested_inside_a_checkout_still_yields_no_facts() {
+        let root = TempDir::new().unwrap();
+        let outer = repo(root.path(), "outer", "git@github.com:acme/outer.git");
+        let bare = outer.join("vendor/bare.git");
+        fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        git(&outer, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+
+        assert_eq!(GitFacts::discover(&bare).unwrap(), None);
+    }
+
+    #[test]
+    fn a_repo_git_finds_but_cannot_use_errors_instead_of_reading_as_absent() {
+        let root = TempDir::new().unwrap();
+        let broken = root.path().join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join(".git"), "gitdir: /nonexistent/path.git\n").unwrap();
+
+        let err = GitFacts::discover(&broken).unwrap_err();
+        assert!(err.contains(&broken.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn a_plain_directory_with_no_dot_git_ancestor_still_yields_no_facts() {
+        let root = TempDir::new().unwrap();
+        let plain = root.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+
+        assert_eq!(GitFacts::discover(&plain).unwrap(), None);
     }
 
     #[test]

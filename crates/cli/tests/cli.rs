@@ -982,6 +982,50 @@ fn map_org_round_trips_through_list_and_keeps_the_config_private() {
 }
 
 #[test]
+fn re_mapping_an_org_under_a_different_case_replaces_the_old_rule() {
+    let stub = Stub::start();
+    let machine = Machine::with_config(&format!("url = \"{}\"\ntoken = \"t\"\n", stub.url()));
+
+    let first = machine.run(&["workspace", "map-org", "Acme", "one"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let second = machine.run(&["workspace", "map-org", "acme", "two"]);
+    assert!(second.status.success(), "{}", stderr(&second));
+
+    let config_path = machine.home.path().join("config").join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert_eq!(config.matches("[[org_rules]]").count(), 1, "{config}");
+    assert!(config.contains("workspace = \"two\""), "{config}");
+
+    machine.init_git_repo_with_origin("git@github.com:Acme/widgets.git");
+    let saved = machine.run(&["save", "a fact", "--type", "project"]);
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    assert!(
+        stdout(&saved).contains("(two · Acme/widgets)"),
+        "{}",
+        stdout(&saved)
+    );
+}
+
+#[test]
+fn a_present_but_unusable_repo_refuses_the_save_instead_of_defaulting() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+    std::fs::write(machine.cwd.join(".git"), "gitdir: /nonexistent/path.git\n").unwrap();
+
+    let refused = machine.run(&["save", "a fact", "--type", "project"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains(machine.cwd.to_str().unwrap()),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        json_files(&machine.outbox()).is_empty(),
+        "a repo git cannot use must not queue a save into the default workspace"
+    );
+}
+
+#[test]
 fn an_org_rule_routes_an_unmapped_repo_and_its_worktree() {
     let stub = Stub::start();
     let machine = Machine::with_config(&format!("url = \"{}\"\ntoken = \"t\"\n", stub.url()));

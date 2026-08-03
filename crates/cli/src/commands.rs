@@ -483,7 +483,9 @@ fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
             let org = resolve::validate_org(&org)?;
             let name = resolve::validate_workspace(&name)?;
             let mut config = ctx.config.clone();
-            config.org_rules.retain(|rule| rule.org != org);
+            config
+                .org_rules
+                .retain(|rule| !rule.org.eq_ignore_ascii_case(&org));
             config.org_rules.push(OrgRule {
                 org: org.clone(),
                 workspace: name.clone(),
