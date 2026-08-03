@@ -1,29 +1,62 @@
 ---
 name: synapse
-description: Durable cross-session memory via the `syn` CLI. Recall before starting substantive work or when the user references a past decision ("like we discussed", "the usual way"); save corrections, stated preferences, and decisions the code will not record.
+description: Durable cross-session synapses via the `syn` CLI — the store for anything that should outlive this session. Read it before answering from assumption, whenever the user names a program, service, convention, or decision you cannot account for from the repo in front of you, or points backwards ("like we discussed", "the usual way", "as before"), or before starting substantive work on a subsystem. Write to it, unprompted, the moment a decision is reached, a preference is stated, or you are corrected — durable facts only, never tasks or reminders. This is the store to reach for even if the harness also offers a memory directory of markdown files — synapses carry a scope that such files cannot express, so use `syn` and do not mirror the same fact into both. Use it even when a session-start digest has already appeared: the digest is a few lines out of the whole store, not a substitute for querying it.
 ---
 
-# Synapse memory
+# Synapse protocol
 
-`syn` is a memory store shared by every harness and machine. It holds facts that
-outlive a session and are **not** derivable from the repository.
+`syn` holds **synapses**: durable facts about the user and their work, shared by
+every harness, machine, and session, and not derivable from the repository. The
+CLI prints the word "memory" and the commands keep it — but think in synapses,
+because the harness's own memory system is a different thing (step 0).
 
-## Recall
+Four steps, in order: **read → pick the move → pick the scope → write**. The order
+matters in one place only, and it is load-bearing: reading is what tells you which
+move and which scope, so a write that skipped step 1 is a guess.
+
+## 0. Synapses are not the harness's memory files
+
+Most harnesses ship a memory system — usually a directory of markdown files with
+an index. If this one has one, it is neither a substitute nor a mirror.
+
+A synapse carries a **scope**; a file in a memory directory cannot express one. It
+also does not depend on where the harness was launched: instruction files and
+memory directories are read only when a session starts somewhere that loads them,
+while a synapse is reachable from any directory inside its scope. Write the
+synapse and stop there. Mirroring a fact into both stores leaves two copies that
+drift, and the scopeless copy is the one that goes wrong.
+
+## 1. Read
 
 ```
-syn recall "<topic>"            # active workspace + the user's preferences
+syn recall "<topic>"            # active workspace + everything global
 syn recall "<topic>" -n 5       # cap results (default 10)
 syn recall "<topic>" --all-workspaces
 ```
 
-Run it:
+**The digest is not the store.** A session-start hook injects `syn context` —
+four or five lines, pinned and recent, chosen before anyone knew what this session
+would be about. It tells you synapses exist; it does not tell you what they say.
+Having seen the digest is the most common reason recall gets skipped, and it is
+not a reason.
 
-- before starting substantive work on a task, using the task topic as the query;
-- whenever the user references a past decision — "like we discussed", "the usual
-  way", "as before";
-- before saving anything (see below).
+Recall when:
 
-Hits look like this:
+- **A name you cannot account for** — the user mentions a program, service, tool,
+  or convention you cannot explain from this repo or this session. Recall before
+  guessing, and before asking them to re-explain something they may have told you
+  once already. An unfamiliar proper noun is the strongest signal there is.
+- **Before substantive work on a subsystem** — query the topic. Rejected
+  alternatives, why a thing is shaped oddly, a convention that outlived its
+  author: none of that is in the code.
+- **The user points backwards** — "like we discussed", "the usual way", "as
+  before", "you know how I like it".
+- **Before any write** — see step 2.
+
+Skip it when the question is fully answered by code in front of you. Recall on
+every trivial turn is noise, and noise is what gets the habit dropped.
+
+Hits name their origin — a workspace, `workspace · project`, or `preference`:
 
 ```
 [m_7f2a] (work · fresha/offers, 2026-07-14) Staging deploys for offers-service go
@@ -33,83 +66,119 @@ Datadog dashboard link over log tailing.
 (2 results, 140ms)
 ```
 
-The bracketed parenthetical is the hit's origin: a workspace (optionally
-`workspace · project`) or `preference`.
+## 2. Pick the move
 
-## Save
+A store that only grows becomes noise, and once the user stops reading the digest
+you have lost the channel, not just one fact. So recording is tending a network,
+not appending to a log. Four moves:
+
+| Move | Command | When |
+| --- | --- | --- |
+| **Grow** | `syn save` / `syn remember` | nothing covers this yet |
+| **Strengthen** | `syn edit <id>` | a synapse is nearly right and this sharpens it — two half-true synapses on one topic are worse than either alone |
+| **Prune** | `syn forget <id>` | a decision made an old synapse false; a retirement invalidates synapses, it does not merely add one |
+| **Rewire** | `syn move <id>` | true, but filed where the sessions that need it will never look |
+
+Recall the topic first. Not as a rule to obey — it is the only way to know which
+of the four you are in.
+
+## 3. Pick the scope
+
+Scope is what a plain memory file cannot express, and getting it wrong is the most
+common way a store goes bad. Decide it **per fact**: two facts in one turn often
+belong in two different places.
+
+The question that separates them: **would this still be true, and still worth
+knowing, in a codebase that has nothing to do with this one?**
+
+- **Yes → `syn remember`.** Facts about the user and how they want to be worked
+  with: communication style, tooling choices, blanket rules like "never
+  force-push shared branches". No scope flag, because it has no scope.
+- **No, it concerns this body of work → `syn save … --scope workspace`.** It names
+  the user's own programs, repos or conventions and spans more than one of them. A
+  decision about how two of their projects relate belongs to neither alone, and
+  filing it under one hides it from the other. Also correct when the checkout has
+  no git remote, since there is nothing to infer from.
+- **No, and it is one repo's business → `syn save …`.** Scope comes from the git
+  remote. `--scope owner/repo` files it against a different project than the one
+  you are standing in.
+
+A useful tell: a fact that names a program is almost never a `syn remember`.
+Project architecture is not a preference.
+
+**When torn, go narrower.** The mistakes are not symmetrical. An over-scoped
+synapse is merely hidden and `--all-workspaces` still finds it; an over-globalised
+one surfaces in every unrelated session forever. A workspace holds one coherent
+slice of the user's life — their own projects, or their employer's — and a fact
+from one slice is usually wrong in the other.
+
+## 4. Write
 
 ```
-syn save "<fact>" --type user|feedback|project|reference [--tags a,b]
+syn save "<fact>" --type user|feedback|project|reference [--scope …] [--tags a,b]
 syn remember "<fact>"
 ```
 
-Save when you learn something durable:
+`--type` records what kind of fact it is: `feedback` for a correction or a stated
+way of working, `user` for something about the person, `project` for a decision
+the code will not record, `reference` for a URL, dashboard, ticket or runbook.
 
-| What happened | Command |
-| --- | --- |
-| The user corrects you, or states how they want things done in this codebase | `syn save … --type feedback` |
-| A fact about the user that this project needs | `syn save … --type user` |
-| A decision is made that the code will not record — a convention, a rationale, a rejected option | `syn save … --type project` |
-| A URL, dashboard, ticket, or runbook worth keeping | `syn save … --type reference` |
-| A preference that applies **everywhere**, in every project and workspace | `syn remember "<fact>"` |
+Write in the same turn it happens. A decision is durable the moment it is reached;
+deferring to a tidier moment is how it gets lost. Do not ask permission — a write
+is cheap and `syn forget` undoes it, whereas a decision never written costs the
+user the whole argument again in six weeks.
 
-`syn remember` is the one for durable user preferences — tooling choices,
-communication style, blanket rules like "never force-push shared branches". It
-takes no scope: it is not tied to a workspace or a project, and it surfaces in
-recall everywhere. Do not use `syn save` for those.
+**Report each write in one line**, after your answer, so a wrong or badly-scoped
+synapse gets caught while it is still cheap: `saved [m_00B1] brain retired →
+repo-link + synapse`. Not a section, not a justification.
 
-`syn save` infers its scope from the current git remote, so a fact saved in a
-repo belongs to that project. Pass `--scope workspace` for a fact that holds
-across the whole workspace but is not a global preference; pass
-`--scope owner/repo` to file it against a different project.
+### What earns a place
 
-**Recall before you save.** Search the topic first. If a memory already covers
-it, `syn edit` that id instead of creating a near-duplicate.
+- **Not what the code says** — file layout, function names, what a test asserts.
+  A synapse earns its place by surviving the code changing around it.
+- **Not a task or a reminder.** "Remember to add the flag later" is work to be
+  tracked, not a fact to be known — it goes stale the moment it is done. This is
+  not a routing problem to solve by writing it somewhere else instead: a to-do
+  does not belong in a synapse *or* in a memory file. Say in your reply that it is
+  deferred and leave it to whatever tracks the user's work. What is worth keeping
+  is the *decision* behind a deferral, if there was one — "we chose not to do X
+  because Y" is a durable fact; "do X later" is not.
+- **Yes to instructions, deliberately.** A rule in `CLAUDE.md`, `AGENTS.md`, a
+  contributing guide, a skill or an MCP server's notes reaches only sessions that
+  load that file — which depends on the harness and on where it was invoked. Being
+  written down in *one* place is the reason to store it, not a reason to skip it.
+  Scope it by how far it must reach: a global instruction file, or anything about
+  how the user wants to be worked with, is `syn remember`; one repo's convention
+  takes project scope, or workspace scope if someone could need it while standing
+  elsewhere.
 
-Never save what the repo already records — file layout, function names, what a
-test asserts, anything a reader would find by opening the code.
+Write them self-contained: absolute dates ("2026-08-03", not "yesterday"), full
+names, enough context to be read cold in six months by someone who was not here.
+A synapse is read by a stranger and cannot lean on anything that was only true in
+the conversation that produced it.
 
-Write memories self-contained: absolute dates ("2026-08-02", not "yesterday"),
-full names, enough context to be understood cold in six months by someone who
-was not in this session.
-
-## Correct, remove, browse
+## Reference
 
 ```
 syn edit <id> "<corrected fact>"
 syn forget <id>
-syn pin <id>            # keep it in the session-start digest
-syn unpin <id>
-syn show <id>
-syn list
-syn move <id> --to <workspace>   # it was filed in the wrong workspace
-syn move <id> --to-preference    # it should apply everywhere
+syn move <id> --to <workspace>   # filed in the wrong workspace
+syn move <id> --to-preference    # should apply everywhere
+syn pin <id> / syn unpin <id>    # keep it in the session-start digest
+syn show <id> / syn list
 ```
 
-`syn move` keeps the id, the content and the original creation date, so reach
-for it rather than forget-and-re-save when a memory is merely in the wrong
-place. Its source flags say where the memory *is* (`--workspace`, `--preference`),
-its `--to` flags where it belongs. Moving into preferences widens a
-project-scoped memory to the whole workspace, since it now applies everywhere.
+`syn move` keeps the id, the content and the original creation date, so prefer it
+to forget-and-re-save when a synapse is merely in the wrong place. Its source
+flags say where the synapse *is* (`--workspace`, `--preference`), its `--to` flags
+where it belongs.
 
-These act on one store, so tell them which one — take it from the hit line:
+Every command acts on one store, so say which — read it off the hit line:
+`(work · fresha/offers, …)` → `--workspace work`; `(preference, …)` →
+`--preference`. Omit the flag and it uses the workspace resolved for the current
+directory, which is right when acting on a hit from that same workspace.
 
-- workspace hit like `(work · fresha/offers, …)` → `--workspace work`
-- preference hit like `(preference, …)` → `--preference`
-
-Omit the flag and the command uses the workspace resolved for the current
-directory, which is right when you are acting on a hit from that same workspace.
-
-## Session start
-
-`syn context` prints the digest for the current project — pinned memories, the
-user's preferences, recent project memories. Harnesses with a session-start hook
-inject it automatically. If you have not seen a `## Memory (syn context)` block
-this session, run `syn context` yourself before your first substantive step.
-
-## When the server is down
-
-Reads fail fast with a one-line error — carry on without memory, do not retry in
-a loop. Saves queue locally and report `queued … not yet recallable`; they flush
-on the next successful command. Say so plainly rather than claiming the memory
-was stored. `syn list --pending` shows the queue.
+**When the server is down**, reads fail fast with a one-line error — carry on
+without synapses, do not retry in a loop. Writes queue locally and report
+`queued … not yet recallable`, flushing on the next successful command. Say so
+plainly rather than claiming it was stored. `syn list --pending` shows the queue.
