@@ -23,6 +23,8 @@ pub enum Command {
     Edit(EditArgs),
     /// Delete a memory
     Forget(IdArgs),
+    /// Relocate a memory to another workspace, or make it apply everywhere
+    Move(MoveArgs),
     /// List memories, or queued saves with --pending
     List(ListArgs),
     /// Show a single memory
@@ -106,6 +108,28 @@ pub struct IdArgs {
     #[arg(long, conflicts_with = "preference")]
     pub workspace: Option<String>,
     /// Target a memory that applies everywhere
+    #[arg(long)]
+    pub preference: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MoveArgs {
+    pub id: String,
+    /// Workspace to move the memory into
+    #[arg(
+        long,
+        value_name = "WORKSPACE",
+        conflicts_with = "to_preference",
+        required_unless_present = "to_preference"
+    )]
+    pub to: Option<String>,
+    /// Make the memory apply everywhere, in every workspace and project
+    #[arg(long)]
+    pub to_preference: bool,
+    /// Workspace the memory is in now (defaults to the resolved workspace)
+    #[arg(long, conflicts_with = "preference")]
+    pub workspace: Option<String>,
+    /// The memory currently applies everywhere
     #[arg(long)]
     pub preference: bool,
 }

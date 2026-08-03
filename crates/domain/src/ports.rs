@@ -18,6 +18,7 @@ impl ScopeFilter {
 
 pub trait Store {
     async fn get(&self, id: &MemoryId) -> Result<Option<Memory>, Error>;
+    async fn get_with_embedding(&self, id: &MemoryId) -> Result<Option<(Memory, Vec<f32>)>, Error>;
     async fn insert(&self, memory: &Memory, embedding: &[f32]) -> Result<(), Error>;
     async fn update(
         &self,

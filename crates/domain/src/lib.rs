@@ -17,9 +17,9 @@ pub use ports::{Embedder, ScopeFilter, Store};
 pub use similarity::cosine_similarity;
 pub use usecases::{
     ContextDigest, DIGEST_PINNED_CAP, DIGEST_RECENT_PROJECT_CAP, DIGEST_SHARED_USER_CAP,
-    DigestEntry, EditRequest, MIN_VECTOR_SIMILARITY, RECALL_LIMIT_CAP, RecallHit, RecallRequest,
-    SaveOutcome, SaveRequest, WorkspaceHits, context_digest, edit, forget, list_memories, recall,
-    recall_grouped, save,
+    DigestEntry, EditRequest, MIN_VECTOR_SIMILARITY, MoveOutcome, RECALL_LIMIT_CAP, RecallHit,
+    RecallRequest, SaveOutcome, SaveRequest, WorkspaceHits, context_digest, edit, forget,
+    list_memories, move_memory, recall, recall_grouped, save,
 };
 pub use workspace::Workspace;
 

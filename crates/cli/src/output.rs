@@ -14,13 +14,18 @@ pub fn memory_line(origin: &Origin, memory: &MemoryDto) -> String {
 }
 
 fn provenance(origin: &Origin, memory: &MemoryDto) -> String {
-    let date = date(&memory.updated_at);
+    format!(
+        "{}, {}",
+        place(origin, &memory.scope),
+        date(&memory.updated_at)
+    )
+}
+
+pub fn place(origin: &Origin, scope: &str) -> String {
     match origin {
-        Origin::Preference => format!("preference, {date}"),
-        Origin::Workspace(workspace) if memory.scope == "workspace" => {
-            format!("{workspace}, {date}")
-        }
-        Origin::Workspace(workspace) => format!("{workspace} · {}, {date}", memory.scope),
+        Origin::Preference => "preference".to_string(),
+        Origin::Workspace(workspace) if scope == "workspace" => workspace.clone(),
+        Origin::Workspace(workspace) => format!("{workspace} · {scope}"),
     }
 }
 

@@ -20,8 +20,8 @@ use tracing::Level;
 use crate::backend::Backend;
 use crate::dto::{
     ContextResponse, EXPORT_VERSION, ExportDoc, HealthResponse, HitDto, HitGroupDto, ImportReport,
-    ListResponse, MemoryDto, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody,
-    SearchResponse, WorkspaceDto, WorkspacesResponse,
+    ListResponse, MemoryDto, MoveBody, MoveResponse, Origin, PatchMemoryBody, PutMemoryBody,
+    PutPreferenceBody, SearchResponse, WorkspaceDto, WorkspacesResponse,
 };
 use crate::error::ApiError;
 use crate::validate::{normalize_timestamp, validate_content, validate_query, validate_tags};
@@ -71,6 +71,7 @@ pub fn router<B: Backend>(backend: B, token: &str) -> Router {
                 .delete(delete_memory::<B>)
                 .get(get_memory::<B>),
         )
+        .route("/memories/{id}/move", axum::routing::post(move_memory::<B>))
         .route("/memories", get(list_memories::<B>))
         .route("/memories/search", get(search::<B>))
         .route(
@@ -193,6 +194,13 @@ fn parse_ws(name: &str) -> Result<Workspace, ApiError> {
         ));
     }
     Workspace::new(name).map_err(ApiError::from)
+}
+
+fn workspace_of(origin: &Origin) -> Result<Workspace, ApiError> {
+    match origin {
+        Origin::Preference => Ok(Workspace::shared()),
+        Origin::Workspace(name) => parse_ws(name),
+    }
 }
 
 fn require_ws(query: &WsQuery) -> Result<Workspace, ApiError> {
@@ -419,6 +427,24 @@ async fn delete_preference<B: Backend>(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     forget_in(&state, &Workspace::shared(), &id).await
+}
+
+async fn move_memory<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Json(body): Json<MoveBody>,
+) -> Result<Json<MoveResponse>, ApiError> {
+    let id = MemoryId::parse(&id)?;
+    let from = workspace_of(&body.from)?;
+    let to = workspace_of(&body.to)?;
+    let outcome = state.backend.move_memory(&from, &to, &id).await?;
+    Ok(Json(MoveResponse {
+        moved: outcome.moved,
+        from: body.from,
+        to: body.to,
+        from_scope: outcome.from_scope.as_str().to_string(),
+        memory: MemoryDto::from(&outcome.memory),
+    }))
 }
 
 async fn fetch_in<B: Backend>(

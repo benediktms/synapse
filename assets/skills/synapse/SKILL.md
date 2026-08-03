@@ -82,7 +82,15 @@ syn pin <id>            # keep it in the session-start digest
 syn unpin <id>
 syn show <id>
 syn list
+syn move <id> --to <workspace>   # it was filed in the wrong workspace
+syn move <id> --to-preference    # it should apply everywhere
 ```
+
+`syn move` keeps the id, the content and the original creation date, so reach
+for it rather than forget-and-re-save when a memory is merely in the wrong
+place. Its source flags say where the memory *is* (`--workspace`, `--preference`),
+its `--to` flags where it belongs. Moving into preferences widens a
+project-scoped memory to the whole workspace, since it now applies everywhere.
 
 These act on one store, so tell them which one — take it from the hit line:
 

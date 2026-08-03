@@ -91,6 +91,22 @@ pub struct PutPreferenceBody {
     pub tags: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MoveBody {
+    pub from: Origin,
+    pub to: Origin,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MoveResponse {
+    pub moved: bool,
+    pub from: Origin,
+    pub to: Origin,
+    pub from_scope: String,
+    #[serde(flatten)]
+    pub memory: MemoryDto,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PatchMemoryBody {
     pub content: Option<String>,

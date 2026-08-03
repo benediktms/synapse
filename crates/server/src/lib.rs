@@ -7,8 +7,8 @@ use adapters_fastembed::FastEmbedder;
 use adapters_sqlite::SqliteStore;
 use api::{Backend, BackendError, RestoreReport};
 use domain::{
-    ContextDigest, EditRequest, Embedder, Error, Memory, MemoryId, RecallHit, RecallRequest,
-    SaveOutcome, SaveRequest, Timestamp, Workspace, WorkspaceHits,
+    ContextDigest, EditRequest, Embedder, Error, Memory, MemoryId, MoveOutcome, RecallHit,
+    RecallRequest, SaveOutcome, SaveRequest, Timestamp, Workspace, WorkspaceHits,
 };
 use tokio::sync::RwLock;
 
@@ -178,6 +178,19 @@ impl Backend for App {
     async fn forget(&self, ws: &Workspace, id: &MemoryId) -> Result<(), BackendError> {
         let store = self.store(ws).await?;
         domain::forget(&*store, id).await.map_err(Into::into)
+    }
+
+    async fn move_memory(
+        &self,
+        from: &Workspace,
+        to: &Workspace,
+        id: &MemoryId,
+    ) -> Result<MoveOutcome, BackendError> {
+        let source = self.store(from).await?;
+        let target = self.store(to).await?;
+        domain::move_memory((from, &*source), (to, &*target), id, self.now())
+            .await
+            .map_err(Into::into)
     }
 
     async fn get(&self, ws: &Workspace, id: &MemoryId) -> Result<Option<Memory>, BackendError> {
