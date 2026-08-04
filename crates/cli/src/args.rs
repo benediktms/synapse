@@ -11,10 +11,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Save a durable memory in the resolved workspace
+    /// Save a durable memory — `--scope` says how far it reaches
     Save(SaveArgs),
-    /// Save a memory that applies everywhere, in every workspace and project
-    Remember(RememberArgs),
+    #[command(hide = true)]
+    Remember(RetiredArgs),
     /// Hybrid search over the active workspace and the memories that apply everywhere
     Recall(RecallArgs),
     /// Session-start digest for the current project
@@ -45,13 +45,28 @@ pub enum Command {
     Config(ConfigCommand),
 }
 
+pub const SCOPE_EVERYWHERE: &str = "everywhere";
+
+/// `project` is the store's own name for a `decision`, kept accepting but unadvertised so
+/// existing scripts and queued outbox items keep working.
+fn kinds() -> Vec<clap::builder::PossibleValue> {
+    use clap::builder::PossibleValue;
+    vec![
+        PossibleValue::new("user"),
+        PossibleValue::new("feedback"),
+        PossibleValue::new("decision"),
+        PossibleValue::new("reference"),
+        PossibleValue::new("project").hide(true),
+    ]
+}
+
 #[derive(Debug, Args)]
 pub struct SaveArgs {
     pub content: String,
-    /// Memory kind
-    #[arg(long = "type", value_name = "KIND", value_parser = ["user", "feedback", "project", "reference"])]
+    /// What kind of fact this is
+    #[arg(long = "kind", visible_alias = "type", value_name = "KIND", value_parser = clap::builder::PossibleValuesParser::new(kinds()))]
     pub kind: String,
-    /// `workspace`, `project` (infer from git origin), or an explicit `owner/repo`
+    /// How far the fact reaches: omit for this repo, or `workspace`, `everywhere`, `owner/repo`
     #[arg(long)]
     pub scope: Option<String>,
     #[arg(long)]
@@ -60,13 +75,30 @@ pub struct SaveArgs {
     pub tags: Vec<String>,
 }
 
+/// `syn remember` was folded into `syn save --scope everywhere`. It stays parseable so the
+/// error can name both forms instead of clap printing "unrecognized subcommand".
 #[derive(Debug, Args)]
-pub struct RememberArgs {
-    pub content: String,
-    #[arg(long = "type", value_name = "KIND", default_value = "user", value_parser = ["user", "feedback", "project", "reference"])]
-    pub kind: String,
-    #[arg(long, value_delimiter = ',')]
-    pub tags: Vec<String>,
+pub struct RetiredArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+    pub rest: Vec<String>,
+}
+
+/// Which store an existing memory lives in.
+#[derive(Debug, Args)]
+pub struct StoreArgs {
+    #[arg(long, conflicts_with_all = ["scope", "preference"])]
+    pub workspace: Option<String>,
+    /// `everywhere` targets the memories that apply in every workspace
+    #[arg(long, value_parser = [SCOPE_EVERYWHERE])]
+    pub scope: Option<String>,
+    #[arg(long, hide = true)]
+    pub preference: bool,
+}
+
+impl StoreArgs {
+    pub fn everywhere(&self) -> bool {
+        self.scope.is_some() || self.preference
+    }
 }
 
 #[derive(Debug, Args)]
@@ -95,27 +127,21 @@ pub struct ContextArgs {
 pub struct EditArgs {
     pub id: String,
     pub content: String,
-    #[arg(long, conflicts_with = "preference")]
-    pub workspace: Option<String>,
-    /// Target a memory that applies everywhere
-    #[arg(long)]
-    pub preference: bool,
+    #[command(flatten)]
+    pub store: StoreArgs,
 }
 
 #[derive(Debug, Args)]
 pub struct IdArgs {
     pub id: String,
-    #[arg(long, conflicts_with = "preference")]
-    pub workspace: Option<String>,
-    /// Target a memory that applies everywhere
-    #[arg(long)]
-    pub preference: bool,
+    #[command(flatten)]
+    pub store: StoreArgs,
 }
 
 #[derive(Debug, Args)]
 pub struct MoveArgs {
     pub id: String,
-    /// Workspace to move the memory into
+    /// Where it belongs: a workspace name, or `everywhere`
     #[arg(
         long,
         value_name = "WORKSPACE",
@@ -123,24 +149,16 @@ pub struct MoveArgs {
         required_unless_present = "to_preference"
     )]
     pub to: Option<String>,
-    /// Make the memory apply everywhere, in every workspace and project
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub to_preference: bool,
-    /// Workspace the memory is in now (defaults to the resolved workspace)
-    #[arg(long, conflicts_with = "preference")]
-    pub workspace: Option<String>,
-    /// The memory currently applies everywhere
-    #[arg(long)]
-    pub preference: bool,
+    #[command(flatten)]
+    pub store: StoreArgs,
 }
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    #[arg(long, conflicts_with = "preference")]
-    pub workspace: Option<String>,
-    /// List memories that apply everywhere
-    #[arg(long, conflicts_with = "pending")]
-    pub preference: bool,
+    #[command(flatten)]
+    pub store: StoreArgs,
     /// Show locally queued saves and dead-lettered items instead
     #[arg(long)]
     pub pending: bool,
@@ -157,20 +175,14 @@ pub struct ListArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkspaceArgs {
-    #[arg(long, conflicts_with = "preference")]
-    pub workspace: Option<String>,
-    /// Dump the memories that apply everywhere
-    #[arg(long)]
-    pub preference: bool,
+    #[command(flatten)]
+    pub store: StoreArgs,
 }
 
 #[derive(Debug, Args)]
 pub struct ImportArgs {
-    #[arg(long, conflicts_with = "preference")]
-    pub workspace: Option<String>,
-    /// Restore into the memories that apply everywhere
-    #[arg(long)]
-    pub preference: bool,
+    #[command(flatten)]
+    pub store: StoreArgs,
     /// Merge into a non-empty target instead of failing
     #[arg(long)]
     pub merge: bool,

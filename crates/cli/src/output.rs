@@ -1,5 +1,7 @@
 use api::{ContextResponse, DigestEntryDto, HitDto, MemoryDto, Origin};
 
+use crate::args::SCOPE_EVERYWHERE;
+
 pub fn hit_line(hit: &HitDto) -> String {
     memory_line(&hit.origin, &hit.memory)
 }
@@ -21,9 +23,13 @@ fn provenance(origin: &Origin, memory: &MemoryDto) -> String {
     )
 }
 
+pub fn store_label(origin: &Origin) -> String {
+    place(origin, "workspace")
+}
+
 pub fn place(origin: &Origin, scope: &str) -> String {
     match origin {
-        Origin::Preference => "preference".to_string(),
+        Origin::Preference => SCOPE_EVERYWHERE.to_string(),
         Origin::Workspace(workspace) if scope == "workspace" => workspace.clone(),
         Origin::Workspace(workspace) => format!("{workspace} · {scope}"),
     }
@@ -120,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn preference_hits_never_name_a_workspace() {
+    fn everywhere_hits_never_name_a_workspace() {
         let hit = HitDto {
             origin: Origin::Preference,
             score: 0.4,
@@ -128,7 +134,7 @@ mod tests {
         };
         assert_eq!(
             hit_line(&hit),
-            "[m_31bc] (preference, 2026-07-14) Prefers Datadog links."
+            "[m_31bc] (everywhere, 2026-07-14) Prefers Datadog links."
         );
     }
 

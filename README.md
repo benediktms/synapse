@@ -117,8 +117,8 @@ syn workspace map-org freshaengineering work
 Every command that infers its workspace or scope hard-errors when `git` is missing or
 misbehaves, rather than silently defaulting or falling back to `workspace` scope. Naming
 both halves explicitly is what keeps a command git-free: `--workspace` together with
-`--project`/`--scope` for a save, `--workspace` or `--preference` for `syn export` and
-`syn import`. A save that names `--workspace` but not `--scope` still needs `git`, because
+`--project`/`--scope` for a save, `--workspace` or `--scope everywhere` for `syn export`
+and `syn import`. A save that names `--workspace` but not `--scope` still needs `git`, because
 the scope comes from the repo's origin. The one exception is
 `syn context`: the installed session-start hook swallows any CLI failure, so a broken
 `git` degrades to *no digest* rather than a broken session — silent, but safe, and the
@@ -165,11 +165,11 @@ Dumps are a versioned logical format — ids, content, kind, scope, tags, pinned
 timestamps. Embeddings and the FTS index are derived, so they are not in the dump and
 import re-embeds with the active model. That also makes a dump model-agnostic.
 
-Back up each workspace plus the preferences, one file each:
+Back up each workspace plus the everywhere memories, one file each:
 
 ```sh
 for ws in $(syn workspace list); do syn export --workspace "$ws" > "backup/$ws.json"; done
-syn export --preference > backup/preferences.json
+syn export --scope everywhere > backup/everywhere.json
 ```
 
 Restore into an empty server:
@@ -186,7 +186,7 @@ curl -s localhost:8737/health
 #    `import` refuses a non-empty target unless you pass --merge.
 syn workspace create work
 syn import --workspace work < backup/work.json
-syn import --preference < backup/preferences.json
+syn import --scope everywhere < backup/everywhere.json
 
 # 3. confirm
 syn recall "something you know is in there"
@@ -198,8 +198,8 @@ Notes that matter when restoring:
 - `--merge` is idempotent by id, so a partial import is safe to re-run. A dump whose id
   already exists with *different* content is a conflict (409) and aborts the import — fix
   the collision rather than forcing it.
-- Preferences ("applies everywhere" memories, written with `syn remember`) are a separate
-  dump. Forgetting `--preference` silently leaves them out of the backup.
+- The everywhere memories (`syn save --scope everywhere`) are a separate dump. Forgetting
+  `--scope everywhere` silently leaves them out of the backup.
 - A queued save is not on the server, so it is in no dump. `syn export` drains this
   machine's outbox first and refuses to write anything while saves remain queued — a
   backup either includes them or fails. It cannot see *other* machines' outboxes, so run
