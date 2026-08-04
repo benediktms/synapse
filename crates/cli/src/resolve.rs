@@ -8,8 +8,8 @@ use crate::git::GitFacts;
 pub fn validate_workspace(name: &str) -> Result<String, String> {
     if name == "shared" {
         return Err(
-            "\"shared\" is not a workspace; use `syn remember` to save a memory that applies \
-             everywhere, or --preference to act on one"
+            "\"shared\" is not a workspace; use `--scope everywhere` to save a memory that \
+             applies in every workspace, or to target one"
                 .into(),
         );
     }
@@ -659,8 +659,7 @@ mod tests {
     #[test]
     fn shared_is_not_addressable_as_a_workspace() {
         let err = validate_workspace("shared").unwrap_err();
-        assert!(err.contains("syn remember"), "{err}");
-        assert!(err.contains("--preference"), "{err}");
+        assert!(err.contains("--scope everywhere"), "{err}");
 
         let config = config_with(&[], Some("work"));
         assert!(resolve_workspace(&config, Some("shared"), Path::new("/"), None, false).is_err());

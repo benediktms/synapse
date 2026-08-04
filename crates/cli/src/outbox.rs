@@ -26,7 +26,7 @@ impl SaveTarget {
     pub fn label(&self) -> String {
         match self {
             Self::Memory { workspace, body } => format!("{workspace} \u{b7} {}", body.scope),
-            Self::Preference { .. } => "preference".to_string(),
+            Self::Preference { .. } => "everywhere".to_string(),
         }
     }
 }
@@ -358,7 +358,7 @@ mod tests {
 
         let stored = outbox.pending().unwrap();
         assert!(matches!(stored[0].1.target, SaveTarget::Preference { .. }));
-        assert_eq!(stored[0].1.target.label(), "preference");
+        assert_eq!(stored[0].1.target.label(), "everywhere");
 
         assert_eq!(outbox.reassign("personal", None).unwrap(), (1, 1));
         let after = outbox.pending().unwrap();

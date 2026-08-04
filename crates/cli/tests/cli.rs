@@ -462,7 +462,7 @@ fn saves_fail_closed_in_a_git_checkout_with_no_matching_rule() {
     ]);
     assert!(!named_shared.status.success());
     assert!(
-        stderr(&named_shared).contains("syn remember"),
+        stderr(&named_shared).contains("--scope everywhere"),
         "{}",
         stderr(&named_shared)
     );
@@ -505,7 +505,7 @@ fn recall_prints_workspace_scope_and_date_per_hit() {
     );
     assert_eq!(
         lines[1],
-        "[m_0000000000000000000002] (preference, 2026-06-02) Prefers Datadog links."
+        "[m_0000000000000000000002] (everywhere, 2026-06-02) Prefers Datadog links."
     );
     assert!(lines[2].starts_with("(2 results, "), "{}", lines[2]);
 }
@@ -539,10 +539,10 @@ fn all_workspaces_recall_groups_hits_by_workspace() {
         lines[1],
         "[m_0000000000000000000001] (work, 2026-07-14) work fact"
     );
-    assert_eq!(lines[2], "## preference");
+    assert_eq!(lines[2], "## everywhere");
     assert_eq!(
         lines[3],
-        "[m_0000000000000000000003] (preference, 2026-07-14) a preference"
+        "[m_0000000000000000000003] (everywhere, 2026-07-14) a preference"
     );
     assert!(lines[4].starts_with("(2 results, "));
 }
@@ -654,27 +654,32 @@ fn id_commands_target_the_workspace_the_hit_came_from() {
 }
 
 #[test]
-fn preference_flag_routes_id_commands_away_from_any_workspace() {
+fn scope_everywhere_routes_id_commands_away_from_any_workspace() {
     let stub = Stub::start();
     let machine = Machine::new(&stub.url());
 
-    let shown = machine.run(&["show", "m_0000000000000000000002", "--preference"]);
+    let shown = machine.run(&["show", "m_0000000000000000000002", "--scope", "everywhere"]);
     assert!(shown.status.success(), "{}", stderr(&shown));
     assert!(
-        stdout(&shown).contains("(preference,"),
+        stdout(&shown).contains("(everywhere,"),
         "{}",
         stdout(&shown)
     );
 
-    let pinned = machine.run(&["pin", "m_0000000000000000000002", "--preference"]);
+    let pinned = machine.run(&["pin", "m_0000000000000000000002", "--scope", "everywhere"]);
     assert!(pinned.status.success(), "{}", stderr(&pinned));
     assert!(
-        stdout(&pinned).contains("(preference)"),
+        stdout(&pinned).contains("(everywhere)"),
         "{}",
         stdout(&pinned)
     );
 
-    let forgotten = machine.run(&["forget", "m_0000000000000000000002", "--preference"]);
+    let forgotten = machine.run(&[
+        "forget",
+        "m_0000000000000000000002",
+        "--scope",
+        "everywhere",
+    ]);
     assert!(forgotten.status.success(), "{}", stderr(&forgotten));
 
     stub.with(|state| {
@@ -691,7 +696,7 @@ fn preference_flag_routes_id_commands_away_from_any_workspace() {
                 .recorded
                 .iter()
                 .all(|r| !r.path.starts_with("/memories")),
-            "a preference command touched the workspace surface"
+            "an everywhere command touched the workspace surface"
         );
     });
 }
@@ -727,12 +732,12 @@ fn moving_into_preferences_reports_the_widened_scope() {
     stub.with(|state| state.move_from_scope = Some("fresha/offers".into()));
     let machine = Machine::new(&stub.url());
 
-    let output = machine.run(&["move", "m_0000000000000000000002", "--to-preference"]);
+    let output = machine.run(&["move", "m_0000000000000000000002", "--to", "everywhere"]);
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
         stdout(&output).trim(),
-        "moved m_0000000000000000000002 (work · fresha/offers → preference)"
+        "moved m_0000000000000000000002 (work · fresha/offers → everywhere)"
     );
     assert!(
         stderr(&output).contains("applies everywhere now"),
@@ -762,7 +767,7 @@ fn move_needs_a_destination_and_refuses_to_name_the_backing_store() {
     let reserved = machine.run(&["move", "m_0000000000000000000002", "--to", "shared"]);
     assert!(!reserved.status.success());
     assert!(
-        stderr(&reserved).contains("--preference"),
+        stderr(&reserved).contains("--scope everywhere"),
         "{}",
         stderr(&reserved)
     );
@@ -776,14 +781,18 @@ fn move_needs_a_destination_and_refuses_to_name_the_backing_store() {
 }
 
 #[test]
-fn remember_saves_without_naming_a_workspace_or_inheriting_the_repo_scope() {
+fn scope_everywhere_saves_without_naming_a_workspace_or_inheriting_the_repo_scope() {
     let stub = Stub::start();
     let machine = Machine::new(&stub.url());
     std::fs::create_dir_all(machine.cwd.join(".git")).unwrap();
 
     let output = machine.run(&[
-        "remember",
+        "save",
         "Benedikt prefers Datadog links over log tailing",
+        "--kind",
+        "user",
+        "--scope",
+        "everywhere",
     ]);
 
     assert!(output.status.success(), "{}", stderr(&output));
@@ -793,7 +802,7 @@ fn remember_saves_without_naming_a_workspace_or_inheriting_the_repo_scope() {
         stdout(&output)
     );
     assert!(
-        stdout(&output).contains("(preference)"),
+        stdout(&output).contains("(everywhere)"),
         "{}",
         stdout(&output)
     );
@@ -816,11 +825,18 @@ fn remember_saves_without_naming_a_workspace_or_inheriting_the_repo_scope() {
 }
 
 #[test]
-fn a_queued_preference_replays_as_a_preference() {
+fn a_queued_everywhere_save_replays_as_one() {
     let port = dead_port();
     let machine = Machine::new(&format!("http://127.0.0.1:{port}"));
 
-    let queued = machine.run(&["remember", "prefers oat milk"]);
+    let queued = machine.run(&[
+        "save",
+        "prefers oat milk",
+        "--kind",
+        "user",
+        "--scope",
+        "everywhere",
+    ]);
     assert!(
         stdout(&queued).contains("queued locally"),
         "{}",
@@ -829,14 +845,14 @@ fn a_queued_preference_replays_as_a_preference() {
 
     let pending = machine.run(&["list", "--pending"]);
     assert!(
-        stdout(&pending).contains("(preference) queued"),
+        stdout(&pending).contains("(everywhere) queued"),
         "{}",
         stdout(&pending)
     );
 
     let untouched = machine.run(&["list", "--pending", "--reassign", "personal"]);
     assert!(
-        stdout(&untouched).contains("left 1 preferences alone"),
+        stdout(&untouched).contains("left 1 everywhere saves alone"),
         "{}",
         stdout(&untouched)
     );
@@ -925,6 +941,90 @@ fn explicit_workspace_and_scope_save_succeeds_without_git() {
         "{}",
         stdout(&saved)
     );
+}
+
+#[test]
+fn a_save_that_reaches_everywhere_needs_neither_git_nor_a_workspace() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let saved = machine.run_without_git(&[
+        "save",
+        "Benedikt wants the failing test output before a fix",
+        "--kind",
+        "feedback",
+        "--scope",
+        "everywhere",
+    ]);
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    assert!(
+        stdout(&saved).contains("(everywhere)"),
+        "{}",
+        stdout(&saved)
+    );
+
+    let contradiction = machine.run(&[
+        "save",
+        "a fact",
+        "--kind",
+        "feedback",
+        "--scope",
+        "everywhere",
+        "--workspace",
+        "work",
+    ]);
+    assert!(!contradiction.status.success());
+    assert!(
+        stderr(&contradiction).contains("cannot take --workspace"),
+        "{}",
+        stderr(&contradiction)
+    );
+}
+
+#[test]
+fn the_retired_remember_command_names_both_reaches_and_writes_nothing() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let refused = machine.run(&["remember", "the clients are web, android and ios"]);
+
+    assert!(!refused.status.success());
+    let err = stderr(&refused);
+    assert!(err.contains("--scope everywhere"), "{err}");
+    assert!(err.contains("--scope workspace"), "{err}");
+    assert!(
+        err.contains("the clients are web, android and ios"),
+        "the fact is echoed back so nothing has to be retyped: {err}"
+    );
+    assert!(json_files(&machine.outbox()).is_empty());
+    stub.with(|state| {
+        assert!(
+            state.recorded.is_empty(),
+            "a retired command reached the server"
+        )
+    });
+}
+
+#[test]
+fn kind_decision_is_stored_as_the_project_kind_the_server_knows() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let saved = machine.run(&[
+        "save",
+        "staging deploys go through ArgoCD",
+        "--kind",
+        "decision",
+        "--scope",
+        "workspace",
+        "--workspace",
+        "work",
+    ]);
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    stub.with(|state| {
+        let body: serde_json::Value = serde_json::from_str(&state.puts()[0].body).unwrap();
+        assert_eq!(body["kind"], "project");
+    });
 }
 
 #[test]
