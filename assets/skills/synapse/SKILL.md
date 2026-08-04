@@ -1,6 +1,6 @@
 ---
 name: synapse
-description: Durable cross-session synapses via the `syn` CLI — the store for anything that should outlive this session. Reach for it whenever the user talks about memory in words of their own, whatever they call it: "remember this", "don't forget", "note that down", "make a note", "keep that in mind", "memorise it", "save that", "for future reference", "do you remember", "did I tell you", "what do you know about X", "forget what I said", "update what you know". Read it before answering from assumption, whenever the user names a program, service, convention, or decision you cannot account for from the repo in front of you, or points backwards ("like we discussed", "the usual way", "as before"), or before starting substantive work on a subsystem. Write to it, unprompted, the moment a decision is reached, a preference is stated, or you are corrected — durable facts only, never tasks or reminders. A user who says "remember" is asking you to make something durable, not telling you how far it should reach: reach is a judgement made per fact on `syn save --scope`, and `--scope everywhere` is only for facts that stay true in a codebase with nothing to do with this one. This is the store to reach for even if the harness also offers a memory directory of markdown files — synapses carry a scope that such files cannot express, so use `syn` and do not mirror the same fact into both. Use it even when a session-start digest has already appeared: the digest is a few lines out of the whole store, not a substitute for querying it.
+description: Durable cross-session synapses via the `syn` CLI — the store for anything that should outlive this session. Reach for it whenever the user talks about memory in words of their own, whatever they call it: "remember this", "don't forget", "note that down", "make a note", "keep that in mind", "memorise it", "save that", "for future reference", "do you remember", "did I tell you", "what do you know about X", "forget what I said", "update what you know". Read it before answering from assumption, whenever the user names a program, service, convention, or decision you cannot account for from the repo in front of you, or points backwards ("like we discussed", "the usual way", "as before"), or before starting substantive work on a subsystem. Write to it, unprompted, the moment a decision is reached, a preference is stated, or you are corrected — durable facts only, never tasks or reminders. A user who says "remember" is asking you to make something durable, not telling you how far it should reach: reach is a judgement made per fact on `syn save --scope`, and `--scope everywhere` is only for facts that stay true in a codebase with nothing to do with this one. After any write, tell the user the memory id `syn` printed and the reach it went to, in one line — that id is what they need to fix a mis-scoped fact. This is the store to reach for even if the harness also offers a memory directory of markdown files — synapses carry a scope that such files cannot express, so use `syn` and do not mirror the same fact into both. Use it even when a session-start digest has already appeared: the digest is a few lines out of the whole store, not a substitute for querying it.
 ---
 
 # Synapse protocol
@@ -95,10 +95,10 @@ belong in two different places.
 One flag carries it. `--scope` is the whole axis, widest to narrowest:
 
 ```
-syn save "<fact>" --kind feedback --scope everywhere    # every workspace, every project
-syn save "<fact>" --kind decision --scope workspace     # every repo in this workspace
-syn save "<fact>" --kind decision                       # this repo (inferred from git origin)
-syn save "<fact>" --kind reference --scope owner/repo    # a repo you are not standing in
+syn save "<fact>" --kind feedback --scope everywhere   # every workspace, every project
+syn save "<fact>" --kind decision --scope workspace    # every repo in this workspace
+syn save "<fact>" --kind decision                      # this repo (inferred from git origin)
+syn save "<fact>" --kind reference --scope owner/repo  # a repo you are not standing in
 ```
 
 The question that picks the line: **would this still be true, and still worth
@@ -133,16 +133,17 @@ repos, so it was `--scope workspace`; globalised, an employer's convention now
 surfaces in unrelated personal projects forever. The give-away was in the sentence
 all along — a repo name.
 
-The same holds in reverse. "While you're in this repo, stop asking before running
-the tests" sounds local because of where it was said, but it is about how they want
-to be worked with, so it is `--scope everywhere`. Neither the phrasing nor the
-current directory is the signal; the fact is.
+It holds in reverse too. "While you're in this repo, stop asking before running the
+tests" sounds local because of where it was said, but it is about how they want to
+be worked with, so it is `--scope everywhere`. Neither the phrasing nor the current
+directory is the signal; the fact is.
 
-**When torn, go narrower.** The mistakes are not symmetrical. An over-scoped
-synapse is merely hidden and `--all-workspaces` still finds it; an over-globalised
-one surfaces in every unrelated session forever. A workspace holds one coherent
-slice of the user's life — their own projects, or their employer's — and a fact
-from one slice is usually wrong in the other.
+**When torn, `--scope workspace` is the safe middle.** The two mistakes are not
+symmetrical, and neither is cheap. Globalised, a fact surfaces in every unrelated
+session forever. Narrowed to one repo, it is invisible from every other repo —
+recall filters project-scoped memories to the project you are standing in, and
+`--all-workspaces` does not lift that. Workspace scope is reachable from anywhere
+in that slice of the user's life while staying out of the others.
 
 ## 4. Write
 
@@ -161,9 +162,12 @@ deferring to a tidier moment is how it gets lost. Do not ask permission — a wr
 is cheap and `syn forget` undoes it, whereas a decision never written costs the
 user the whole argument again in six weeks.
 
-**Report each write in one line**, after your answer, so a wrong or badly-scoped
-synapse gets caught while it is still cheap: `saved [m_00B1] brain retired →
-repo-link + synapse`. Not a section, not a justification.
+**Report each write in one line, and always include the id `syn` printed**, after
+your answer: `saved [m_00B1] (work) brain retired → repo-link + synapse`. Not a
+section, not a justification. The id is the part that matters — it is what the user
+types into `syn forget` or `syn move` when the scope is wrong, and a write reported
+without one leaves them having to search for their own memory to correct it. Name
+the reach too, since that is the judgement most worth checking.
 
 ### What earns a place
 
