@@ -143,9 +143,9 @@ impl fmt::Display for Timestamp {
     }
 }
 
-/// Importance tiers. Higher rank = more important; the digest sorts rank desc.
-/// The public surface is a tier word; the persisted and stored form is the integer rank so
-/// future tiers need no schema migration.
+/// Importance tiers, low < medium < high. The public surface is the tier word; the persisted
+/// form is an integer rank so future tiers need no schema migration. Higher ranks are more
+/// important — consumers that order by importance should sort `rank()` descending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Importance {
     Low,
@@ -183,13 +183,14 @@ impl Importance {
         }
     }
 
-    // ponytail: a stored rank that isn't a known tier clamps to the nearest edge rather than
-    // erroring, so a corrupted integer can never produce an out-of-domain tier in memory.
-    pub fn from_rank(rank: u8) -> Self {
+    // ponytail: a stored rank outside the known tiers clamps to the nearest edge rather than
+    // erroring, so a corrupted integer — including any negative from a signed DB column — can
+    // never produce an out-of-domain tier in memory. Accepts the signed i64 the DB hands back.
+    pub fn from_rank(rank: i64) -> Self {
         match rank {
-            0 => Self::Low,
-            2.. => Self::High,
-            _ => Self::Medium,
+            ..=0 => Self::Low,
+            1 => Self::Medium,
+            _ => Self::High,
         }
     }
 }
@@ -309,7 +310,7 @@ mod tests {
         for tier in ["low", "medium", "high"] {
             let parsed = Importance::parse(tier).unwrap();
             assert_eq!(parsed.as_str(), tier);
-            assert_eq!(Importance::from_rank(parsed.rank()), parsed);
+            assert_eq!(Importance::from_rank(i64::from(parsed.rank())), parsed);
         }
         assert_eq!(
             Importance::parse("urgent"),
@@ -321,6 +322,8 @@ mod tests {
     fn importance_ranks_are_ordered_low_medium_high() {
         assert!(Importance::Low < Importance::Medium);
         assert!(Importance::Medium < Importance::High);
+        // Signed DB integers: negatives clamp to the low edge without wraparound.
+        assert_eq!(Importance::from_rank(-1), Importance::Low);
         assert_eq!(Importance::from_rank(0), Importance::Low);
         assert_eq!(Importance::from_rank(1), Importance::Medium);
         assert_eq!(Importance::from_rank(2), Importance::High);
