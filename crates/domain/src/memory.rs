@@ -143,6 +143,58 @@ impl fmt::Display for Timestamp {
     }
 }
 
+/// Importance tiers, low < medium < high. The public surface is the tier word; the persisted
+/// form is an integer rank so future tiers need no schema migration. Higher ranks are more
+/// important — consumers that order by importance should sort `rank()` descending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Importance {
+    Low,
+    Medium,
+    High,
+}
+
+impl Importance {
+    pub const DEFAULT: Self = Self::Medium;
+
+    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
+
+    pub fn parse(s: &str) -> Result<Self, Error> {
+        match s {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            _ => Err(Error::InvalidImportance(s.to_string())),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Medium => 1,
+            Self::High => 2,
+        }
+    }
+
+    // ponytail: a stored rank outside the known tiers clamps to the nearest edge rather than
+    // erroring, so a corrupted integer — including any negative from a signed DB column — can
+    // never produce an out-of-domain tier in memory. Accepts the signed i64 the DB hands back.
+    pub fn from_rank(rank: i64) -> Self {
+        match rank {
+            ..=0 => Self::Low,
+            1 => Self::Medium,
+            _ => Self::High,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Memory {
     pub id: MemoryId,
@@ -151,6 +203,7 @@ pub struct Memory {
     pub scope: Scope,
     pub tags: Vec<String>,
     pub pinned: bool,
+    pub importance: Importance,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -249,5 +302,31 @@ mod tests {
                 "accepted {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn importance_parse_and_rank_roundtrip() {
+        assert_eq!(Importance::DEFAULT, Importance::Medium);
+        for tier in ["low", "medium", "high"] {
+            let parsed = Importance::parse(tier).unwrap();
+            assert_eq!(parsed.as_str(), tier);
+            assert_eq!(Importance::from_rank(i64::from(parsed.rank())), parsed);
+        }
+        assert_eq!(
+            Importance::parse("urgent"),
+            Err(Error::InvalidImportance("urgent".to_string()))
+        );
+    }
+
+    #[test]
+    fn importance_ranks_are_ordered_low_medium_high() {
+        assert!(Importance::Low < Importance::Medium);
+        assert!(Importance::Medium < Importance::High);
+        // Signed DB integers: negatives clamp to the low edge without wraparound.
+        assert_eq!(Importance::from_rank(-1), Importance::Low);
+        assert_eq!(Importance::from_rank(0), Importance::Low);
+        assert_eq!(Importance::from_rank(1), Importance::Medium);
+        assert_eq!(Importance::from_rank(2), Importance::High);
+        assert_eq!(Importance::from_rank(9), Importance::High);
     }
 }

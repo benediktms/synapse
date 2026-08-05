@@ -68,6 +68,7 @@ impl MemoryDto {
             scope: Scope::parse(&self.scope)?,
             tags: self.tags.clone(),
             pinned: self.pinned,
+            importance: domain::Importance::DEFAULT,
             created_at: Timestamp::new(self.created_at.clone()),
             updated_at: Timestamp::new(self.updated_at.clone()),
         })

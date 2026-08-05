@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::Error;
 use crate::fusion::rrf_scores;
-use crate::memory::{Memory, MemoryId, MemoryKind, Scope, Timestamp};
+use crate::memory::{Importance, Memory, MemoryId, MemoryKind, Scope, Timestamp};
 use crate::ports::{Embedder, ScopeFilter, Store};
 use crate::similarity::cosine_similarity;
 use crate::workspace::Workspace;
@@ -58,6 +58,7 @@ pub async fn save<S: Store, E: Embedder>(
         scope: req.scope,
         tags: req.tags,
         pinned: false,
+        importance: Importance::DEFAULT,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -406,6 +407,7 @@ mod tests {
             scope,
             tags: Vec::new(),
             pinned,
+            importance: Importance::DEFAULT,
             created_at: ts(n % 60),
             updated_at: ts(n % 60),
         }
