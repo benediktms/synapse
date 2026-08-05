@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id, content, kind, scope, tags, pinned, embedding, created_at, updated_at FROM memories WHERE id = ?",
+  "query": "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at FROM memories WHERE id = ?",
   "describe": {
     "columns": [
       {
@@ -34,9 +34,9 @@
         "type_info": "Integer"
       },
       {
-        "name": "embedding",
+        "name": "importance",
         "ordinal": 6,
-        "type_info": "Blob"
+        "type_info": "Integer"
       },
       {
         "name": "created_at",
@@ -64,5 +64,5 @@
       false
     ]
   },
-  "hash": "d42ba3924af75730250400a525798adc8f10e43c992058b8a975cfb52dae50f8"
+  "hash": "38997f1463312aaa8d3612e3e61e5e01800865d8b27b3a35e8880403669bd914"
 }

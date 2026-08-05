@@ -71,6 +71,7 @@ pub struct EditRequest {
     pub content: Option<String>,
     pub tags: Option<Vec<String>>,
     pub pinned: Option<bool>,
+    pub importance: Option<Importance>,
 }
 
 pub async fn edit<S: Store, E: Embedder>(
@@ -88,8 +89,13 @@ pub async fn edit<S: Store, E: Embedder>(
         content: req.content.filter(|content| *content != current.content),
         tags: req.tags.filter(|tags| *tags != current.tags),
         pinned: req.pinned.filter(|pinned| *pinned != current.pinned),
+        importance: req.importance.filter(|tier| *tier != current.importance),
     };
-    if patch.content.is_none() && patch.tags.is_none() && patch.pinned.is_none() {
+    if patch.content.is_none()
+        && patch.tags.is_none()
+        && patch.pinned.is_none()
+        && patch.importance.is_none()
+    {
         return Ok(current);
     }
     let embedding = match &patch.content {
