@@ -1088,6 +1088,7 @@ fn memory(n: u32, content: &str) -> Memory {
         scope: Scope::Workspace,
         tags: Vec::new(),
         pinned: false,
+        importance: domain::Importance::DEFAULT,
         created_at: Timestamp::new("2026-08-01T00:00:00Z"),
         updated_at: Timestamp::new("2026-08-01T00:00:00Z"),
     }

@@ -25,6 +25,7 @@ fn mem(id: &MemoryId, content: &str, scope: Scope) -> Memory {
         scope,
         tags: vec!["alpha".to_string(), "beta".to_string()],
         pinned: false,
+        importance: domain::Importance::DEFAULT,
         created_at: ts(1),
         updated_at: ts(1),
     }

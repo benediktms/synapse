@@ -381,6 +381,9 @@ impl TryFrom<MemoryRow> for Memory {
             scope: Scope::parse(&row.scope)?,
             tags: serde_json::from_str(&row.tags).map_err(store_err)?,
             pinned: row.pinned != 0,
+            // ponytail: hardcoded default until the 0002 migration adds the importance column;
+            // every row read before then is medium by definition.
+            importance: domain::Importance::DEFAULT,
             created_at: Timestamp::new(row.created_at),
             updated_at: Timestamp::new(row.updated_at),
         })
