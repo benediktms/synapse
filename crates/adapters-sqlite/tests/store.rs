@@ -140,6 +140,13 @@ async fn insert_same_payload_is_noop_different_payload_conflicts() {
     let different = mem(&id, "other fact", Scope::Workspace);
     assert_eq!(
         store.insert(&different, &vec4(0.2)).await.unwrap_err(),
+        Error::Conflict(id.clone())
+    );
+
+    let mut re_ranked = memory.clone();
+    re_ranked.importance = domain::Importance::High;
+    assert_eq!(
+        store.insert(&re_ranked, &vec4(0.3)).await.unwrap_err(),
         Error::Conflict(id)
     );
 }

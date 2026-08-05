@@ -60,7 +60,9 @@ impl Store for FakeStore {
             let same_payload = existing.content == memory.content
                 && existing.kind == memory.kind
                 && existing.scope == memory.scope
-                && existing.tags == memory.tags;
+                && existing.tags == memory.tags
+                && existing.pinned == memory.pinned
+                && existing.importance == memory.importance;
             return if same_payload {
                 Ok(())
             } else {
