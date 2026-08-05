@@ -139,7 +139,7 @@ impl Store for SqliteStore {
         let id = id.as_str();
         sqlx::query_as!(
             MemoryRow,
-            "SELECT id, content, kind, scope, tags, pinned, created_at, updated_at \
+            "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at \
              FROM memories WHERE id = ?",
             id
         )
@@ -153,7 +153,7 @@ impl Store for SqliteStore {
     async fn get_with_embedding(&self, id: &MemoryId) -> Result<Option<(Memory, Vec<f32>)>, Error> {
         let key = id.as_str();
         let row = sqlx::query!(
-            "SELECT id, content, kind, scope, tags, pinned, embedding, created_at, updated_at \
+            "SELECT id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at \
              FROM memories WHERE id = ?",
             key
         )
@@ -171,6 +171,7 @@ impl Store for SqliteStore {
             scope: row.scope,
             tags: row.tags,
             pinned: row.pinned,
+            importance: row.importance,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })?;
@@ -184,17 +185,19 @@ impl Store for SqliteStore {
         let scope = memory.scope.as_str();
         let tags = serde_json::to_string(&memory.tags).map_err(store_err)?;
         let pinned = memory.pinned as i64;
+        let importance = i64::from(memory.importance.rank());
         let created_at = memory.created_at.as_str();
         let updated_at = memory.updated_at.as_str();
         let result = sqlx::query!(
-            "INSERT INTO memories (id, content, kind, scope, tags, pinned, embedding, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO memories (id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
             id,
             memory.content,
             kind,
             scope,
             tags,
             pinned,
+            importance,
             blob,
             created_at,
             updated_at
@@ -235,6 +238,7 @@ impl Store for SqliteStore {
             .transpose()
             .map_err(store_err)?;
         let pinned = patch.pinned.map(i64::from);
+        let importance = patch.importance.map(|tier| i64::from(tier.rank()));
         let blob = embedding
             .map(|embedding| encode_embedding(embedding, self.dim))
             .transpose()?;
@@ -243,15 +247,16 @@ impl Store for SqliteStore {
         sqlx::query_as!(
             MemoryRow,
             r#"UPDATE memories SET content = COALESCE(?, content), tags = COALESCE(?, tags),
-                   pinned = COALESCE(?, pinned), embedding = COALESCE(?, embedding),
-                   updated_at = ?
+                   pinned = COALESCE(?, pinned), importance = COALESCE(?, importance),
+                   embedding = COALESCE(?, embedding), updated_at = ?
                WHERE id = ?
                RETURNING id AS "id!", content AS "content!", kind AS "kind!", scope AS "scope!",
-                   tags AS "tags!", pinned AS "pinned!", created_at AS "created_at!",
-                   updated_at AS "updated_at!""#,
+                   tags AS "tags!", pinned AS "pinned!", importance AS "importance!",
+                   created_at AS "created_at!", updated_at AS "updated_at!""#,
             content,
             tags,
             pinned,
+            importance,
             blob,
             updated_at,
             key
@@ -275,7 +280,7 @@ impl Store for SqliteStore {
     async fn list(&self) -> Result<Vec<Memory>, Error> {
         sqlx::query_as!(
             MemoryRow,
-            "SELECT id, content, kind, scope, tags, pinned, created_at, updated_at FROM memories"
+            "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at FROM memories"
         )
         .fetch_all(&self.pool)
         .await
@@ -366,6 +371,7 @@ struct MemoryRow {
     scope: String,
     tags: String,
     pinned: i64,
+    importance: i64,
     created_at: String,
     updated_at: String,
 }
@@ -381,9 +387,7 @@ impl TryFrom<MemoryRow> for Memory {
             scope: Scope::parse(&row.scope)?,
             tags: serde_json::from_str(&row.tags).map_err(store_err)?,
             pinned: row.pinned != 0,
-            // ponytail: hardcoded default until the 0002 migration adds the importance column;
-            // every row read before then is medium by definition.
-            importance: domain::Importance::DEFAULT,
+            importance: domain::Importance::from_rank(row.importance),
             created_at: Timestamp::new(row.created_at),
             updated_at: Timestamp::new(row.updated_at),
         })

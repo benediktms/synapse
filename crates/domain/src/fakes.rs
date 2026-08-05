@@ -91,6 +91,9 @@ impl Store for FakeStore {
         if let Some(pinned) = patch.pinned {
             memory.pinned = pinned;
         }
+        if let Some(importance) = patch.importance {
+            memory.importance = importance;
+        }
         memory.updated_at = now.clone();
         if let Some(embedding) = embedding {
             *stored = embedding.to_vec();

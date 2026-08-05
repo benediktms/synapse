@@ -380,6 +380,7 @@ async fn edit_in<B: Backend>(
         content: body.content,
         tags: body.tags,
         pinned: body.pinned,
+        importance: None,
     };
     let memory = state.backend.edit(ws, &id, request).await?;
     Ok(Json(MemoryDto::from(&memory)))

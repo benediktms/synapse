@@ -71,6 +71,42 @@ async fn insert_get_roundtrip_preserves_all_fields() {
 }
 
 #[tokio::test]
+async fn importance_roundtrips_through_insert_and_update() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = MemoryId::generate();
+    let mut memory = mem(&id, "a ranked fact", Scope::Workspace);
+    memory.importance = domain::Importance::High;
+    store.insert(&memory, &vec4(0.1)).await.unwrap();
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().importance,
+        domain::Importance::High
+    );
+    assert_eq!(
+        store.list().await.unwrap()[0].importance,
+        domain::Importance::High
+    );
+
+    let returned = store
+        .update(
+            &id,
+            &EditRequest {
+                importance: Some(domain::Importance::Low),
+                ..Default::default()
+            },
+            None,
+            &ts(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(returned.importance, domain::Importance::Low);
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().importance,
+        domain::Importance::Low
+    );
+}
+
+#[tokio::test]
 async fn get_with_embedding_returns_the_stored_vector_verbatim() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir).await;

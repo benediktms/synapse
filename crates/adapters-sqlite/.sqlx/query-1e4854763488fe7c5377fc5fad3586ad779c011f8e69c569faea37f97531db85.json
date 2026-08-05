@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "UPDATE memories SET content = COALESCE(?, content), tags = COALESCE(?, tags),\n                   pinned = COALESCE(?, pinned), embedding = COALESCE(?, embedding),\n                   updated_at = ?\n               WHERE id = ?\n               RETURNING id AS \"id!\", content AS \"content!\", kind AS \"kind!\", scope AS \"scope!\",\n                   tags AS \"tags!\", pinned AS \"pinned!\", created_at AS \"created_at!\",\n                   updated_at AS \"updated_at!\"",
+  "query": "UPDATE memories SET content = COALESCE(?, content), tags = COALESCE(?, tags),\n                   pinned = COALESCE(?, pinned), importance = COALESCE(?, importance),\n                   embedding = COALESCE(?, embedding), updated_at = ?\n               WHERE id = ?\n               RETURNING id AS \"id!\", content AS \"content!\", kind AS \"kind!\", scope AS \"scope!\",\n                   tags AS \"tags!\", pinned AS \"pinned!\", importance AS \"importance!\",\n                   created_at AS \"created_at!\", updated_at AS \"updated_at!\"",
   "describe": {
     "columns": [
       {
@@ -34,20 +34,26 @@
         "type_info": "Integer"
       },
       {
-        "name": "created_at!",
+        "name": "importance!",
         "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at!",
+        "ordinal": 7,
         "type_info": "Text"
       },
       {
         "name": "updated_at!",
-        "ordinal": 7,
+        "ordinal": 8,
         "type_info": "Text"
       }
     ],
     "parameters": {
-      "Right": 6
+      "Right": 7
     },
     "nullable": [
+      false,
       false,
       false,
       false,
@@ -58,5 +64,5 @@
       false
     ]
   },
-  "hash": "3ca1da688608be607b6c5e2cad4ff18b2137ee7406246695a3954de5b6963a2d"
+  "hash": "1e4854763488fe7c5377fc5fad3586ad779c011f8e69c569faea37f97531db85"
 }

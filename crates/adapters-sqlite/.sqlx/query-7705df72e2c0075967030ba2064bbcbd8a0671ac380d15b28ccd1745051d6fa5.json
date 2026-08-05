@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id, content, kind, scope, tags, pinned, created_at, updated_at FROM memories WHERE id = ?",
+  "query": "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at FROM memories",
   "describe": {
     "columns": [
       {
@@ -34,20 +34,26 @@
         "type_info": "Integer"
       },
       {
-        "name": "created_at",
+        "name": "importance",
         "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 7,
         "type_info": "Text"
       },
       {
         "name": "updated_at",
-        "ordinal": 7,
+        "ordinal": 8,
         "type_info": "Text"
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 0
     },
     "nullable": [
+      false,
       false,
       false,
       false,
@@ -58,5 +64,5 @@
       false
     ]
   },
-  "hash": "e8abc11d21dc7be40956369fa3a83ea8919c6e1cb6dd78363e39758f0c3c2b4f"
+  "hash": "7705df72e2c0075967030ba2064bbcbd8a0671ac380d15b28ccd1745051d6fa5"
 }
