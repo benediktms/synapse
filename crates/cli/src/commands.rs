@@ -154,7 +154,7 @@ fn save(ctx: &Context, args: SaveArgs) -> Result<(), String> {
                 kind,
                 scope: scope.scope,
                 tags: args.tags,
-                importance: None,
+                importance: args.importance,
             },
         },
     )
@@ -309,6 +309,7 @@ fn edit(ctx: &Context, args: EditArgs) -> Result<(), String> {
     let target = resolve_target(ctx, &args.store)?;
     let body = PatchMemoryBody {
         content: Some(args.content),
+        importance: args.importance,
         ..PatchMemoryBody::default()
     };
     let memory = patch(&client, &target, &args.id, &body)?;
@@ -390,7 +391,7 @@ fn list(ctx: &Context, args: ListArgs) -> Result<(), String> {
     }
     .map_err(|e| e.to_string())?;
     for memory in memories {
-        println!("{}", output::memory_line(&target, &memory));
+        println!("{}", output::list_line(&target, &memory));
     }
     Ok(())
 }
@@ -455,9 +456,10 @@ fn show(ctx: &Context, args: IdArgs) -> Result<(), String> {
         println!("tags: {}", memory.tags.join(", "));
     }
     println!(
-        "kind: {}  pinned: {}  created: {}",
+        "kind: {}  pinned: {}  importance: {}  created: {}",
         cli_kind(&memory.kind),
         memory.pinned,
+        memory.importance,
         memory.created_at
     );
     Ok(())

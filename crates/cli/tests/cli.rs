@@ -147,6 +147,46 @@ fn a_reachable_server_saves_immediately_and_reports_the_workspace() {
 }
 
 #[test]
+fn save_with_importance_sends_the_tier_to_the_server() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let output = machine.run(&[
+        "save",
+        "architectural decision",
+        "--type",
+        "project",
+        "--importance",
+        "high",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    stub.with(|state| {
+        assert_eq!(state.memories.len(), 1);
+        let body = state.memories.values().next().unwrap();
+        assert!(body.contains("\"importance\":\"high\""), "{body}");
+    });
+}
+
+#[test]
+fn save_rejects_an_unknown_importance_tier() {
+    let machine = Machine::new("http://127.0.0.1:1");
+    let output = machine.run(&[
+        "save",
+        "fact",
+        "--type",
+        "project",
+        "--importance",
+        "urgent",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("possible values"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn an_unreachable_server_queues_the_save_and_says_it_is_not_recallable() {
     let machine = Machine::new(&format!("http://127.0.0.1:{}", dead_port()));
 

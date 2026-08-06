@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use domain::Importance;
 
 #[derive(Debug, Parser)]
 #[command(name = "syn", version, about = "Synapse agent memory")]
@@ -60,6 +61,15 @@ fn kinds() -> Vec<clap::builder::PossibleValue> {
     ]
 }
 
+/// The importance tiers, interpolated from the domain map so help can never drift from it.
+fn tiers() -> Vec<clap::builder::PossibleValue> {
+    use clap::builder::PossibleValue;
+    Importance::ALL
+        .iter()
+        .map(|tier| PossibleValue::new(tier.as_str()))
+        .collect()
+}
+
 #[derive(Debug, Args)]
 pub struct SaveArgs {
     pub content: String,
@@ -73,6 +83,9 @@ pub struct SaveArgs {
     pub workspace: Option<String>,
     #[arg(long, value_delimiter = ',')]
     pub tags: Vec<String>,
+    /// How important this fact is
+    #[arg(long, value_name = "TIER", value_parser = clap::builder::PossibleValuesParser::new(tiers()))]
+    pub importance: Option<String>,
 }
 
 /// `syn remember` was folded into `syn save --scope everywhere`. It stays parseable so the
@@ -127,6 +140,9 @@ pub struct ContextArgs {
 pub struct EditArgs {
     pub id: String,
     pub content: String,
+    /// New importance tier for the memory
+    #[arg(long, value_name = "TIER", value_parser = clap::builder::PossibleValuesParser::new(tiers()))]
+    pub importance: Option<String>,
     #[command(flatten)]
     pub store: StoreArgs,
 }
@@ -208,4 +224,41 @@ pub enum ConfigCommand {
     SetToken { token: String },
     /// Store the server base URL
     SetUrl { url: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn importance_flag_accepts_only_domain_tiers() {
+        let cli = Cli::try_parse_from([
+            "syn",
+            "save",
+            "--kind",
+            "user",
+            "--importance",
+            "high",
+            "a fact",
+        ])
+        .expect("a domain tier must parse");
+        let Command::Save(args) = cli.command else {
+            panic!("expected save")
+        };
+        assert_eq!(args.importance.as_deref(), Some("high"));
+
+        assert!(
+            Cli::try_parse_from([
+                "syn",
+                "save",
+                "--kind",
+                "user",
+                "--importance",
+                "urgent",
+                "a fact",
+            ])
+            .is_err(),
+            "an unknown tier must be rejected by clap"
+        );
+    }
 }
