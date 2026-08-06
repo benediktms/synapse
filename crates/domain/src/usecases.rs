@@ -304,11 +304,26 @@ pub async fn list_memories<S: Store>(store: &S) -> Result<Vec<Memory>, Error> {
     Ok(memories)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RecallRequest {
     pub query: String,
     pub project: Option<String>,
     pub limit: usize,
+    /// When true, only surface linked neighbors whose scope matches the recall's scope filter.
+    /// Default false: cross-scope links surface too (Q17).
+    pub links_in_scope: bool,
+}
+
+/// A first-hop linked neighbor of a recalled memory, for recall surfacing. Ids and a phrase only —
+/// the agent traverses explicitly from here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecallLink {
+    pub id: MemoryId,
+    /// The display phrase from the recalled memory's perspective, e.g. "relates to" or
+    /// "is superseded by".
+    pub phrase: String,
+    /// The neighbor's scope, so a cross-scope link can be identified.
+    pub scope: Scope,
 }
 
 #[derive(Clone, Debug)]
@@ -316,6 +331,7 @@ pub struct RecallHit {
     pub workspace: Workspace,
     pub memory: Memory,
     pub score: f64,
+    pub links: Vec<RecallLink>,
 }
 
 #[derive(Clone, Debug)]
@@ -344,6 +360,7 @@ pub async fn recall<S: Store, E: Embedder>(
         &req.query,
         &filter,
         req.limit.clamp(1, RECALL_LIMIT_CAP),
+        req.links_in_scope,
     )
     .await
 }
@@ -368,6 +385,7 @@ pub async fn recall_grouped<S: Store, E: Embedder>(
             &req.query,
             &filter,
             limit,
+            req.links_in_scope,
         )
         .await?;
         if !hits.is_empty() {
@@ -386,6 +404,7 @@ async fn hybrid_search<S: Store>(
     query: &str,
     filter: &ScopeFilter,
     limit: usize,
+    links_in_scope: bool,
 ) -> Result<Vec<RecallHit>, Error> {
     let mut origin: HashMap<MemoryId, usize> = HashMap::new();
     let mut vector_pool: Vec<(MemoryId, f32)> = Vec::new();
@@ -418,10 +437,12 @@ async fn hybrid_search<S: Store>(
     for (id, score) in rrf_scores(&lists) {
         let (workspace, store) = sides[origin[&id]];
         if let Some(memory) = store.get(&id).await? {
+            let links = build_recall_links(store, &memory, filter, links_in_scope).await?;
             hits.push(RecallHit {
                 workspace: workspace.clone(),
                 memory,
                 score,
+                links,
             });
         }
     }
@@ -434,6 +455,42 @@ async fn hybrid_search<S: Store>(
     });
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// The first-hop linked neighbors of `memory`, for recall surfacing. For each edge touching the
+/// memory, emits the other endpoint with a display phrase relative to `memory`. When
+/// `links_in_scope` is set, edges whose neighbor's scope doesn't match `filter` are dropped
+/// (cross-scope links otherwise surface, per Q17).
+async fn build_recall_links<S: Store>(
+    store: &S,
+    memory: &Memory,
+    filter: &ScopeFilter,
+    links_in_scope: bool,
+) -> Result<Vec<RecallLink>, Error> {
+    let mut out = Vec::new();
+    for link in store.links_of(&memory.id).await? {
+        let (neighbor_id, directed, this_is_source) = if link.source == memory.id {
+            (link.target.clone(), true, true)
+        } else {
+            (link.source.clone(), false, false)
+        };
+        let Some(neighbor) = store.get(&neighbor_id).await? else {
+            continue;
+        };
+        if links_in_scope && !filter.matches(&neighbor.scope) {
+            continue;
+        }
+        out.push(RecallLink {
+            id: neighbor_id,
+            phrase: link
+                .relation
+                .phrase_from(directed, this_is_source)
+                .to_string(),
+            scope: neighbor.scope,
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
 }
 
 #[derive(Clone, Debug)]
@@ -1004,6 +1061,7 @@ mod tests {
                 query: "deploy staging".to_string(),
                 project: None,
                 limit: 10,
+                links_in_scope: false,
             },
         ))
         .unwrap();
@@ -1045,6 +1103,7 @@ mod tests {
                 query: "deploy staging".to_string(),
                 project: None,
                 limit: 10,
+                links_in_scope: false,
             },
         ))
         .unwrap();
@@ -1096,6 +1155,7 @@ mod tests {
                 query: "deploy verification".to_string(),
                 project: None,
                 limit: 10,
+                links_in_scope: false,
             },
         ))
         .unwrap();
@@ -1142,6 +1202,7 @@ mod tests {
                 query: "deploy runbook".to_string(),
                 project: Some("fresha/offers".to_string()),
                 limit: 10,
+                links_in_scope: false,
             },
         ))
         .unwrap();
@@ -1198,6 +1259,7 @@ mod tests {
                 query: "deploy".to_string(),
                 project: None,
                 limit: 10,
+                links_in_scope: false,
             },
         ))
         .unwrap();
@@ -1558,5 +1620,106 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].relation, Relation::Supersession);
         assert!(block_on(is_superseded(&store, &mid(2))).unwrap());
+    }
+
+    #[test]
+    fn recall_surfaces_linked_neighbors_with_phrases() {
+        let store = FakeStore::new();
+        store.seed(
+            mem(
+                1,
+                "new deploy process",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![1.0, 0.0],
+        );
+        store.seed(
+            mem(
+                2,
+                "old deploy process",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![0.9, 0.1],
+        );
+        block_on(link(&store, &mid(2), &mid(1), Relation::Supersession)).unwrap();
+
+        let ws = Workspace::new("work").unwrap();
+        let embedder = FakeEmbedder::new().with("deploy process", vec![0.8, 0.2]);
+        let hits = block_on(recall(
+            &embedder,
+            (&ws, &store),
+            None,
+            &RecallRequest {
+                query: "deploy process".to_string(),
+                project: None,
+                limit: 10,
+                links_in_scope: false,
+            },
+        ))
+        .unwrap();
+
+        let superseder = hits.iter().find(|h| h.memory.id == mid(2)).unwrap();
+        assert_eq!(superseder.links.len(), 1);
+        // 2 supersedes 1: from 2's side the phrase is "supersedes".
+        assert_eq!(superseder.links[0].id, mid(1));
+        assert_eq!(superseder.links[0].phrase, "supersedes");
+
+        let superseded = hits.iter().find(|h| h.memory.id == mid(1)).unwrap();
+        assert_eq!(superseded.links.len(), 1);
+        assert_eq!(superseded.links[0].id, mid(2));
+        assert_eq!(superseded.links[0].phrase, "is superseded by");
+    }
+
+    #[test]
+    fn recall_links_in_scope_filters_cross_scope_neighbors() {
+        let store = FakeStore::new();
+        // 1 is workspace-scoped; 2 (its neighbor) is project-scoped.
+        store.seed(
+            mem(
+                1,
+                "root cause",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![1.0, 0.0],
+        );
+        store.seed(
+            mem(
+                2,
+                "symptom in offers",
+                MemoryKind::Project,
+                Scope::Project("acme/offers".into()),
+                false,
+            ),
+            vec![0.9, 0.1],
+        );
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+
+        let ws = Workspace::new("work").unwrap();
+        let embedder = FakeEmbedder::new().with("root cause", vec![0.8, 0.2]);
+        // Workspace-scoped recall with the flag ON: the project-scoped neighbor is dropped.
+        let hits = block_on(recall(
+            &embedder,
+            (&ws, &store),
+            None,
+            &RecallRequest {
+                query: "root cause".to_string(),
+                project: None,
+                limit: 10,
+                links_in_scope: true,
+            },
+        ))
+        .unwrap();
+        let hit = hits.iter().find(|h| h.memory.id == mid(1)).unwrap();
+        assert!(
+            hit.links.is_empty(),
+            "cross-scope neighbor should be filtered: {:?}",
+            hit.links
+        );
     }
 }

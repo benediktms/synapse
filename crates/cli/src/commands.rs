@@ -241,6 +241,7 @@ fn recall(ctx: &Context, args: RecallArgs) -> Result<(), String> {
             scope.project(),
             args.limit,
             args.all_workspaces,
+            args.links_in_scope,
         )
         .map_err(|e| e.to_string())?;
     let elapsed = started.elapsed().as_millis();

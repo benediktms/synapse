@@ -315,6 +315,8 @@ struct SearchParams {
     scope: Option<String>,
     limit: Option<usize>,
     all: Option<bool>,
+    /// true: only surface linked neighbors within the recall's scope. Default false.
+    links_scope: Option<bool>,
 }
 
 async fn search<B: Backend>(
@@ -337,6 +339,7 @@ async fn search<B: Backend>(
         query: query.to_string(),
         project: parse_project(params.scope.as_deref())?,
         limit,
+        links_in_scope: params.links_scope.unwrap_or(false),
     };
     if params.all.unwrap_or(false) {
         let groups = state.backend.recall_all(&request).await?;

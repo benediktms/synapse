@@ -305,6 +305,40 @@ async fn search_fuses_and_respects_workspace_isolation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn search_hits_carry_a_neighbors_array_and_accept_links_scope() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    put_memory(&router, "work", 1, "argocd deploy to staging for offers").await;
+
+    // Default: hits include a (here empty) neighbors array.
+    let (status, body) = req(
+        &router,
+        Method::GET,
+        "/memories/search?ws=work&q=deploy%20staging",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hit = body["hits"][0].as_object().expect("hit object");
+    assert!(
+        hit.contains_key("neighbors"),
+        "recall hit is missing the neighbors field: {body}"
+    );
+    assert_eq!(hit["neighbors"], json!([]));
+
+    // The links_scope route param is accepted (cross-scope neighbor tightening flag).
+    let (status, _) = req(
+        &router,
+        Method::GET,
+        "/memories/search?ws=work&q=deploy&links_scope=true",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn shared_is_not_addressable_as_a_workspace() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;

@@ -192,6 +192,7 @@ impl SynapseApiClient {
         scope: Option<&str>,
         limit: usize,
         all_workspaces: bool,
+        links_in_scope: bool,
     ) -> Result<SearchResponse, ClientError> {
         let limit = limit.to_string();
         let mut params: Vec<(&str, &str)> = vec![("q", query), ("limit", &limit)];
@@ -202,6 +203,9 @@ impl SynapseApiClient {
         }
         if let Some(scope) = scope {
             params.push(("scope", scope));
+        }
+        if links_in_scope {
+            params.push(("links_scope", "true"));
         }
         json(self.http.get(self.url("/memories/search")).query(&params))
     }

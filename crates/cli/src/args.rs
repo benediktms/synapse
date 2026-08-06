@@ -126,6 +126,9 @@ pub struct RecallArgs {
     pub all_workspaces: bool,
     #[arg(long)]
     pub project: Option<String>,
+    /// Only surface linked neighbors within the recall's scope (default: cross-scope links surface)
+    #[arg(long)]
+    pub links_in_scope: bool,
 }
 
 #[derive(Debug, Args)]

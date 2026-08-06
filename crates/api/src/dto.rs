@@ -1,6 +1,6 @@
 use domain::{
-    ContextDigest, DigestEntry, Memory, MemoryId, MemoryKind, RecallHit, Scope, Timestamp,
-    Workspace, WorkspaceHits,
+    ContextDigest, DigestEntry, Memory, MemoryId, MemoryKind, RecallHit, RecallLink, Scope,
+    Timestamp, Workspace, WorkspaceHits,
 };
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +134,26 @@ pub struct HitDto {
     pub score: f64,
     #[serde(flatten)]
     pub memory: MemoryDto,
+    /// First-hop linked neighbors, for graph surfacing. Ids and phrases only.
+    #[serde(default)]
+    pub neighbors: Vec<NeighborDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NeighborDto {
+    pub id: String,
+    pub phrase: String,
+    pub scope: String,
+}
+
+impl From<&RecallLink> for NeighborDto {
+    fn from(link: &RecallLink) -> Self {
+        Self {
+            id: link.id.to_string(),
+            phrase: link.phrase.clone(),
+            scope: link.scope.as_str().to_string(),
+        }
+    }
 }
 
 impl From<&RecallHit> for HitDto {
@@ -142,6 +162,7 @@ impl From<&RecallHit> for HitDto {
             origin: Origin::of(&hit.workspace),
             score: hit.score,
             memory: MemoryDto::from(&hit.memory),
+            neighbors: hit.links.iter().map(NeighborDto::from).collect(),
         }
     }
 }
@@ -273,6 +294,7 @@ mod tests {
             origin: Origin::Preference,
             score: 0.5,
             memory: memory(),
+            neighbors: vec![],
         })
         .unwrap();
         assert!(json.contains(r#""origin":"preference""#), "{json}");
@@ -286,6 +308,7 @@ mod tests {
                 origin: origin.clone(),
                 score: 0.75,
                 memory: memory(),
+                neighbors: vec![],
             };
             let text = serde_json::to_string(&hit).unwrap();
             let back: HitDto = serde_json::from_str(&text).unwrap();

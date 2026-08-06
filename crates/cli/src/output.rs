@@ -3,7 +3,16 @@ use api::{ContextResponse, DigestEntryDto, HitDto, MemoryDto, Origin};
 use crate::args::SCOPE_EVERYWHERE;
 
 pub fn hit_line(hit: &HitDto) -> String {
-    memory_line(&hit.origin, &hit.memory)
+    if hit.neighbors.is_empty() {
+        return memory_line(&hit.origin, &hit.memory);
+    }
+    let links = hit
+        .neighbors
+        .iter()
+        .map(|n| format!("{} {}", n.phrase, n.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{} ({links})", memory_line(&hit.origin, &hit.memory))
 }
 
 pub fn memory_line(origin: &Origin, memory: &MemoryDto) -> String {
@@ -105,12 +114,39 @@ mod tests {
         }
     }
 
+    fn neighbor(id: &str, phrase: &str, scope: &str) -> api::NeighborDto {
+        api::NeighborDto {
+            id: id.into(),
+            phrase: phrase.into(),
+            scope: scope.into(),
+        }
+    }
+
+    #[test]
+    fn hit_line_appends_bracketed_neighbors() {
+        let hit = HitDto {
+            origin: Origin::Workspace("work".into()),
+            score: 0.9,
+            memory: memory("m_7f2a", "workspace", "New deploy process."),
+            neighbors: vec![
+                neighbor("m_31bc", "supersedes", "workspace"),
+                neighbor("m_00B1", "is superseded by", "work · fresha/offers"),
+            ],
+        };
+        assert_eq!(
+            hit_line(&hit),
+            "[m_7f2a] (work, 2026-07-14) New deploy process. \
+             (supersedes m_31bc, is superseded by m_00B1)"
+        );
+    }
+
     #[test]
     fn hits_carry_workspace_scope_and_date() {
         let hit = HitDto {
             origin: Origin::Workspace("work".into()),
             score: 0.9,
             memory: memory("m_7f2a", "fresha/offers", "Staging deploys via ArgoCD."),
+            neighbors: vec![],
         };
         assert_eq!(
             hit_line(&hit),
@@ -124,6 +160,7 @@ mod tests {
             origin: Origin::Workspace("work".into()),
             score: 0.5,
             memory: memory("m_31bc", "workspace", "Team uses trunk-based development."),
+            neighbors: vec![],
         };
         assert_eq!(
             hit_line(&hit),
@@ -137,6 +174,7 @@ mod tests {
             origin: Origin::Preference,
             score: 0.4,
             memory: memory("m_31bc", "workspace", "Prefers Datadog links."),
+            neighbors: vec![],
         };
         assert_eq!(
             hit_line(&hit),
