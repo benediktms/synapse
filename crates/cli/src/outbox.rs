@@ -278,6 +278,7 @@ mod tests {
                     kind: "project".into(),
                     scope: "workspace".into(),
                     tags: vec![],
+                    importance: None,
                 },
             },
             failure: None,

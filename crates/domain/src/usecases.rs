@@ -25,6 +25,7 @@ pub struct SaveRequest {
     pub kind: MemoryKind,
     pub scope: Scope,
     pub tags: Vec<String>,
+    pub importance: Importance,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -43,7 +44,8 @@ pub async fn save<S: Store, E: Embedder>(
         let same_payload = existing.content == req.content
             && existing.kind == req.kind
             && existing.scope == req.scope
-            && existing.tags == req.tags;
+            && existing.tags == req.tags
+            && existing.importance == req.importance;
         return if same_payload {
             Ok(SaveOutcome::Unchanged(existing))
         } else {
@@ -58,7 +60,7 @@ pub async fn save<S: Store, E: Embedder>(
         scope: req.scope,
         tags: req.tags,
         pinned: false,
-        importance: Importance::DEFAULT,
+        importance: req.importance,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -427,6 +429,7 @@ mod tests {
             kind: MemoryKind::Project,
             scope: Scope::Workspace,
             tags: Vec::new(),
+            importance: Importance::DEFAULT,
         }
     }
 

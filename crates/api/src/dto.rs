@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 pub const EXPORT_VERSION: u32 = 1;
 
+fn default_tier() -> String {
+    domain::Importance::DEFAULT.as_str().to_string()
+}
+
 /// Where a memory came from, as clients are allowed to see it. The shared database
 /// backing preferences is a storage detail and is never named on the wire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +44,8 @@ pub struct MemoryDto {
     pub scope: String,
     pub tags: Vec<String>,
     pub pinned: bool,
+    #[serde(default = "default_tier")]
+    pub importance: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -53,6 +59,7 @@ impl From<&Memory> for MemoryDto {
             scope: memory.scope.as_str().to_string(),
             tags: memory.tags.clone(),
             pinned: memory.pinned,
+            importance: memory.importance.as_str().to_string(),
             created_at: memory.created_at.to_string(),
             updated_at: memory.updated_at.to_string(),
         }
@@ -68,7 +75,7 @@ impl MemoryDto {
             scope: Scope::parse(&self.scope)?,
             tags: self.tags.clone(),
             pinned: self.pinned,
-            importance: domain::Importance::DEFAULT,
+            importance: domain::Importance::parse(&self.importance)?,
             created_at: Timestamp::new(self.created_at.clone()),
             updated_at: Timestamp::new(self.updated_at.clone()),
         })
@@ -82,6 +89,8 @@ pub struct PutMemoryBody {
     pub scope: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub importance: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,6 +122,8 @@ pub struct PatchMemoryBody {
     pub content: Option<String>,
     pub tags: Option<Vec<String>>,
     pub pinned: Option<bool>,
+    #[serde(default)]
+    pub importance: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -243,6 +254,7 @@ mod tests {
             scope: "workspace".into(),
             tags: vec![],
             pinned: false,
+            importance: "medium".into(),
             created_at: "2026-08-02T10:00:00Z".into(),
             updated_at: "2026-08-02T10:00:00Z".into(),
         }
