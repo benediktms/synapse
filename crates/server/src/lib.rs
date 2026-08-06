@@ -8,7 +8,8 @@ use adapters_sqlite::SqliteStore;
 use api::{Backend, BackendError, RestoreReport};
 use domain::{
     ContextDigest, EditRequest, Embedder, Error, GraphSubgraph, Memory, MemoryId, MoveOutcome,
-    RecallHit, RecallRequest, SaveOutcome, SaveRequest, Timestamp, Workspace, WorkspaceHits,
+    RecallHit, RecallRequest, Relation, SaveOutcome, SaveRequest, Timestamp, Workspace,
+    WorkspaceHits,
 };
 use tokio::sync::RwLock;
 
@@ -256,6 +257,42 @@ impl Backend for App {
     ) -> Result<GraphSubgraph, BackendError> {
         let (active, _) = self.active_and_shared(ws).await?;
         domain::graph_subgraph(&*active, id, depth)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn link(
+        &self,
+        ws: &Workspace,
+        source: &MemoryId,
+        target: &MemoryId,
+        relation: Relation,
+    ) -> Result<(), BackendError> {
+        let (active, _) = self.active_and_shared(ws).await?;
+        domain::link(&*active, source, target, relation)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn unlink(
+        &self,
+        ws: &Workspace,
+        a: &MemoryId,
+        b: &MemoryId,
+    ) -> Result<usize, BackendError> {
+        let (active, _) = self.active_and_shared(ws).await?;
+        domain::unlink(&*active, a, b).await.map_err(Into::into)
+    }
+
+    async fn retype_link(
+        &self,
+        ws: &Workspace,
+        a: &MemoryId,
+        b: &MemoryId,
+        relation: Relation,
+    ) -> Result<(), BackendError> {
+        let (active, _) = self.active_and_shared(ws).await?;
+        domain::retype_link(&*active, a, b, relation)
             .await
             .map_err(Into::into)
     }

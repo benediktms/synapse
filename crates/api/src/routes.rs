@@ -10,7 +10,7 @@ use axum::routing::{get, put};
 use axum::{Json, Router};
 use domain::{
     EditRequest, Importance, MAX_GRAPH_DEPTH, Memory, MemoryId, MemoryKind, RECALL_LIMIT_CAP,
-    RecallRequest, SaveOutcome, SaveRequest, Scope, Workspace,
+    RecallRequest, Relation, SaveOutcome, SaveRequest, Scope, Workspace,
 };
 use serde::Deserialize;
 use tower_http::timeout::TimeoutLayer;
@@ -73,7 +73,13 @@ pub fn router<B: Backend>(backend: B, token: &str) -> Router {
                 .get(get_memory::<B>),
         )
         .route("/memories/{id}/move", axum::routing::post(move_memory::<B>))
-        .route("/memories/{id}/links", get(links::<B>))
+        .route(
+            "/memories/{id}/links",
+            get(links::<B>)
+                .post(create_link::<B>)
+                .patch(retype_link::<B>)
+                .delete(delete_link::<B>),
+        )
         .route("/memories", get(list_memories::<B>))
         .route("/memories/search", get(search::<B>))
         .route(
@@ -490,6 +496,7 @@ async fn get_memory<B: Backend>(
 struct LinksQuery {
     ws: Option<String>,
     depth: Option<usize>,
+    target: Option<String>,
 }
 
 async fn links<B: Backend>(
@@ -507,6 +514,56 @@ async fn links<B: Backend>(
     }
     let sub = state.backend.links(&ws, &id, depth).await?;
     Ok(Json(GraphDto::from(&sub)))
+}
+
+/// Body for creating or retyping a link: the other endpoint and the noun relation.
+#[derive(Deserialize)]
+struct LinkBody {
+    target: String,
+    relation: String,
+}
+
+async fn create_link<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Query(query): Query<WsQuery>,
+    Json(body): Json<LinkBody>,
+) -> Result<StatusCode, ApiError> {
+    let ws = require_ws(&query)?;
+    let source = MemoryId::parse(&id)?;
+    let target = MemoryId::parse(&body.target)?;
+    let relation = Relation::parse(&body.relation)?;
+    state.backend.link(&ws, &source, &target, relation).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn retype_link<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Query(query): Query<WsQuery>,
+    Json(body): Json<LinkBody>,
+) -> Result<StatusCode, ApiError> {
+    let ws = require_ws(&query)?;
+    let a = MemoryId::parse(&id)?;
+    let b = MemoryId::parse(&body.target)?;
+    let relation = Relation::parse(&body.relation)?;
+    state.backend.retype_link(&ws, &a, &b, relation).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_link<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Query(query): Query<LinksQuery>,
+) -> Result<StatusCode, ApiError> {
+    let ws = require_ws(&WsQuery { ws: query.ws })?;
+    let a = MemoryId::parse(&id)?;
+    let target = query
+        .target
+        .ok_or_else(|| ApiError::BadRequest("missing required query parameter: target".into()))?;
+    let b = MemoryId::parse(&target)?;
+    state.backend.unlink(&ws, &a, &b).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_preference<B: Backend>(

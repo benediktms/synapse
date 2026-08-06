@@ -269,6 +269,50 @@ impl SynapseApiClient {
         )
     }
 
+    pub fn link(
+        &self,
+        workspace: &str,
+        source: &str,
+        target: &str,
+        relation: &str,
+    ) -> Result<(), ClientError> {
+        check(
+            self.http
+                .post(self.url(&format!("/memories/{source}/links")))
+                .query(&[("ws", workspace)])
+                .json(&serde_json::json!({ "target": target, "relation": relation }))
+                .send()?,
+        )?;
+        Ok(())
+    }
+
+    pub fn retype_link(
+        &self,
+        workspace: &str,
+        a: &str,
+        b: &str,
+        relation: &str,
+    ) -> Result<(), ClientError> {
+        check(
+            self.http
+                .patch(self.url(&format!("/memories/{a}/links")))
+                .query(&[("ws", workspace)])
+                .json(&serde_json::json!({ "target": b, "relation": relation }))
+                .send()?,
+        )?;
+        Ok(())
+    }
+
+    pub fn unlink(&self, workspace: &str, a: &str, b: &str) -> Result<(), ClientError> {
+        check(
+            self.http
+                .delete(self.url(&format!("/memories/{a}/links")))
+                .query(&[("ws", workspace), ("target", b)])
+                .send()?,
+        )?;
+        Ok(())
+    }
+
     pub fn list(&self, workspace: &str) -> Result<Vec<MemoryDto>, ClientError> {
         let body: ListResponse = json(
             self.http

@@ -382,6 +382,59 @@ async fn links_route_returns_a_jgf_graph_and_validates_depth() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn link_mutation_create_retype_unlink_over_http() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    put_memory(&router, "work", 1, "old deploy process").await;
+    put_memory(&router, "work", 2, "new deploy process").await;
+
+    let links_url = |a: u32| format!("/memories/{}/links?ws=work", mid(a));
+    let link_body =
+        |target: u32, relation: &str| json!({ "target": mid(target), "relation": relation });
+
+    let (status, _) = req(
+        &router,
+        Method::POST,
+        &links_url(2),
+        Some(link_body(1, "supersession")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = req(&router, Method::GET, &links_url(1), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let edges = body["graph"]["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["relation"], "supersession");
+    assert_eq!(edges[0]["directed"], true);
+
+    let (status, _) = req(
+        &router,
+        Method::PATCH,
+        &links_url(2),
+        Some(link_body(1, "support")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = req(&router, Method::GET, &links_url(1), None).await;
+    let edges = body["graph"]["edges"].as_array().unwrap();
+    assert_eq!(edges[0]["relation"], "support");
+    assert_eq!(edges[0]["directed"], false);
+
+    let (status, _) = req(
+        &router,
+        Method::DELETE,
+        &format!("/memories/{}/links?ws=work&target={}", mid(1), mid(2)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = req(&router, Method::GET, &links_url(1), None).await;
+    assert_eq!(body["graph"]["edges"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn shared_is_not_addressable_as_a_workspace() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;
