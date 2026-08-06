@@ -30,6 +30,8 @@ pub enum Command {
     List(ListArgs),
     /// Show a single memory
     Show(IdArgs),
+    /// Dump the linked-neighbors graph around a memory as JSON (JGF v2)
+    Links(LinksArgs),
     /// Pin a memory into the digest
     Pin(IdArgs),
     /// Remove a memory from the digest
@@ -153,6 +155,16 @@ pub struct EditArgs {
 #[derive(Debug, Args)]
 pub struct IdArgs {
     pub id: String,
+    #[command(flatten)]
+    pub store: StoreArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct LinksArgs {
+    pub id: String,
+    /// How many hops of the graph to expand (default 2)
+    #[arg(long, default_value_t = 2)]
+    pub depth: usize,
     #[command(flatten)]
     pub store: StoreArgs,
 }

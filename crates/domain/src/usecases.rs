@@ -304,6 +304,121 @@ pub async fn list_memories<S: Store>(store: &S) -> Result<Vec<Memory>, Error> {
     Ok(memories)
 }
 
+pub const MAX_GRAPH_DEPTH: usize = 10;
+
+/// A node of a bounded subgraph dump, for `syn links`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphNode {
+    pub memory: Memory,
+    /// True when this node sits on the depth frontier and we did not expand its adjacency — the
+    /// dump cuts here and the real graph extends at least one more hop below it.
+    pub truncated: bool,
+}
+
+/// An edge of the subgraph dump. `directed` is true only for supersession.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphEdge {
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub relation: Relation,
+    pub directed: bool,
+}
+
+/// The result of a bounded breadth-first subgraph dump rooted at a memory.
+#[derive(Clone, Debug)]
+pub struct GraphSubgraph {
+    pub root: MemoryId,
+    pub depth: usize,
+    /// True when the dump is a depth-N window and the real graph extends deeper somewhere.
+    pub truncated: bool,
+    pub nodes: Vec<GraphNode>,
+    /// Every edge within the visited set, including back-edges that close cycles.
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Build a bounded subgraph around `root`: visit each node once but emit every edge (cycle-safe),
+/// expand at most `depth` hops, and mark frontier nodes whose real adjacency exceeds the window.
+pub async fn graph_subgraph<S: Store>(
+    store: &S,
+    root: &MemoryId,
+    depth: usize,
+) -> Result<GraphSubgraph, Error> {
+    let depth = depth.min(MAX_GRAPH_DEPTH);
+    let mut edges: Vec<GraphEdge> = Vec::new();
+    let mut seen_edges: HashSet<(MemoryId, MemoryId, Relation)> = HashSet::new();
+    let mut queue = vec![root.clone()];
+    let mut order: Vec<MemoryId> = Vec::new();
+    let mut levels: HashMap<MemoryId, usize> = HashMap::new();
+    levels.insert(root.clone(), 0);
+
+    while let Some(id) = queue.pop() {
+        order.push(id.clone());
+        let level = levels[&id];
+        if level >= depth {
+            continue;
+        }
+        for link in store.links_of(&id).await? {
+            let key = (link.source.clone(), link.target.clone(), link.relation);
+            if seen_edges.insert(key) {
+                edges.push(GraphEdge {
+                    source: link.source.clone(),
+                    target: link.target.clone(),
+                    relation: link.relation,
+                    directed: link.relation.is_directed(),
+                });
+            }
+            if !levels.contains_key(&link.target) {
+                levels.insert(link.target.clone(), level + 1);
+                queue.push(link.target.clone());
+            }
+            if !levels.contains_key(&link.source) {
+                levels.insert(link.source.clone(), level + 1);
+                queue.push(link.source.clone());
+            }
+        }
+    }
+
+    // A frontier node (at exactly `depth`) is truncated iff it has a neighbor we never expanded —
+    // i.e. any neighbor outside the visited set. Interior nodes are fully enumerated, so never
+    // truncated; a frontier node all of whose neighbors are visited is also not truncated.
+    let mut nodes = Vec::new();
+    for id in &order {
+        let links = store.links_of(id).await?;
+        let truncated = levels[id] == depth
+            && depth < MAX_GRAPH_DEPTH
+            && links.iter().any(|link| {
+                let other = if link.source == *id {
+                    &link.target
+                } else {
+                    &link.source
+                };
+                !levels.contains_key(other)
+            });
+        nodes.push(GraphNode {
+            memory: store
+                .get(id)
+                .await?
+                .ok_or_else(|| Error::NotFound(id.clone()))?,
+            truncated,
+        });
+    }
+    nodes.sort_by(|a, b| a.memory.id.cmp(&b.memory.id));
+    edges.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| a.relation.cmp(&b.relation))
+    });
+
+    Ok(GraphSubgraph {
+        root: root.clone(),
+        depth,
+        truncated: nodes.iter().any(|n| n.truncated),
+        nodes,
+        edges,
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RecallRequest {
     pub query: String,
@@ -1721,5 +1836,65 @@ mod tests {
             "cross-scope neighbor should be filtered: {:?}",
             hit.links
         );
+    }
+
+    #[test]
+    fn graph_subgraph_dumps_neighborhood_with_edges() {
+        let store = FakeStore::new();
+        seed_triplet(&store);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Support)).unwrap();
+
+        let sub = block_on(graph_subgraph(&store, &mid(1), 2)).unwrap();
+        let ids: Vec<MemoryId> = sub.nodes.iter().map(|n| n.memory.id.clone()).collect();
+        assert_eq!(ids, vec![mid(1), mid(2), mid(3)]);
+        assert_eq!(sub.edges.len(), 2);
+        assert!(!sub.truncated);
+        assert!(sub.nodes.iter().all(|n| !n.truncated));
+    }
+
+    #[test]
+    fn graph_subgraph_respects_cycle_back_edges() {
+        let store = FakeStore::new();
+        seed_triplet(&store);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(3), &mid(1), Relation::Relation)).unwrap();
+
+        let sub = block_on(graph_subgraph(&store, &mid(1), 10)).unwrap();
+        assert_eq!(sub.nodes.len(), 3);
+        assert_eq!(sub.edges.len(), 3);
+        assert!(!sub.truncated);
+    }
+
+    #[test]
+    fn graph_subgraph_truncates_at_depth_with_flag() {
+        let store = FakeStore::new();
+        seed_triplet(&store);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Relation)).unwrap();
+
+        let sub = block_on(graph_subgraph(&store, &mid(1), 1)).unwrap();
+        let ids: Vec<MemoryId> = sub.nodes.iter().map(|n| n.memory.id.clone()).collect();
+        assert_eq!(ids, vec![mid(1), mid(2)]);
+        assert_eq!(sub.edges.len(), 1);
+        let node2 = sub.nodes.iter().find(|n| n.memory.id == mid(2)).unwrap();
+        assert!(node2.truncated);
+        assert!(sub.truncated);
+        let node1 = sub.nodes.iter().find(|n| n.memory.id == mid(1)).unwrap();
+        assert!(!node1.truncated);
+    }
+
+    #[test]
+    fn graph_subgraph_directed_supersession_is_marked() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+
+        let sub = block_on(graph_subgraph(&store, &mid(1), 2)).unwrap();
+        assert_eq!(sub.edges.len(), 1);
+        assert!(sub.edges[0].directed);
+        assert_eq!(sub.edges[0].relation, Relation::Supersession);
+        assert!(!sub.edges[0].directed || sub.edges[0].source == mid(1));
     }
 }

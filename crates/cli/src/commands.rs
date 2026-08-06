@@ -11,8 +11,8 @@ use api_client::SynapseApiClient;
 use domain::MemoryId;
 
 use crate::args::{
-    Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, ListArgs, MoveArgs,
-    RecallArgs, RetiredArgs, SCOPE_EVERYWHERE, SaveArgs, StoreArgs, WorkspaceArgs,
+    Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, LinksArgs, ListArgs,
+    MoveArgs, RecallArgs, RetiredArgs, SCOPE_EVERYWHERE, SaveArgs, StoreArgs, WorkspaceArgs,
     WorkspaceCommand,
 };
 use crate::config::{Config, OrgRule, WorkspaceRule};
@@ -47,6 +47,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Command::Move(args) => move_memory(&ctx, args),
         Command::List(args) => list(&ctx, args),
         Command::Show(args) => show(&ctx, args),
+        Command::Links(args) => links(&ctx, args),
         Command::Pin(args) => set_pinned(&ctx, args, true),
         Command::Unpin(args) => set_pinned(&ctx, args, false),
         Command::Workspace(command) => workspace(&ctx, command),
@@ -464,6 +465,21 @@ fn show(ctx: &Context, args: IdArgs) -> Result<(), String> {
         memory.importance,
         memory.created_at
     );
+    Ok(())
+}
+
+fn links(ctx: &Context, args: LinksArgs) -> Result<(), String> {
+    let client = ctx.client(READ_TIMEOUT)?;
+    flush_before_read(ctx);
+    if args.store.everywhere() {
+        return Err("syn links acts on a workspace memory; drop --scope everywhere".into());
+    }
+    let workspace = ctx.workspace(args.store.workspace.as_deref(), false)?;
+    let graph = client
+        .links(&workspace, &args.id, args.depth)
+        .map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?;
+    println!("{json}");
     Ok(())
 }
 

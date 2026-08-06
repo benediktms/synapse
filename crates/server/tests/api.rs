@@ -339,6 +339,49 @@ async fn search_hits_carry_a_neighbors_array_and_accept_links_scope() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn links_route_returns_a_jgf_graph_and_validates_depth() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    put_memory(&router, "work", 1, "argocd deploy to staging").await;
+
+    // A single memory with no links -> a JGF graph with just the root.
+    let (status, body) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}/links?ws=work", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["graph"]["root"], mid(1));
+    assert_eq!(body["graph"]["depth"], 2);
+    assert_eq!(body["graph"]["truncated"], false);
+    assert_eq!(body["graph"]["edges"].as_array().unwrap().len(), 0);
+    assert!(body["graph"]["nodes"][&mid(1)]["label"].is_string());
+
+    // Depth is bounded at MAX_GRAPH_DEPTH.
+    let (status, _) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}/links?ws=work&depth=99", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Unknown memory is a not-found.
+    let (status, _) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}/links?ws=work", mid(999)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn shared_is_not_addressable_as_a_workspace() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;

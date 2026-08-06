@@ -9,8 +9,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use domain::{
-    EditRequest, Importance, Memory, MemoryId, MemoryKind, RECALL_LIMIT_CAP, RecallRequest,
-    SaveOutcome, SaveRequest, Scope, Workspace,
+    EditRequest, Importance, MAX_GRAPH_DEPTH, Memory, MemoryId, MemoryKind, RECALL_LIMIT_CAP,
+    RecallRequest, SaveOutcome, SaveRequest, Scope, Workspace,
 };
 use serde::Deserialize;
 use tower_http::timeout::TimeoutLayer;
@@ -19,9 +19,9 @@ use tracing::Level;
 
 use crate::backend::Backend;
 use crate::dto::{
-    ContextResponse, EXPORT_VERSION, ExportDoc, HealthResponse, HitDto, HitGroupDto, ImportReport,
-    ListResponse, MemoryDto, MoveBody, MoveResponse, Origin, PatchMemoryBody, PutMemoryBody,
-    PutPreferenceBody, SearchResponse, WorkspaceDto, WorkspacesResponse,
+    ContextResponse, EXPORT_VERSION, ExportDoc, GraphDto, HealthResponse, HitDto, HitGroupDto,
+    ImportReport, ListResponse, MemoryDto, MoveBody, MoveResponse, Origin, PatchMemoryBody,
+    PutMemoryBody, PutPreferenceBody, SearchResponse, WorkspaceDto, WorkspacesResponse,
 };
 use crate::error::ApiError;
 use crate::validate::{normalize_timestamp, validate_content, validate_query, validate_tags};
@@ -30,6 +30,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(600);
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
+const DEFAULT_GRAPH_DEPTH: usize = 2;
 const UNREADY_PUBLIC_REASON: &str = "server is not ready; see server logs for detail";
 
 pub struct AppState<B> {
@@ -72,6 +73,7 @@ pub fn router<B: Backend>(backend: B, token: &str) -> Router {
                 .get(get_memory::<B>),
         )
         .route("/memories/{id}/move", axum::routing::post(move_memory::<B>))
+        .route("/memories/{id}/links", get(links::<B>))
         .route("/memories", get(list_memories::<B>))
         .route("/memories/search", get(search::<B>))
         .route(
@@ -482,6 +484,29 @@ async fn get_memory<B: Backend>(
 ) -> Result<Json<MemoryDto>, ApiError> {
     let ws = require_ws(&query)?;
     fetch_in(&state, &ws, &id).await
+}
+
+#[derive(Deserialize)]
+struct LinksQuery {
+    ws: Option<String>,
+    depth: Option<usize>,
+}
+
+async fn links<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Query(query): Query<LinksQuery>,
+) -> Result<Json<GraphDto>, ApiError> {
+    let ws = require_ws(&WsQuery { ws: query.ws })?;
+    let id = MemoryId::parse(&id)?;
+    let depth = query.depth.unwrap_or(DEFAULT_GRAPH_DEPTH);
+    if depth > MAX_GRAPH_DEPTH {
+        return Err(ApiError::BadRequest(format!(
+            "depth must be at most {MAX_GRAPH_DEPTH}"
+        )));
+    }
+    let sub = state.backend.links(&ws, &id, depth).await?;
+    Ok(Json(GraphDto::from(&sub)))
 }
 
 async fn get_preference<B: Backend>(

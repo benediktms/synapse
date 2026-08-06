@@ -7,8 +7,8 @@ use adapters_fastembed::FastEmbedder;
 use adapters_sqlite::SqliteStore;
 use api::{Backend, BackendError, RestoreReport};
 use domain::{
-    ContextDigest, EditRequest, Embedder, Error, Memory, MemoryId, MoveOutcome, RecallHit,
-    RecallRequest, SaveOutcome, SaveRequest, Timestamp, Workspace, WorkspaceHits,
+    ContextDigest, EditRequest, Embedder, Error, GraphSubgraph, Memory, MemoryId, MoveOutcome,
+    RecallHit, RecallRequest, SaveOutcome, SaveRequest, Timestamp, Workspace, WorkspaceHits,
 };
 use tokio::sync::RwLock;
 
@@ -244,6 +244,18 @@ impl Backend for App {
             .as_ref()
             .map(|(shared_ws, store)| (shared_ws, &**store));
         domain::context_digest((ws, &*active), shared_side, project)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn links(
+        &self,
+        ws: &Workspace,
+        id: &MemoryId,
+        depth: usize,
+    ) -> Result<GraphSubgraph, BackendError> {
+        let (active, _) = self.active_and_shared(ws).await?;
+        domain::graph_subgraph(&*active, id, depth)
             .await
             .map_err(Into::into)
     }

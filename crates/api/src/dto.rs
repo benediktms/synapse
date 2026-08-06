@@ -1,8 +1,9 @@
 use domain::{
-    ContextDigest, DigestEntry, Memory, MemoryId, MemoryKind, RecallHit, RecallLink, Scope,
-    Timestamp, Workspace, WorkspaceHits,
+    ContextDigest, DigestEntry, GraphEdge, GraphNode, GraphSubgraph, Memory, MemoryId, MemoryKind,
+    RecallHit, RecallLink, Scope, Timestamp, Workspace, WorkspaceHits,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const EXPORT_VERSION: u32 = 1;
 
@@ -265,6 +266,94 @@ pub struct HealthResponse {
     pub reason: Option<String>,
 }
 
+/// A graph dump in JSON Graph Format v2. Truncation (not part of the JGF spec) rides on the graph
+/// container as `truncated` and per-node as `meta.truncated`; all JGF consumers pass unknown keys
+/// through harmlessly.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphDto {
+    pub graph: GraphContainerDto,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphContainerDto {
+    pub directed: bool,
+    pub nodes: BTreeMap<String, GraphNodeDto>,
+    pub edges: Vec<GraphEdgeDto>,
+    pub root: String,
+    pub depth: usize,
+    /// True when the dump is a depth-N window and the real graph extends deeper somewhere.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphNodeDto {
+    pub label: String,
+    #[serde(rename = "meta", default = "default_node_meta")]
+    pub meta: GraphNodeMetaDto,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GraphNodeMetaDto {
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphEdgeDto {
+    pub source: String,
+    /// The edge type noun: relation / support / contradiction / supersession.
+    pub relation: String,
+    pub target: String,
+    #[serde(default)]
+    pub directed: bool,
+}
+
+fn default_node_meta() -> GraphNodeMetaDto {
+    GraphNodeMetaDto::default()
+}
+
+impl From<&GraphNode> for GraphNodeDto {
+    fn from(node: &GraphNode) -> Self {
+        Self {
+            label: node.memory.content.clone(),
+            meta: GraphNodeMetaDto {
+                truncated: node.truncated,
+            },
+        }
+    }
+}
+
+impl From<&GraphEdge> for GraphEdgeDto {
+    fn from(edge: &GraphEdge) -> Self {
+        Self {
+            source: edge.source.to_string(),
+            relation: edge.relation.as_str().to_string(),
+            target: edge.target.to_string(),
+            directed: edge.directed,
+        }
+    }
+}
+
+impl From<&GraphSubgraph> for GraphDto {
+    fn from(sub: &GraphSubgraph) -> Self {
+        Self {
+            graph: GraphContainerDto {
+                directed: sub.edges.iter().any(|e| e.directed),
+                nodes: sub
+                    .nodes
+                    .iter()
+                    .map(|n| (n.memory.id.to_string(), GraphNodeDto::from(n)))
+                    .collect(),
+                edges: sub.edges.iter().map(GraphEdgeDto::from).collect(),
+                root: sub.root.to_string(),
+                depth: sub.depth,
+                truncated: sub.truncated,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +405,47 @@ mod tests {
             assert_eq!(back.score, 0.75);
             assert_eq!(back.memory.id, hit.memory.id);
         }
+    }
+
+    #[test]
+    fn graph_dto_serializes_jgf_v2_shape_with_meta_and_truncation() {
+        let mid = |n: u32| MemoryId::parse(&format!("m_{n:022}")).unwrap();
+        let node = |n: u32, truncated: bool| GraphNode {
+            memory: Memory {
+                id: mid(n),
+                content: format!("memory {n}"),
+                kind: MemoryKind::Project,
+                scope: Scope::Workspace,
+                tags: vec![],
+                pinned: false,
+                importance: domain::Importance::DEFAULT,
+                created_at: Timestamp::new("2026-08-02T10:00:00Z"),
+                updated_at: Timestamp::new("2026-08-02T10:00:00Z"),
+            },
+            truncated,
+        };
+        let sub = GraphSubgraph {
+            root: mid(1),
+            depth: 2,
+            truncated: true,
+            nodes: vec![node(1, false), node(2, true)],
+            edges: vec![GraphEdge {
+                source: mid(1),
+                target: mid(2),
+                relation: domain::Relation::Supersession,
+                directed: true,
+            }],
+        };
+        let json = serde_json::to_value(GraphDto::from(&sub)).unwrap();
+        assert_eq!(json["graph"]["root"], "m_0000000000000000000001");
+        assert_eq!(json["graph"]["depth"], 2);
+        assert_eq!(json["graph"]["truncated"], true);
+        assert_eq!(json["graph"]["directed"], true);
+        assert_eq!(
+            json["graph"]["nodes"]["m_0000000000000000000002"]["meta"]["truncated"],
+            true
+        );
+        assert_eq!(json["graph"]["edges"][0]["relation"], "supersession");
+        assert_eq!(json["graph"]["edges"][0]["directed"], true);
     }
 }
