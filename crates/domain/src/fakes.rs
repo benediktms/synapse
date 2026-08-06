@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::error::Error;
+use crate::links::Link;
 use crate::memory::{Memory, MemoryId, Timestamp};
 use crate::ports::{Embedder, ScopeFilter, Store};
 use crate::usecases::EditRequest;
@@ -9,6 +10,7 @@ use crate::usecases::EditRequest;
 #[derive(Default)]
 pub struct FakeStore {
     rows: Mutex<HashMap<MemoryId, (Memory, Vec<f32>)>>,
+    links: Mutex<Vec<Link>>,
 }
 
 impl FakeStore {
@@ -160,6 +162,43 @@ impl Store for FakeStore {
         });
         scored.truncate(limit);
         Ok(scored.into_iter().map(|(_, memory)| memory.id).collect())
+    }
+
+    async fn insert_link(&self, link: &Link) -> Result<(), Error> {
+        let link = link.clone().canonical();
+        if !self.rows.lock().unwrap().contains_key(&link.source) {
+            return Err(Error::NotFound(link.source.clone()));
+        }
+        if !self.rows.lock().unwrap().contains_key(&link.target) {
+            return Err(Error::NotFound(link.target.clone()));
+        }
+        let mut links = self.links.lock().unwrap();
+        if !links.contains(&link) {
+            links.push(link);
+        }
+        Ok(())
+    }
+
+    async fn delete_links_between(&self, a: &MemoryId, b: &MemoryId) -> Result<usize, Error> {
+        let mut links = self.links.lock().unwrap();
+        let before = links.len();
+        links.retain(|link| {
+            !(link.source == *a && link.target == *b || link.source == *b && link.target == *a)
+        });
+        Ok(before - links.len())
+    }
+
+    async fn links_of(&self, id: &MemoryId) -> Result<Vec<Link>, Error> {
+        let mut out: Vec<Link> = self
+            .links
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|link| link.source == *id || link.target == *id)
+            .cloned()
+            .collect();
+        out.sort();
+        Ok(out)
     }
 }
 

@@ -2,8 +2,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use domain::{
-    EditRequest, Embedder, Error, Memory, MemoryId, MemoryKind, Scope, ScopeFilter, Store,
-    Timestamp,
+    EditRequest, Embedder, Error, Link, Memory, MemoryId, MemoryKind, Relation, Scope, ScopeFilter,
+    Store, Timestamp,
 };
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -338,6 +338,78 @@ impl Store for SqliteStore {
         rows.into_iter()
             .map(|row| MemoryId::parse(&row.id))
             .collect()
+    }
+
+    async fn insert_link(&self, link: &Link) -> Result<(), Error> {
+        let canonical = link.clone().canonical();
+        if self.get(&canonical.source).await?.is_none() {
+            return Err(Error::NotFound(canonical.source));
+        }
+        if self.get(&canonical.target).await?.is_none() {
+            return Err(Error::NotFound(canonical.target));
+        }
+        let low = canonical.source.as_str();
+        let high = canonical.target.as_str();
+        let relation = canonical.relation.as_str();
+        sqlx::query!(
+            "INSERT OR IGNORE INTO links (low_id, high_id, relation) VALUES (?, ?, ?)",
+            low,
+            high,
+            relation
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn delete_links_between(&self, a: &MemoryId, b: &MemoryId) -> Result<usize, Error> {
+        let a = a.as_str();
+        let b = b.as_str();
+        let result = sqlx::query!(
+            "DELETE FROM links WHERE (low_id = ? AND high_id = ?) OR (low_id = ? AND high_id = ?)",
+            a,
+            b,
+            b,
+            a
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        usize::try_from(result.rows_affected()).map_err(store_err)
+    }
+
+    async fn links_of(&self, id: &MemoryId) -> Result<Vec<Link>, Error> {
+        let key = id.as_str();
+        let rows = sqlx::query_as!(
+            LinkRow,
+            "SELECT low_id AS \"low_id!\", high_id AS \"high_id!\", relation AS \"relation!\" \
+             FROM links WHERE low_id = ? OR high_id = ?",
+            key,
+            key
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        rows.into_iter().map(Link::try_from).collect()
+    }
+}
+
+struct LinkRow {
+    low_id: String,
+    high_id: String,
+    relation: String,
+}
+
+impl TryFrom<LinkRow> for Link {
+    type Error = Error;
+
+    fn try_from(row: LinkRow) -> Result<Self, Error> {
+        Ok(Link {
+            source: MemoryId::parse(&row.low_id)?,
+            target: MemoryId::parse(&row.high_id)?,
+            relation: Relation::parse(&row.relation)?,
+        })
     }
 }
 
