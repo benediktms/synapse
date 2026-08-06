@@ -303,7 +303,7 @@ async fn put_preference<B: Backend>(
         kind: body.kind,
         scope: Scope::Workspace.as_str().to_string(),
         tags: body.tags,
-        importance: None,
+        importance: body.importance,
     };
     save_into(&state, &Workspace::shared(), &id, body).await
 }

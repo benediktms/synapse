@@ -99,6 +99,8 @@ pub struct PutPreferenceBody {
     pub kind: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub importance: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

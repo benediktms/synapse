@@ -15,6 +15,11 @@ pub fn memory_line(origin: &Origin, memory: &MemoryDto) -> String {
     )
 }
 
+/// `syn list` line — `memory_line` plus the importance tier column.
+pub fn list_line(origin: &Origin, memory: &MemoryDto) -> String {
+    format!("{} [{}]", memory_line(origin, memory), memory.importance)
+}
+
 fn provenance(origin: &Origin, memory: &MemoryDto) -> String {
     format!(
         "{}, {}",
@@ -137,6 +142,15 @@ mod tests {
             hit_line(&hit),
             "[m_31bc] (everywhere, 2026-07-14) Prefers Datadog links."
         );
+    }
+
+    #[test]
+    fn list_line_renders_the_importance_tier() {
+        let mut fact = memory("m_9a1c", "workspace", "Runbook for deploy lanes.");
+        fact.importance = "high".into();
+        let line = list_line(&Origin::Workspace("work".into()), &fact);
+        assert!(line.starts_with("[m_9a1c]"), "{line}");
+        assert!(line.ends_with("[high]"), "{line}");
     }
 
     #[test]

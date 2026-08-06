@@ -147,6 +147,71 @@ fn a_reachable_server_saves_immediately_and_reports_the_workspace() {
 }
 
 #[test]
+fn save_with_importance_sends_the_tier_to_the_server() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let output = machine.run(&[
+        "save",
+        "architectural decision",
+        "--type",
+        "project",
+        "--importance",
+        "high",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    stub.with(|state| {
+        assert_eq!(state.memories.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(state.memories.values().next().unwrap()).unwrap();
+        assert_eq!(body["importance"], "high");
+    });
+}
+
+#[test]
+fn everywhere_save_forwards_importance_to_the_preference() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let output = machine.run(&[
+        "save",
+        "prefers live demo by default",
+        "--type",
+        "user",
+        "--scope",
+        "everywhere",
+        "--importance",
+        "high",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    stub.with(|state| {
+        assert_eq!(state.memories.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(state.memories.values().next().unwrap()).unwrap();
+        assert_eq!(body["importance"], "high");
+    });
+}
+
+#[test]
+fn save_rejects_an_unknown_importance_tier() {
+    let machine = Machine::new("http://127.0.0.1:1");
+    let output = machine.run(&[
+        "save",
+        "fact",
+        "--type",
+        "project",
+        "--importance",
+        "urgent",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("possible values"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn an_unreachable_server_queues_the_save_and_says_it_is_not_recallable() {
     let machine = Machine::new(&format!("http://127.0.0.1:{}", dead_port()));
 
