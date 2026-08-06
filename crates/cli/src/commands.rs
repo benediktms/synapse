@@ -154,6 +154,7 @@ fn save(ctx: &Context, args: SaveArgs) -> Result<(), String> {
                 kind,
                 scope: scope.scope,
                 tags: args.tags,
+                importance: None,
             },
         },
     )

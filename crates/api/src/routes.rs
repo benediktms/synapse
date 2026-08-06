@@ -9,8 +9,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use domain::{
-    EditRequest, Memory, MemoryId, MemoryKind, RECALL_LIMIT_CAP, RecallRequest, SaveOutcome,
-    SaveRequest, Scope, Workspace,
+    EditRequest, Importance, Memory, MemoryId, MemoryKind, RECALL_LIMIT_CAP, RecallRequest,
+    SaveOutcome, SaveRequest, Scope, Workspace,
 };
 use serde::Deserialize;
 use tower_http::timeout::TimeoutLayer;
@@ -271,6 +271,11 @@ async fn save_into<B: Backend>(
         kind: MemoryKind::parse(&body.kind)?,
         scope: Scope::parse(&body.scope)?,
         tags: body.tags,
+        importance: body
+            .importance
+            .as_deref()
+            .map(Importance::parse)
+            .transpose()?,
     };
     match state.backend.save(ws, request).await? {
         SaveOutcome::Created(memory) => Ok((StatusCode::CREATED, Json(MemoryDto::from(&memory)))),
@@ -298,6 +303,7 @@ async fn put_preference<B: Backend>(
         kind: body.kind,
         scope: Scope::Workspace.as_str().to_string(),
         tags: body.tags,
+        importance: None,
     };
     save_into(&state, &Workspace::shared(), &id, body).await
 }
@@ -380,7 +386,11 @@ async fn edit_in<B: Backend>(
         content: body.content,
         tags: body.tags,
         pinned: body.pinned,
-        importance: None,
+        importance: body
+            .importance
+            .as_deref()
+            .map(Importance::parse)
+            .transpose()?,
     };
     let memory = state.backend.edit(ws, &id, request).await?;
     Ok(Json(MemoryDto::from(&memory)))

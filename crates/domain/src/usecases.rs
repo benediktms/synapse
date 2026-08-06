@@ -25,6 +25,9 @@ pub struct SaveRequest {
     pub kind: MemoryKind,
     pub scope: Scope,
     pub tags: Vec<String>,
+    /// Some: the caller pins an explicit tier (conflict if it differs); None: keep the stored
+    /// tier on an existing idempotent save, default to medium on a true create.
+    pub importance: Option<Importance>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -43,7 +46,10 @@ pub async fn save<S: Store, E: Embedder>(
         let same_payload = existing.content == req.content
             && existing.kind == req.kind
             && existing.scope == req.scope
-            && existing.tags == req.tags;
+            && existing.tags == req.tags
+            && req
+                .importance
+                .is_none_or(|tier| existing.importance == tier);
         return if same_payload {
             Ok(SaveOutcome::Unchanged(existing))
         } else {
@@ -58,7 +64,7 @@ pub async fn save<S: Store, E: Embedder>(
         scope: req.scope,
         tags: req.tags,
         pinned: false,
-        importance: Importance::DEFAULT,
+        importance: req.importance.unwrap_or(Importance::DEFAULT),
         created_at: now.clone(),
         updated_at: now,
     };
@@ -427,6 +433,7 @@ mod tests {
             kind: MemoryKind::Project,
             scope: Scope::Workspace,
             tags: Vec::new(),
+            importance: Some(Importance::DEFAULT),
         }
     }
 

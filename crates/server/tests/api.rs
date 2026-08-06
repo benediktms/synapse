@@ -813,6 +813,80 @@ async fn move_rejects_shared_by_name_and_reports_nothing_moved_in_place() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn importance_tier_surfaces_on_save_edit_and_get() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+
+    let (status, body) = req(
+        &router,
+        Method::PUT,
+        &format!("/memories/{}?ws=work", mid(1)),
+        Some(json!({ "content": "deploy runbook", "kind": "project",
+                     "scope": "workspace", "tags": [], "importance": "high" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["importance"], "high");
+
+    let (status, body) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}?ws=work", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["importance"], "high");
+
+    let (status, body) = req(
+        &router,
+        Method::PATCH,
+        &format!("/memories/{}?ws=work", mid(1)),
+        Some(json!({ "importance": "low" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["importance"], "low");
+
+    let (status, body) = req(
+        &router,
+        Method::PUT,
+        &format!("/memories/{}?ws=work", mid(2)),
+        Some(json!({ "content": "plain fact", "kind": "project",
+                     "scope": "workspace", "tags": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["importance"], "medium");
+
+    // An idempotent retry that omits importance (an older client) must not 409 against the
+    // edited rank — it keeps the stored tier and reports OK, not Conflict.
+    let (status, body) = req(
+        &router,
+        Method::PUT,
+        &format!("/memories/{}?ws=work", mid(1)),
+        Some(json!({ "content": "deploy runbook", "kind": "project",
+                     "scope": "workspace", "tags": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["importance"], "low");
+
+    let (status, _) = req(
+        &router,
+        Method::PATCH,
+        &format!("/memories/{}?ws=work", mid(1)),
+        Some(json!({ "importance": "urgent" })),
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "invalid tier must be rejected, got {status}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn export_import_round_trip_and_merge_idempotency() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;

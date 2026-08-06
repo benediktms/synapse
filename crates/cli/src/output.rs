@@ -87,6 +87,7 @@ mod tests {
             scope: scope.into(),
             tags: vec![],
             pinned: false,
+            importance: "medium".into(),
             created_at: "2026-06-02T09:00:00Z".into(),
             updated_at: "2026-07-14T11:22:33Z".into(),
         }
