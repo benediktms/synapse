@@ -294,6 +294,7 @@ mod tests {
                     content: "prefers oat milk".into(),
                     kind: "user".into(),
                     tags: vec![],
+                    importance: None,
                 },
             },
             failure: None,

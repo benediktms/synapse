@@ -162,8 +162,33 @@ fn save_with_importance_sends_the_tier_to_the_server() {
     assert!(output.status.success(), "{}", stderr(&output));
     stub.with(|state| {
         assert_eq!(state.memories.len(), 1);
-        let body = state.memories.values().next().unwrap();
-        assert!(body.contains("\"importance\":\"high\""), "{body}");
+        let body: serde_json::Value =
+            serde_json::from_str(state.memories.values().next().unwrap()).unwrap();
+        assert_eq!(body["importance"], "high");
+    });
+}
+
+#[test]
+fn everywhere_save_forwards_importance_to_the_preference() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let output = machine.run(&[
+        "save",
+        "prefers live demo by default",
+        "--type",
+        "user",
+        "--scope",
+        "everywhere",
+        "--importance",
+        "high",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    stub.with(|state| {
+        assert_eq!(state.memories.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(state.memories.values().next().unwrap()).unwrap();
+        assert_eq!(body["importance"], "high");
     });
 }
 

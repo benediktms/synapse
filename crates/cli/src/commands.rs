@@ -136,6 +136,7 @@ fn save(ctx: &Context, args: SaveArgs) -> Result<(), String> {
                     content: args.content,
                     kind,
                     tags: args.tags,
+                    importance: args.importance,
                 },
             },
         );
