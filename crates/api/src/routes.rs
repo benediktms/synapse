@@ -265,17 +265,17 @@ async fn save_into<B: Backend>(
     let id = MemoryId::parse(id)?;
     validate_content(&state.backend, &body.content)?;
     validate_tags(&body.tags)?;
-    let importance = match body.importance.as_deref() {
-        Some(tier) => Importance::parse(tier)?,
-        None => Importance::DEFAULT,
-    };
     let request = SaveRequest {
         id,
         content: body.content,
         kind: MemoryKind::parse(&body.kind)?,
         scope: Scope::parse(&body.scope)?,
         tags: body.tags,
-        importance,
+        importance: body
+            .importance
+            .as_deref()
+            .map(Importance::parse)
+            .transpose()?,
     };
     match state.backend.save(ws, request).await? {
         SaveOutcome::Created(memory) => Ok((StatusCode::CREATED, Json(MemoryDto::from(&memory)))),

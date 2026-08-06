@@ -860,6 +860,19 @@ async fn importance_tier_surfaces_on_save_edit_and_get() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["importance"], "medium");
 
+    // An idempotent retry that omits importance (an older client) must not 409 against the
+    // edited rank — it keeps the stored tier and reports OK, not Conflict.
+    let (status, body) = req(
+        &router,
+        Method::PUT,
+        &format!("/memories/{}?ws=work", mid(1)),
+        Some(json!({ "content": "deploy runbook", "kind": "project",
+                     "scope": "workspace", "tags": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["importance"], "low");
+
     let (status, _) = req(
         &router,
         Method::PATCH,
