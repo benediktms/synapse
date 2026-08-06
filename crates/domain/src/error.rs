@@ -13,6 +13,8 @@ pub enum Error {
     InvalidScope(String),
     NotFound(MemoryId),
     Conflict(MemoryId),
+    /// A supersession edge would close a cycle in the supersession relation.
+    Cycle(MemoryId, MemoryId),
     Store(String),
     Embed(String),
 }
@@ -29,6 +31,9 @@ impl fmt::Display for Error {
             Error::InvalidScope(scope) => write!(f, "invalid scope: {scope:?}"),
             Error::NotFound(id) => write!(f, "memory {id} not found"),
             Error::Conflict(id) => write!(f, "memory {id} already exists with different payload"),
+            Error::Cycle(source, target) => {
+                write!(f, "{source} supersedes {target} would create a cycle")
+            }
             Error::Store(msg) => write!(f, "store error: {msg}"),
             Error::Embed(msg) => write!(f, "embedding error: {msg}"),
         }

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::Error;
 use crate::fusion::rrf_scores;
+use crate::links::{Link, Relation};
 use crate::memory::{Importance, Memory, MemoryId, MemoryKind, Scope, Timestamp};
 use crate::ports::{Embedder, ScopeFilter, Store};
 use crate::similarity::cosine_similarity;
@@ -164,6 +165,133 @@ pub async fn forget<S: Store>(store: &S, id: &MemoryId) -> Result<(), Error> {
     } else {
         Err(Error::NotFound(id.clone()))
     }
+}
+
+/// Create a typed edge between two memories. Non-supersession relations are canonicalized as
+/// symmetric pairs (deduped); `supersede` is directed and cycle-guarded.
+pub async fn link<S: Store>(
+    store: &S,
+    source: &MemoryId,
+    target: &MemoryId,
+    relation: Relation,
+) -> Result<(), Error> {
+    if relation == Relation::Supersession {
+        within_cycle_guard(store, source, target).await?;
+    }
+    store
+        .insert_link(&Link {
+            source: source.clone(),
+            target: target.clone(),
+            relation,
+        })
+        .await
+}
+
+/// Remove every edge between two memories, whatever its relation. Returns the number removed.
+pub async fn unlink<S: Store>(store: &S, a: &MemoryId, b: &MemoryId) -> Result<usize, Error> {
+    store.delete_links_between(a, b).await
+}
+
+/// Re-anchor an existing edge between `a` and `b` onto `relation`. If a supersession edge is
+/// removed or created this is a stateful transition: the derived pin/suppression recomputes
+/// from the live graph on the next read (no stored undo).
+pub async fn retype_link<S: Store>(
+    store: &S,
+    a: &MemoryId,
+    b: &MemoryId,
+    relation: Relation,
+) -> Result<(), Error> {
+    let links = store.links_of(a).await?;
+    let matched: Vec<Link> = links
+        .into_iter()
+        .filter(|link| link.source == *b || link.target == *b)
+        .collect();
+    if matched.is_empty() {
+        return Err(Error::NotFound(a.clone()));
+    }
+    store.delete_links_between(a, b).await?;
+    link(store, a, b, relation).await
+}
+
+/// A memory is superseded if it is the target of at least one incoming supersession edge.
+pub async fn is_superseded<S: Store>(store: &S, id: &MemoryId) -> Result<bool, Error> {
+    Ok(store
+        .links_of(id)
+        .await?
+        .iter()
+        .any(|link| link.relation == Relation::Supersession && link.target == *id))
+}
+
+/// The memories that supersede `id` — the sources of incoming supersession edges.
+pub async fn superseders_of<S: Store>(store: &S, id: &MemoryId) -> Result<Vec<MemoryId>, Error> {
+    let mut out: Vec<MemoryId> = store
+        .links_of(id)
+        .await?
+        .into_iter()
+        .filter(|link| link.relation == Relation::Supersession && link.target == *id)
+        .map(|link| link.source)
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Derived pin status. A memory is effectively pinned if it is itself pinned, or it supersedes a
+/// memory that is pinned (pin inherits upward through supersession). Derived — nothing is written;
+/// breaking the supersession edge reverses it automatically.
+pub async fn effective_pinned<S: Store>(store: &S, memory: &Memory) -> Result<bool, Error> {
+    if memory.pinned {
+        return Ok(true);
+    }
+    for link in store.links_of(&memory.id).await? {
+        if link.relation == Relation::Supersession
+            && link.source == memory.id
+            && let Some(target) = store.get(&link.target).await?
+            && target.pinned
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn within_cycle_guard<S: Store>(
+    store: &S,
+    source: &MemoryId,
+    target: &MemoryId,
+) -> Result<(), Error> {
+    if supersession_would_cycle(store, source, target).await? {
+        return Err(Error::Cycle(source.clone(), target.clone()));
+    }
+    Ok(())
+}
+
+/// True if adding `source supersedes target` would form a cycle — i.e. `target` already
+/// transitively reaches `source` by following supersession edges source→target.
+async fn supersession_would_cycle<S: Store>(
+    store: &S,
+    source: &MemoryId,
+    target: &MemoryId,
+) -> Result<bool, Error> {
+    if source == target {
+        return Ok(true);
+    }
+    let mut stack = vec![target.clone()];
+    let mut seen: HashSet<MemoryId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        for link in store.links_of(&id).await? {
+            if link.relation == Relation::Supersession && link.source == id {
+                if link.target == *source {
+                    return Ok(true);
+                }
+                stack.push(link.target.clone());
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub async fn list_memories<S: Store>(store: &S) -> Result<Vec<Memory>, Error> {
@@ -424,6 +552,45 @@ mod tests {
             created_at: ts(n % 60),
             updated_at: ts(n % 60),
         }
+    }
+
+    fn seed_pair(store: &FakeStore, a: u32, b: u32) {
+        store.seed(
+            mem(
+                a,
+                &format!("fact {a}"),
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![a as f32, 0.0],
+        );
+        store.seed(
+            mem(
+                b,
+                &format!("fact {b}"),
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![0.0, b as f32],
+        );
+    }
+
+    fn seed_triplet(store: &FakeStore) {
+        seed_pair(store, 1, 2);
+        store.seed(
+            mem(3, "fact 3", MemoryKind::Project, Scope::Workspace, false),
+            vec![0.0, 3.0],
+        );
+    }
+
+    fn super_links(store: &FakeStore, id: &MemoryId) -> Result<Vec<Link>, Error> {
+        block_on(store.links_of(id))
+    }
+
+    fn get_mem(store: &FakeStore, id: &MemoryId) -> Memory {
+        block_on(store.get(id)).unwrap().unwrap()
     }
 
     fn save_req(n: u32, content: &str) -> SaveRequest {
@@ -1261,5 +1428,135 @@ mod tests {
             vec![mid(6), mid(5), mid(4), mid(3), mid(2)]
         );
         assert_eq!(entry_ids(&digest.preferences), vec![mid(1)]);
+    }
+
+    #[test]
+    fn link_bidirectional_canonicalizes() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Support)).unwrap();
+        // reversed insertion collapses to the same canonical edge
+        block_on(link(&store, &mid(2), &mid(1), Relation::Support)).unwrap();
+        let from_1 = super_links(&store, &mid(1)).unwrap();
+        assert_eq!(from_1.len(), 1);
+        assert_eq!(from_1[0].relation, Relation::Support);
+    }
+
+    #[test]
+    fn supersede_rejects_direct_and_transitive_cycles() {
+        let store = FakeStore::new();
+        seed_triplet(&store);
+        // 1 supersedes 2 -> direct reverse 2->1 is a cycle
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        assert_eq!(
+            block_on(link(&store, &mid(2), &mid(1), Relation::Supersession)).unwrap_err(),
+            Error::Cycle(mid(2), mid(1))
+        );
+        // 2 supersedes 3 -> 3 supersedes 1 closes the loop 1->2->3->1
+        block_on(link(&store, &mid(2), &mid(3), Relation::Supersession)).unwrap();
+        assert_eq!(
+            block_on(link(&store, &mid(3), &mid(1), Relation::Supersession)).unwrap_err(),
+            Error::Cycle(mid(3), mid(1))
+        );
+    }
+
+    #[test]
+    fn supersede_rejects_self_and_accepts_idempotent_duplicate() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        assert_eq!(
+            block_on(link(&store, &mid(1), &mid(1), Relation::Supersession)).unwrap_err(),
+            Error::Cycle(mid(1), mid(1))
+        );
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        // exact duplicate is a no-op, not a cycle
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        assert!(block_on(is_superseded(&store, &mid(2))).unwrap());
+    }
+
+    #[test]
+    fn is_superseded_and_superseders_read_incoming_edges() {
+        let store = FakeStore::new();
+        seed_triplet(&store);
+        block_on(link(&store, &mid(1), &mid(3), Relation::Supersession)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Supersession)).unwrap();
+        assert!(block_on(is_superseded(&store, &mid(3))).unwrap());
+        assert!(!block_on(is_superseded(&store, &mid(1))).unwrap());
+        assert_eq!(
+            block_on(superseders_of(&store, &mid(3))).unwrap(),
+            vec![mid(1), mid(2)]
+        );
+    }
+
+    #[test]
+    fn effective_pinned_inherits_through_supersession() {
+        let store = FakeStore::new();
+        store.seed(
+            mem(
+                1,
+                "superseder",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![1.0, 0.0],
+        );
+        store.seed(
+            mem(
+                2,
+                "superseded pinned",
+                MemoryKind::Project,
+                Scope::Workspace,
+                true,
+            ),
+            vec![0.0, 1.0],
+        );
+        // A (1) not pinned, but supersedes pinned B (2) -> effectively pinned
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        let a = get_mem(&store, &mid(1));
+        assert!(block_on(effective_pinned(&store, &a)).unwrap());
+
+        // break the edge -> derived pin reverses
+        block_on(unlink(&store, &mid(1), &mid(2))).unwrap();
+        assert!(!block_on(effective_pinned(&store, &a)).unwrap());
+    }
+
+    #[test]
+    fn effective_pinned_not_inherited_from_unpinned_target() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        let a = get_mem(&store, &mid(1));
+        // B (2) not pinned -> A stays unpinned
+        assert!(!block_on(effective_pinned(&store, &a)).unwrap());
+    }
+
+    #[test]
+    fn unlink_removes_any_edge_between_pair() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(1), &mid(2), Relation::Support)).unwrap();
+        let removed = block_on(unlink(&store, &mid(1), &mid(2))).unwrap();
+        assert_eq!(removed, 2);
+        assert!(super_links(&store, &mid(1)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retype_link_moves_an_existing_edge() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(retype_link(
+            &store,
+            &mid(1),
+            &mid(2),
+            Relation::Supersession,
+        ))
+        .unwrap();
+        let links = super_links(&store, &mid(1)).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].relation, Relation::Supersession);
+        assert!(block_on(is_superseded(&store, &mid(2))).unwrap());
     }
 }

@@ -705,3 +705,33 @@ async fn link_delete_between_removes_all_relations() {
     // Idempotent: deleting again removes nothing.
     assert_eq!(store.delete_links_between(&a, &b).await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn supersession_engine_cycle_guard_and_derived_pin() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let mut old = mem(&MemoryId::generate(), "old fact", Scope::Workspace);
+    old.pinned = true;
+    let new = MemoryId::generate();
+    store.insert(&old, &vec4(0.1)).await.unwrap();
+    store
+        .insert(&mem(&new, "new fact", Scope::Workspace), &vec4(0.2))
+        .await
+        .unwrap();
+
+    // new supersedes old -> old becomes superseded, new effectively pinned (old was pinned).
+    domain::link(&store, &new, &old.id, Relation::Supersession)
+        .await
+        .unwrap();
+    let old_mem = store.get(&old.id).await.unwrap().unwrap();
+    let new_mem = store.get(&new).await.unwrap().unwrap();
+    assert!(domain::is_superseded(&store, &old.id).await.unwrap());
+    assert!(domain::effective_pinned(&store, &new_mem).await.unwrap());
+    assert!(!domain::effective_pinned(&store, &old_mem).await.unwrap() || old_mem.pinned);
+
+    // Breaking the edge reverses the derived pin on `new`.
+    domain::unlink(&store, &new, &old.id).await.unwrap();
+    let new_mem = store.get(&new).await.unwrap().unwrap();
+    assert!(!domain::effective_pinned(&store, &new_mem).await.unwrap());
+    assert!(!domain::is_superseded(&store, &old.id).await.unwrap());
+}
