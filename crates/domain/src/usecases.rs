@@ -337,8 +337,9 @@ pub async fn context_digest<S: Store>(
     }
     pool.sort_by(|a, b| {
         b.memory
-            .updated_at
-            .cmp(&a.memory.updated_at)
+            .importance
+            .cmp(&a.memory.importance)
+            .then_with(|| b.memory.updated_at.cmp(&a.memory.updated_at))
             .then_with(|| a.memory.id.cmp(&b.memory.id))
     });
 
@@ -1139,6 +1140,67 @@ mod tests {
             entry_ids(&digest.preferences),
             vec![mid(35), mid(34), mid(33), mid(32), mid(31)]
         );
+    }
+
+    #[test]
+    fn digest_ranks_importance_over_recency() {
+        let work_ws = Workspace::new("work").unwrap();
+        let work = FakeStore::new();
+
+        let mut high = mem(
+            1,
+            "high",
+            MemoryKind::Project,
+            Scope::Project("fresha/offers".into()),
+            false,
+        );
+        high.importance = Importance::High;
+        let mut medium = mem(
+            2,
+            "medium",
+            MemoryKind::Project,
+            Scope::Project("fresha/offers".into()),
+            false,
+        );
+        medium.importance = Importance::Medium;
+        let mut low = mem(
+            3,
+            "low",
+            MemoryKind::Project,
+            Scope::Project("fresha/offers".into()),
+            false,
+        );
+        low.importance = Importance::Low;
+        work.seed(high, vec![1.0]);
+        work.seed(medium, vec![1.0]);
+        work.seed(low, vec![1.0]);
+
+        // Newer pinned memory is lower importance, so importance must beat recency inside the section.
+        let mut pinned_high = mem(
+            5,
+            "pinned high",
+            MemoryKind::Project,
+            Scope::Workspace,
+            true,
+        );
+        pinned_high.importance = Importance::High;
+        let mut pinned_low = mem(6, "pinned low", MemoryKind::Project, Scope::Workspace, true);
+        pinned_low.importance = Importance::Low;
+        work.seed(pinned_high, vec![1.0]);
+        work.seed(pinned_low, vec![1.0]);
+
+        let digest = block_on(context_digest(
+            (&work_ws, &work),
+            None,
+            Some("fresha/offers"),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            entry_ids(&digest.recent_project),
+            vec![mid(1), mid(2), mid(3)]
+        );
+        assert_eq!(entry_ids(&digest.pinned), vec![mid(5), mid(6)]);
     }
 
     #[test]
