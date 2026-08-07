@@ -155,7 +155,7 @@ pub struct ContextArgs {
 pub struct EditArgs {
     pub id: String,
     /// New content (for a content edit); omit for a link retype with --relation/--type
-    #[arg(conflicts_with_all = ["relation", "type_"])]
+    #[arg(long, conflicts_with_all = ["relation", "type_"])]
     pub content: Option<String>,
     /// New importance tier for the memory (only for a content edit)
     #[arg(long, value_name = "TIER", value_parser = clap::builder::PossibleValuesParser::new(tiers()), conflicts_with_all = ["relation", "type_"])]

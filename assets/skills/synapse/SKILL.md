@@ -227,7 +227,7 @@ the conversation that produced it.
 ## Reference
 
 ```
-syn edit <id> "<corrected fact>"
+syn edit <id> --content "<corrected fact>"
 syn forget <id>
 syn move <id> --to <workspace>   # filed in the wrong workspace
 syn move <id> --to everywhere    # should hold in every workspace
