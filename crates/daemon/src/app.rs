@@ -105,6 +105,26 @@ impl DaemonApp {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        state_dir: PathBuf,
+        embedder: Arc<FastEmbedder>,
+        stores: HashMap<Workspace, Arc<LibsqlStore>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(DaemonInner {
+                state_dir,
+                config: Config::default(),
+                embedder,
+                stores: RwLock::new(stores),
+                bindings: RwLock::new(HashMap::new()),
+                platform: TursoPlatform::new(),
+                ready: Ok(()),
+                links_mutation: Mutex::new(()),
+            }),
+        }
+    }
+
     /// A workspace is only reachable once bound at boot or created explicitly; a lookup
     /// must never provision a cloud database for a mistyped name.
     async fn store(&self, ws: &Workspace) -> Result<Arc<LibsqlStore>, BackendError> {

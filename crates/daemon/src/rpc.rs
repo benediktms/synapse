@@ -490,39 +490,40 @@ fn fail(id: u64, code: i64, message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use adapters_fastembed::FastEmbedder;
+    use adapters_fastembed::{DIMENSION, FastEmbedder, MODEL_NAME};
+    use adapters_libsql::LibsqlStore;
+    use domain::Workspace;
     use serde_json::{Value, json};
 
-    use super::{RpcHost, WorkspaceStatus, dispatch};
+    use super::dispatch;
+    use crate::DaemonApp;
 
-    // server::App is the sqlite-backed Backend the HTTP suite tests against; driving the
-    // RPC dispatch with it exercises the identical ops layer without a Turso primary.
-    impl RpcHost for server::App {
-        async fn statuses(&self) -> Vec<WorkspaceStatus> {
-            Vec::new()
-        }
-
-        async fn sync_replicas(
-            &self,
-            _only: Option<&domain::Workspace>,
-        ) -> Result<(), api::BackendError> {
-            Ok(())
-        }
-    }
-
-    async fn boot(dir: &std::path::Path) -> server::App {
+    // The daemon test binary must link only the libsql engine: a dev-dependency on the
+    // sqlite-backed server crate pulls libsqlite3-sys in as well, and the two bundled
+    // sqlite3.c archives collide at link time on Linux.
+    async fn boot(dir: &std::path::Path) -> DaemonApp {
         let embedder =
             tokio::task::spawn_blocking(|| Arc::new(FastEmbedder::new().expect("model init")))
                 .await
                 .expect("join");
-        server::App::boot(dir.to_path_buf(), embedder)
-            .await
-            .expect("boot")
+        let mut stores = HashMap::new();
+        for ws in [Workspace::new("work").unwrap(), Workspace::shared()] {
+            let db = libsql::Builder::new_local(dir.join(format!("{ws}.db")))
+                .build()
+                .await
+                .expect("local db");
+            let store = LibsqlStore::init(db, MODEL_NAME, DIMENSION)
+                .await
+                .expect("store init");
+            stores.insert(ws, Arc::new(store));
+        }
+        DaemonApp::for_tests(dir.to_path_buf(), embedder, stores)
     }
 
-    async fn call(app: &server::App, method: &str, params: Value) -> Value {
+    async fn call(app: &DaemonApp, method: &str, params: Value) -> Value {
         let line = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         serde_json::from_str(&dispatch(&line.to_string(), app).await).expect("valid response")
     }
@@ -537,8 +538,14 @@ mod tests {
         let resp = call(&app, "ping", Value::Null).await;
         assert_eq!(resp["result"], "pong");
 
-        let resp = call(&app, "workspace.create", json!({"name": "work"})).await;
-        assert_eq!(resp["result"]["created"], true);
+        let resp = call(&app, "workspace.list", Value::Null).await;
+        assert_eq!(resp["result"]["workspaces"], json!(["work"]));
+
+        let resp = call(&app, "workspace.create", json!({"name": "other"})).await;
+        assert_eq!(
+            resp["error"]["code"], -32001,
+            "no scoped orgs configured, so provisioning must fail: {resp}"
+        );
 
         let params = json!({
             "origin": {"workspace": "work"},
