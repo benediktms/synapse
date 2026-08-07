@@ -25,6 +25,9 @@ struct AppInner {
     embedder: Arc<FastEmbedder>,
     stores: RwLock<HashMap<Workspace, Arc<SqliteStore>>>,
     ready: Result<(), String>,
+    /// Serializes link mutations (cycle check + insert) so two concurrent supersessions can't
+    /// both observe an acyclic graph and then both insert, closing the TOCTOU race.
+    links_mutation: tokio::sync::Mutex<()>,
 }
 
 impl App {
@@ -74,6 +77,7 @@ impl App {
                 embedder,
                 stores: RwLock::new(stores),
                 ready,
+                links_mutation: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -268,6 +272,7 @@ impl Backend for App {
         target: &MemoryId,
         relation: Relation,
     ) -> Result<(), BackendError> {
+        let _guard = self.inner.links_mutation.lock().await;
         let (active, _) = self.active_and_shared(ws).await?;
         domain::link(&*active, source, target, relation)
             .await
@@ -280,6 +285,7 @@ impl Backend for App {
         a: &MemoryId,
         b: &MemoryId,
     ) -> Result<usize, BackendError> {
+        let _guard = self.inner.links_mutation.lock().await;
         let (active, _) = self.active_and_shared(ws).await?;
         domain::unlink(&*active, a, b).await.map_err(Into::into)
     }
@@ -291,6 +297,7 @@ impl Backend for App {
         b: &MemoryId,
         relation: Relation,
     ) -> Result<(), BackendError> {
+        let _guard = self.inner.links_mutation.lock().await;
         let (active, _) = self.active_and_shared(ws).await?;
         domain::retype_link(&*active, a, b, relation)
             .await

@@ -267,8 +267,9 @@ pub struct HealthResponse {
 }
 
 /// A graph dump in JSON Graph Format v2. Truncation (not part of the JGF spec) rides on the graph
-/// container as `truncated` and per-node as `meta.truncated`; all JGF consumers pass unknown keys
-/// through harmlessly.
+/// container as `metadata`; per-node truncation as `metadata`. The JGF v2 schema pins `directed`,
+/// `nodes`, `edges` and `metadata` at graph level — traversal fields like root/depth are not legal
+/// there, so they ride inside `metadata`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GraphDto {
     pub graph: GraphContainerDto,
@@ -279,9 +280,14 @@ pub struct GraphContainerDto {
     pub directed: bool,
     pub nodes: BTreeMap<String, GraphNodeDto>,
     pub edges: Vec<GraphEdgeDto>,
+    #[serde(default)]
+    pub metadata: GraphMetaDto,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GraphMetaDto {
     pub root: String,
     pub depth: usize,
-    /// True when the dump is a depth-N window and the real graph extends deeper somewhere.
     #[serde(default)]
     pub truncated: bool,
 }
@@ -289,8 +295,8 @@ pub struct GraphContainerDto {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GraphNodeDto {
     pub label: String,
-    #[serde(rename = "meta", default = "default_node_meta")]
-    pub meta: GraphNodeMetaDto,
+    #[serde(default = "default_node_meta")]
+    pub metadata: GraphNodeMetaDto,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -317,7 +323,7 @@ impl From<&GraphNode> for GraphNodeDto {
     fn from(node: &GraphNode) -> Self {
         Self {
             label: node.memory.content.clone(),
-            meta: GraphNodeMetaDto {
+            metadata: GraphNodeMetaDto {
                 truncated: node.truncated,
             },
         }
@@ -346,9 +352,11 @@ impl From<&GraphSubgraph> for GraphDto {
                     .map(|n| (n.memory.id.to_string(), GraphNodeDto::from(n)))
                     .collect(),
                 edges: sub.edges.iter().map(GraphEdgeDto::from).collect(),
-                root: sub.root.to_string(),
-                depth: sub.depth,
-                truncated: sub.truncated,
+                metadata: GraphMetaDto {
+                    root: sub.root.to_string(),
+                    depth: sub.depth,
+                    truncated: sub.truncated,
+                },
             },
         }
     }
@@ -437,15 +445,21 @@ mod tests {
             }],
         };
         let json = serde_json::to_value(GraphDto::from(&sub)).unwrap();
-        assert_eq!(json["graph"]["root"], "m_0000000000000000000001");
-        assert_eq!(json["graph"]["depth"], 2);
-        assert_eq!(json["graph"]["truncated"], true);
+        assert_eq!(
+            json["graph"]["metadata"]["root"],
+            "m_0000000000000000000001"
+        );
+        assert_eq!(json["graph"]["metadata"]["depth"], 2);
+        assert_eq!(json["graph"]["metadata"]["truncated"], true);
         assert_eq!(json["graph"]["directed"], true);
         assert_eq!(
-            json["graph"]["nodes"]["m_0000000000000000000002"]["meta"]["truncated"],
+            json["graph"]["nodes"]["m_0000000000000000000002"]["metadata"]["truncated"],
             true
         );
         assert_eq!(json["graph"]["edges"][0]["relation"], "supersession");
         assert_eq!(json["graph"]["edges"][0]["directed"], true);
+                assert!(json["graph"]["root"].is_null());
+        assert!(json["graph"]["depth"].is_null());
+        assert!(json["graph"]["truncated"].is_null());
     }
 }

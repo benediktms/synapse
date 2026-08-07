@@ -735,3 +735,34 @@ async fn supersession_engine_cycle_guard_and_derived_pin() {
     assert!(!domain::effective_pinned(&store, &new_mem).await.unwrap());
     assert!(!domain::is_superseded(&store, &old.id).await.unwrap());
 }
+
+#[tokio::test]
+async fn forget_cascades_away_links_on_either_endpoint() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let a = MemoryId::generate();
+    let b = MemoryId::generate();
+    store
+        .insert(&mem(&a, "a", Scope::Workspace), &vec4(0.1))
+        .await
+        .unwrap();
+    store
+        .insert(&mem(&b, "b", Scope::Workspace), &vec4(0.2))
+        .await
+        .unwrap();
+    store
+        .insert_link(&Link {
+            source: a.clone(),
+            target: b.clone(),
+            relation: Relation::Support,
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.links_of(&a).await.unwrap().len(), 1);
+
+        store.delete(&a).await.unwrap();
+    assert!(
+        store.links_of(&b).await.unwrap().is_empty(),
+        "edge must cascade away"
+    );
+}

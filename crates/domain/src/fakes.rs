@@ -106,7 +106,14 @@ impl Store for FakeStore {
     }
 
     async fn delete(&self, id: &MemoryId) -> Result<bool, Error> {
-        Ok(self.rows.lock().unwrap().remove(id).is_some())
+        let removed = self.rows.lock().unwrap().remove(id).is_some();
+        if removed {
+            self.links
+                .lock()
+                .unwrap()
+                .retain(|link| link.source != *id && link.target != *id);
+        }
+        Ok(removed)
     }
 
     async fn list(&self) -> Result<Vec<Memory>, Error> {

@@ -354,9 +354,9 @@ async fn links_route_returns_a_jgf_graph_and_validates_depth() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["graph"]["root"], mid(1));
-    assert_eq!(body["graph"]["depth"], 2);
-    assert_eq!(body["graph"]["truncated"], false);
+    assert_eq!(body["graph"]["metadata"]["root"], mid(1));
+    assert_eq!(body["graph"]["metadata"]["depth"], 2);
+    assert_eq!(body["graph"]["metadata"]["truncated"], false);
     assert_eq!(body["graph"]["edges"].as_array().unwrap().len(), 0);
     assert!(body["graph"]["nodes"][&mid(1)]["label"].is_string());
 

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::Error;
 use crate::fusion::rrf_scores;
@@ -209,8 +209,19 @@ pub async fn retype_link<S: Store>(
     if matched.is_empty() {
         return Err(Error::NotFound(a.clone()));
     }
+    // Validate before mutating: if this becomes a supersession that would close a cycle, reject
+    // with the original edge intact rather than deleting it and losing it on failure.
+    if relation == Relation::Supersession && supersession_would_cycle(store, a, b).await? {
+        return Err(Error::Cycle(a.clone(), b.clone()));
+    }
     store.delete_links_between(a, b).await?;
-    link(store, a, b, relation).await
+    store
+        .insert_link(&Link {
+            source: a.clone(),
+            target: b.clone(),
+            relation,
+        })
+        .await
 }
 
 /// A memory is superseded if it is the target of at least one incoming supersession edge.
@@ -344,20 +355,39 @@ pub async fn graph_subgraph<S: Store>(
     depth: usize,
 ) -> Result<GraphSubgraph, Error> {
     let depth = depth.min(MAX_GRAPH_DEPTH);
-    let mut edges: Vec<GraphEdge> = Vec::new();
-    let mut seen_edges: HashSet<(MemoryId, MemoryId, Relation)> = HashSet::new();
-    let mut queue = vec![root.clone()];
-    let mut order: Vec<MemoryId> = Vec::new();
-    let mut levels: HashMap<MemoryId, usize> = HashMap::new();
-    levels.insert(root.clone(), 0);
 
-    while let Some(id) = queue.pop() {
-        order.push(id.clone());
+    // FIFO BFS so each node gets its shortest-path level; a node reached first along a long path
+    // and later along a short one keeps the short level (no early DFS mis-assignment).
+    let mut levels: HashMap<MemoryId, usize> = HashMap::new();
+    let mut queue: VecDeque<MemoryId> = VecDeque::new();
+    levels.insert(root.clone(), 0);
+    queue.push_back(root.clone());
+    while let Some(id) = queue.pop_front() {
         let level = levels[&id];
         if level >= depth {
             continue;
         }
         for link in store.links_of(&id).await? {
+            for other in [link.source.clone(), link.target.clone()] {
+                if !levels.contains_key(&other) {
+                    levels.insert(other.clone(), level + 1);
+                    queue.push_back(other);
+                }
+            }
+        }
+    }
+    let discovered: HashSet<MemoryId> = levels.keys().cloned().collect();
+
+    // Enumerate every edge whose endpoints are both within the window — including edges that only
+    // surface from a frontier node's side (e.g. an A–B edge at depth 1) — so the dump is complete
+    // at the level it claims. Edges into unvisited territory are cut by the window.
+    let mut edges: Vec<GraphEdge> = Vec::new();
+    let mut seen_edges: HashSet<(MemoryId, MemoryId, Relation)> = HashSet::new();
+    for id in &discovered {
+        for link in store.links_of(id).await? {
+            if !discovered.contains(&link.source) || !discovered.contains(&link.target) {
+                continue;
+            }
             let key = (link.source.clone(), link.target.clone(), link.relation);
             if seen_edges.insert(key) {
                 edges.push(GraphEdge {
@@ -367,32 +397,23 @@ pub async fn graph_subgraph<S: Store>(
                     directed: link.relation.is_directed(),
                 });
             }
-            if !levels.contains_key(&link.target) {
-                levels.insert(link.target.clone(), level + 1);
-                queue.push(link.target.clone());
-            }
-            if !levels.contains_key(&link.source) {
-                levels.insert(link.source.clone(), level + 1);
-                queue.push(link.source.clone());
-            }
         }
     }
 
-    // A frontier node (at exactly `depth`) is truncated iff it has a neighbor we never expanded —
-    // i.e. any neighbor outside the visited set. Interior nodes are fully enumerated, so never
-    // truncated; a frontier node all of whose neighbors are visited is also not truncated.
+    // A node on the frontier (shortest-path level == depth) is truncated iff it has a real
+    // neighbour beyond the window — one we did not expand. This stays accurate at MAX_GRAPH_DEPTH,
+    // which is exactly where the client cannot ask for a deeper follow-up.
     let mut nodes = Vec::new();
-    for id in &order {
+    for (id, level) in &levels {
         let links = store.links_of(id).await?;
-        let truncated = levels[id] == depth
-            && depth < MAX_GRAPH_DEPTH
+        let truncated = level == &depth
             && links.iter().any(|link| {
-                let other = if link.source == *id {
+                let other = if &link.source == id {
                     &link.target
                 } else {
                     &link.source
                 };
-                !levels.contains_key(other)
+                !discovered.contains(other)
             });
         nodes.push(GraphNode {
             memory: store
@@ -552,6 +573,11 @@ async fn hybrid_search<S: Store>(
     for (id, score) in rrf_scores(&lists) {
         let (workspace, store) = sides[origin[&id]];
         if let Some(memory) = store.get(&id).await? {
+            // A superseded memory is suppressed from standalone recall (it stays reachable as a
+            // neighbour of its superseder via build_recall_links below).
+            if is_superseded(store, &id).await? {
+                continue;
+            }
             let links = build_recall_links(store, &memory, filter, links_in_scope).await?;
             hits.push(RecallHit {
                 workspace: workspace.clone(),
@@ -627,7 +653,16 @@ pub async fn context_digest<S: Store>(
     project: Option<&str>,
 ) -> Result<ContextDigest, Error> {
     let mut pool = Vec::new();
+    let mut effectively_pinned: HashSet<MemoryId> = HashSet::new();
     for memory in active.1.list().await? {
+        // A superseded memory is suppressed from the digest entirely (it stays reachable via
+        // its superseder as a neighbour); effective_pinned below reads the store, not the pool.
+        if is_superseded(active.1, &memory.id).await? {
+            continue;
+        }
+        if effective_pinned(active.1, &memory).await? {
+            effectively_pinned.insert(memory.id.clone());
+        }
         pool.push(DigestEntry {
             workspace: active.0.clone(),
             memory,
@@ -635,6 +670,12 @@ pub async fn context_digest<S: Store>(
     }
     if let Some((workspace, store)) = shared {
         for memory in store.list().await? {
+            if is_superseded(store, &memory.id).await? {
+                continue;
+            }
+            if effective_pinned(store, &memory).await? {
+                effectively_pinned.insert(memory.id.clone());
+            }
             pool.push(DigestEntry {
                 workspace: workspace.clone(),
                 memory,
@@ -652,7 +693,7 @@ pub async fn context_digest<S: Store>(
     let mut taken: HashSet<MemoryId> = HashSet::new();
     let pinned: Vec<DigestEntry> = pool
         .iter()
-        .filter(|entry| entry.memory.pinned)
+        .filter(|entry| effectively_pinned.contains(&entry.memory.id))
         .take(DIGEST_PINNED_CAP)
         .cloned()
         .collect();
@@ -665,7 +706,7 @@ pub async fn context_digest<S: Store>(
     let recent_project: Vec<DigestEntry> = pool
         .iter()
         .filter(|entry| {
-            !entry.memory.pinned
+            !effectively_pinned.contains(&entry.memory.id)
                 && entry.memory.scope == target_scope
                 && !taken.contains(&entry.memory.id)
         })
@@ -1494,6 +1535,38 @@ mod tests {
     }
 
     #[test]
+    fn digest_superseder_inherits_a_pinned_targets_pin() {
+        let ws = Workspace::new("work").unwrap();
+        let store = FakeStore::new();
+        // 2 is pinned; 1 supersedes it.
+        store.seed(
+            mem(
+                1,
+                "superseder",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![1.0],
+        );
+        store.seed(
+            mem(
+                2,
+                "pinned superseded",
+                MemoryKind::Project,
+                Scope::Workspace,
+                true,
+            ),
+            vec![1.0],
+        );
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+
+        let digest = block_on(context_digest((&ws, &store), None, None)).unwrap();
+        // 1 is not itself pinned but supersedes pinned 2, so it inherits the pin slot.
+        assert_eq!(entry_ids(&digest.pinned), vec![mid(1)]);
+    }
+
+    #[test]
     fn digest_ranks_importance_over_recency() {
         let work_ws = Workspace::new("work").unwrap();
         let work = FakeStore::new();
@@ -1738,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_surfaces_linked_neighbors_with_phrases() {
+    fn recall_surfaces_linked_neighbors_and_suppresses_the_superseded() {
         let store = FakeStore::new();
         store.seed(
             mem(
@@ -1760,6 +1833,7 @@ mod tests {
             ),
             vec![0.9, 0.1],
         );
+        // 2 supersedes 1: 1 is the superseded (suppressed) one.
         block_on(link(&store, &mid(2), &mid(1), Relation::Supersession)).unwrap();
 
         let ws = Workspace::new("work").unwrap();
@@ -1777,16 +1851,16 @@ mod tests {
         ))
         .unwrap();
 
+        // The superseded memory (1) is suppressed from standalone recall...
+        assert!(
+            hits.iter().all(|h| h.memory.id != mid(1)),
+            "superseded memory should not rank on its own"
+        );
+        // ...but the superseder (2) surfaces and carries 1 as a neighbour.
         let superseder = hits.iter().find(|h| h.memory.id == mid(2)).unwrap();
         assert_eq!(superseder.links.len(), 1);
-        // 2 supersedes 1: from 2's side the phrase is "supersedes".
         assert_eq!(superseder.links[0].id, mid(1));
         assert_eq!(superseder.links[0].phrase, "supersedes");
-
-        let superseded = hits.iter().find(|h| h.memory.id == mid(1)).unwrap();
-        assert_eq!(superseded.links.len(), 1);
-        assert_eq!(superseded.links[0].id, mid(2));
-        assert_eq!(superseded.links[0].phrase, "is superseded by");
     }
 
     #[test]
@@ -1896,5 +1970,69 @@ mod tests {
         assert!(sub.edges[0].directed);
         assert_eq!(sub.edges[0].relation, Relation::Supersession);
         assert!(!sub.edges[0].directed || sub.edges[0].source == mid(1));
+    }
+
+    #[test]
+    fn graph_subgraph_emits_frontier_cross_edges() {
+        // Diamond: root 1 -> A(2), B(3); A and B also linked to each other. At depth 1 the A-B
+        // edge only surfaces from a frontier node's side, so it must still be emitted.
+        let store = FakeStore::new();
+        for n in 1..=3 {
+            store.seed(
+                mem(
+                    n,
+                    &format!("fact {n}"),
+                    MemoryKind::Project,
+                    Scope::Workspace,
+                    false,
+                ),
+                vec![1.0],
+            );
+        }
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(1), &mid(3), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Relation)).unwrap();
+
+        let sub = block_on(graph_subgraph(&store, &mid(1), 1)).unwrap();
+        assert_eq!(
+            sub.edges.len(),
+            3,
+            "A-B cross edge must be included: {:?}",
+            sub.edges
+        );
+        assert!(!sub.truncated, "all neighbours are within the window");
+    }
+
+    #[test]
+    fn graph_subgraph_stays_truncated_at_max_depth() {
+        let store = FakeStore::new();
+        for n in 1..=(MAX_GRAPH_DEPTH as u32 + 3) {
+            store.seed(
+                mem(
+                    n,
+                    &format!("deep {n}"),
+                    MemoryKind::Project,
+                    Scope::Workspace,
+                    false,
+                ),
+                vec![1.0],
+            );
+        }
+        // Chain 1-2-3-... each relate-forward.
+        for n in 1..=(MAX_GRAPH_DEPTH as u32 + 2) {
+            block_on(link(&store, &mid(n), &mid(n + 1), Relation::Relation)).unwrap();
+        }
+        let sub = block_on(graph_subgraph(&store, &mid(1), MAX_GRAPH_DEPTH)).unwrap();
+        assert!(
+            sub.truncated,
+            "the chain continues beyond MAX_GRAPH_DEPTH, so the dump must report truncated"
+        );
+        assert_eq!(sub.nodes.len(), MAX_GRAPH_DEPTH + 1);
+        let frontier = sub
+            .nodes
+            .iter()
+            .find(|n| n.memory.id == mid(MAX_GRAPH_DEPTH as u32 + 1))
+            .unwrap();
+        assert!(frontier.truncated);
     }
 }
