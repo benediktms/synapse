@@ -1153,6 +1153,61 @@ async fn export_import_round_trip_and_merge_idempotency() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn import_accepts_v1_dumps_as_linkless() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/old", None).await;
+
+    let v1 = json!({
+        "version": 1,
+        "origin": { "workspace": "old" },
+        "memories": [{
+            "id": mid(1),
+            "content": "backup made before links existed",
+            "kind": "project",
+            "scope": "workspace",
+            "tags": [],
+            "pinned": false,
+            "created_at": "2026-07-01T00:00:00Z",
+            "updated_at": "2026-07-01T00:00:00Z",
+        }],
+    });
+    let (status, report) = req(&router, Method::POST, "/import?ws=old", Some(v1)).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["imported"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn import_rejects_a_supersession_cycle_in_the_dump() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/cyc", None).await;
+
+    let doc = json!({
+        "version": 2,
+        "origin": { "workspace": "cyc" },
+        "memories": [
+            { "id": mid(1), "content": "a", "kind": "project", "scope": "workspace",
+              "tags": [], "pinned": false, "created_at": "2026-07-01T00:00:00Z",
+              "updated_at": "2026-07-01T00:00:00Z" },
+            { "id": mid(2), "content": "b", "kind": "project", "scope": "workspace",
+              "tags": [], "pinned": false, "created_at": "2026-07-01T00:00:00Z",
+              "updated_at": "2026-07-01T00:00:00Z" },
+        ],
+        "links": [
+            { "source": mid(1), "relation": "supersession", "target": mid(2), "directed": true },
+            { "source": mid(2), "relation": "supersession", "target": mid(1), "directed": true },
+        ],
+    });
+    let (status, body) = req(&router, Method::POST, "/import?ws=cyc", Some(doc)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a cyclic supersession dump must be rejected: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn import_keeps_preferences_and_workspaces_apart() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;

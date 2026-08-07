@@ -344,10 +344,11 @@ impl Backend for App {
             store.insert(&memory, &embedding).await?;
             report.imported += 1;
         }
-        // Recreate the graph after its endpoint memories exist.
+        // Recreate links through the same serialized, cycle-checked path as ordinary mutations,
+        // so a dump's A→B + B→A (or a merge cycle) is rejected, not smuggled past the guard.
+        let _guard = self.inner.links_mutation.lock().await;
         for link in links {
-            store
-                .insert_link(&link)
+            domain::link(&*store, &link.source, &link.target, link.relation)
                 .await
                 .map_err(BackendError::Domain)?;
         }

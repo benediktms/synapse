@@ -673,7 +673,8 @@ async fn import_into<B: Backend>(
             )));
         }
     };
-    if doc.version != EXPORT_VERSION {
+    // v1 (linkless) dumps stay importable as backups made before links existed; only v2 is emitted.
+    if doc.version != EXPORT_VERSION && doc.version != 1 {
         return Err(ApiError::BadRequest(format!(
             "unsupported export version {}, this server reads version {EXPORT_VERSION}",
             doc.version
