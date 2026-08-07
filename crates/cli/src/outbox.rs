@@ -47,6 +47,7 @@ pub struct FlushReport {
     pub dead_lettered: Vec<(String, String)>,
     pub deferred: Option<String>,
     pub still_queued: usize,
+    pub oldest_queued_at: Option<u64>,
 }
 
 pub struct Outbox {
@@ -103,7 +104,7 @@ impl Outbox {
         };
         let Some(_lock) = held else {
             report.deferred = Some("another syn is flushing the outbox".to_string());
-            report.still_queued = self.pending()?.len();
+            self.record_backlog(&mut report)?;
             return Ok(report);
         };
         for (path, item) in self.pending()? {
@@ -138,8 +139,15 @@ impl Outbox {
                 }
             }
         }
-        report.still_queued = self.pending()?.len();
+        self.record_backlog(&mut report)?;
         Ok(report)
+    }
+
+    fn record_backlog(&self, report: &mut FlushReport) -> Result<(), String> {
+        let pending = self.pending()?;
+        report.still_queued = pending.len();
+        report.oldest_queued_at = pending.first().map(|(_, item)| item.queued_at);
+        Ok(())
     }
 
     /// Preferences belong to no workspace, so they are reported as skipped rather
