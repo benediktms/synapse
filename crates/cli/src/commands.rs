@@ -314,10 +314,9 @@ fn patch(
 
 fn edit(ctx: &Context, args: EditArgs) -> Result<(), String> {
     let client = ctx.client(WRITE_TIMEOUT)?;
-    // Retype mode: --relation <other> --type <t> changes an existing edge's type.
-    if let Some(relation) = args.relation {
-        let target = resolve_target(ctx, &args.store)?;
-        let b = relation;
+    let target = resolve_target(ctx, &args.store)?;
+
+    if let Some(relation) = args.relation.as_deref() {
         let ty = args
             .type_
             .as_deref()
@@ -329,22 +328,28 @@ fn edit(ctx: &Context, args: EditArgs) -> Result<(), String> {
             Origin::Workspace(workspace) => workspace.to_string(),
         };
         client
-            .retype_link(&workspace, &args.id, &b, ty)
+            .retype_link(&workspace, &args.id, relation, ty)
             .map_err(|e| e.to_string())?;
-        println!("retyped {} ↔ {b} ({})", args.id, ty);
-        return Ok(());
+        println!("retyped {} ↔ {relation} ({ty})", args.id);
     }
-    let content = args
-        .content
-        .ok_or("syn edit needs a new content, or --relation/--type to retype a link")?;
-    let target = resolve_target(ctx, &args.store)?;
-    let body = PatchMemoryBody {
-        content: Some(content),
-        importance: args.importance,
-        ..PatchMemoryBody::default()
-    };
-    let memory = patch(&client, &target, &args.id, &body)?;
-    println!("updated {} ({})", memory.id, output::store_label(&target));
+
+    let wants_memory_edit = args.content.is_some() || args.importance.is_some();
+    if wants_memory_edit {
+        let body = PatchMemoryBody {
+            content: args.content,
+            importance: args.importance,
+            ..PatchMemoryBody::default()
+        };
+        let memory = patch(&client, &target, &args.id, &body)?;
+        println!("updated {} ({})", memory.id, output::store_label(&target));
+    }
+
+    if args.relation.is_none() && !wants_memory_edit {
+        return Err(
+            "syn edit needs --content (or --importance), or --relation/--type to retype a link"
+                .into(),
+        );
+    }
     Ok(())
 }
 
