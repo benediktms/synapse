@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::Error;
 use crate::fusion::rrf_scores;
+use crate::links::{Link, Relation};
 use crate::memory::{Importance, Memory, MemoryId, MemoryKind, Scope, Timestamp};
 use crate::ports::{Embedder, ScopeFilter, Store};
 use crate::similarity::cosine_similarity;
@@ -12,6 +13,7 @@ use crate::workspace::Workspace;
 // paraphrases ~0.95 — 0.6 sits above the noise band.
 pub const MIN_VECTOR_SIMILARITY: f32 = 0.6;
 pub const RECALL_LIMIT_CAP: usize = 20;
+pub const RECALL_NEIGHBOUR_CAP: usize = 5;
 pub const DIGEST_PINNED_CAP: usize = 10;
 pub const DIGEST_RECENT_PROJECT_CAP: usize = 5;
 pub const DIGEST_SHARED_USER_CAP: usize = 5;
@@ -116,6 +118,7 @@ pub struct MoveOutcome {
     pub memory: Memory,
     pub from_scope: Scope,
     pub moved: bool,
+    pub links_dropped: usize,
 }
 
 pub async fn move_memory<S: Store>(
@@ -135,8 +138,12 @@ pub async fn move_memory<S: Store>(
             memory,
             from_scope,
             moved: false,
+            links_dropped: 0,
         });
     }
+    // ponytail: a link cannot span two stores, so a move drops the memory's edges and reports the
+    // count; qualifying link endpoints with a workspace removes the loss (#9).
+    let links_dropped = source.1.links_of(id).await?.len();
     let mut moved = memory;
     if target.0.is_shared() {
         moved.scope = Scope::Workspace;
@@ -155,6 +162,7 @@ pub async fn move_memory<S: Store>(
         memory: stored,
         from_scope,
         moved: true,
+        links_dropped,
     })
 }
 
@@ -164,6 +172,199 @@ pub async fn forget<S: Store>(store: &S, id: &MemoryId) -> Result<(), Error> {
     } else {
         Err(Error::NotFound(id.clone()))
     }
+}
+
+/// Create a typed edge between two memories. Non-supersession relations are canonicalized as
+/// symmetric pairs (deduped); `supersede` is directed and cycle-guarded.
+pub async fn link<S: Store>(
+    store: &S,
+    source: &MemoryId,
+    target: &MemoryId,
+    relation: Relation,
+) -> Result<(), Error> {
+    if relation == Relation::Supersession {
+        within_cycle_guard(store, source, target).await?;
+    }
+    store
+        .insert_link(&Link {
+            source: source.clone(),
+            target: target.clone(),
+            relation,
+        })
+        .await
+}
+
+/// Reject an incoming edge set whose merged supersession graph holds a cycle — checked before
+/// anything is written, so a bad dump cannot leave half an import behind. The stored graph is
+/// acyclic by construction, so every cycle runs through at least one incoming edge.
+pub fn check_import_acyclic(existing: &[Link], incoming: &[Link]) -> Result<(), Error> {
+    let mut adjacency: HashMap<MemoryId, Vec<MemoryId>> = HashMap::new();
+    for link in existing.iter().chain(incoming) {
+        if link.relation == Relation::Supersession {
+            adjacency
+                .entry(link.source.clone())
+                .or_default()
+                .push(link.target.clone());
+        }
+    }
+    for link in incoming {
+        if link.relation != Relation::Supersession {
+            continue;
+        }
+        if link.source == link.target || reaches(&adjacency, &link.target, &link.source) {
+            return Err(Error::Cycle(link.source.clone(), link.target.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn reaches(adjacency: &HashMap<MemoryId, Vec<MemoryId>>, from: &MemoryId, to: &MemoryId) -> bool {
+    let mut stack = vec![from.clone()];
+    let mut seen: HashSet<MemoryId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if id == *to {
+            return true;
+        }
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(next) = adjacency.get(&id) {
+            stack.extend(next.iter().cloned());
+        }
+    }
+    false
+}
+
+/// Remove every edge between two memories, whatever its relation. Returns the number removed.
+pub async fn unlink<S: Store>(store: &S, a: &MemoryId, b: &MemoryId) -> Result<usize, Error> {
+    store.delete_links_between(a, b).await
+}
+
+/// Re-anchor an existing edge between `a` and `b` onto `relation`. If a supersession edge is
+/// removed or created this is a stateful transition: the derived pin/suppression recomputes
+/// from the live graph on the next read (no stored undo).
+pub async fn retype_link<S: Store>(
+    store: &S,
+    a: &MemoryId,
+    b: &MemoryId,
+    relation: Relation,
+) -> Result<(), Error> {
+    let links = store.links_of(a).await?;
+    let matched: Vec<Link> = links
+        .into_iter()
+        .filter(|link| link.source == *b || link.target == *b)
+        .collect();
+    if matched.is_empty() {
+        return Err(Error::NotFound(a.clone()));
+    }
+    // Retyping names only the new type, not which existing edge to change. If several typed edges
+    // coexist between the pair, deleting them all would silently drop the siblings — reject rather
+    // than guess.
+    if matched.len() > 1 {
+        return Err(Error::Ambiguous(a.clone(), b.clone()));
+    }
+    if relation == Relation::Supersession && supersession_would_cycle(store, a, b).await? {
+        return Err(Error::Cycle(a.clone(), b.clone()));
+    }
+    store.delete_links_between(a, b).await?;
+    store
+        .insert_link(&Link {
+            source: a.clone(),
+            target: b.clone(),
+            relation,
+        })
+        .await
+}
+
+/// A memory is superseded if it is the target of at least one incoming supersession edge.
+pub async fn is_superseded<S: Store>(store: &S, id: &MemoryId) -> Result<bool, Error> {
+    Ok(store
+        .links_of(id)
+        .await?
+        .iter()
+        .any(|link| link.relation == Relation::Supersession && link.target == *id))
+}
+
+/// The memories that supersede `id` — the sources of incoming supersession edges.
+pub async fn superseders_of<S: Store>(store: &S, id: &MemoryId) -> Result<Vec<MemoryId>, Error> {
+    let mut out: Vec<MemoryId> = store
+        .links_of(id)
+        .await?
+        .into_iter()
+        .filter(|link| link.relation == Relation::Supersession && link.target == *id)
+        .map(|link| link.source)
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Derived pin status. A memory is effectively pinned if it is itself pinned, or it supersedes —
+/// directly or down a chain of supersessions — a memory that is pinned (pin inherits upward).
+/// Derived — nothing is written; breaking the supersession edge reverses it automatically.
+pub async fn effective_pinned<S: Store>(store: &S, memory: &Memory) -> Result<bool, Error> {
+    if memory.pinned {
+        return Ok(true);
+    }
+    let mut stack = vec![memory.id.clone()];
+    let mut seen: HashSet<MemoryId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        for link in store.links_of(&id).await? {
+            if link.relation != Relation::Supersession || link.source != id {
+                continue;
+            }
+            let Some(target) = store.get(&link.target).await? else {
+                continue;
+            };
+            if target.pinned {
+                return Ok(true);
+            }
+            stack.push(link.target.clone());
+        }
+    }
+    Ok(false)
+}
+
+async fn within_cycle_guard<S: Store>(
+    store: &S,
+    source: &MemoryId,
+    target: &MemoryId,
+) -> Result<(), Error> {
+    if supersession_would_cycle(store, source, target).await? {
+        return Err(Error::Cycle(source.clone(), target.clone()));
+    }
+    Ok(())
+}
+
+/// True if adding `source supersedes target` would form a cycle — i.e. `target` already
+/// transitively reaches `source` by following supersession edges source→target.
+async fn supersession_would_cycle<S: Store>(
+    store: &S,
+    source: &MemoryId,
+    target: &MemoryId,
+) -> Result<bool, Error> {
+    if source == target {
+        return Ok(true);
+    }
+    let mut stack = vec![target.clone()];
+    let mut seen: HashSet<MemoryId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        for link in store.links_of(&id).await? {
+            if link.relation == Relation::Supersession && link.source == id {
+                if link.target == *source {
+                    return Ok(true);
+                }
+                stack.push(link.target.clone());
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub async fn list_memories<S: Store>(store: &S) -> Result<Vec<Memory>, Error> {
@@ -176,11 +377,173 @@ pub async fn list_memories<S: Store>(store: &S) -> Result<Vec<Memory>, Error> {
     Ok(memories)
 }
 
+pub const MAX_GRAPH_DEPTH: usize = 10;
+/// Node cap for a single subgraph dump: a depth cap alone does not bound work when a hub memory
+/// links to thousands of others, so cap the collected nodes (and by extension edges) to keep one
+/// `syn links` call response-bounded. When hit, the dump reports `truncated`.
+pub const GRAPH_NODE_BUDGET: usize = 500;
+pub const GRAPH_EDGE_BUDGET: usize = 1000;
+
+/// A node of a bounded subgraph dump, for `syn links`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphNode {
+    pub memory: Memory,
+    /// True when this node sits on the depth frontier and we did not expand its adjacency — the
+    /// dump cuts here and the real graph extends at least one more hop below it.
+    pub truncated: bool,
+}
+
+/// An edge of the subgraph dump. `directed` is true only for supersession.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphEdge {
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub relation: Relation,
+    pub directed: bool,
+}
+
+/// The result of a bounded breadth-first subgraph dump rooted at a memory.
 #[derive(Clone, Debug)]
+pub struct GraphSubgraph {
+    pub root: MemoryId,
+    pub depth: usize,
+    /// True when the dump is a depth-N window and the real graph extends deeper somewhere.
+    pub truncated: bool,
+    pub nodes: Vec<GraphNode>,
+    /// Every edge within the visited set, including back-edges that close cycles.
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Build a bounded subgraph around `root`: visit each node once but emit every edge (cycle-safe),
+/// expand at most `depth` hops, and mark frontier nodes whose real adjacency exceeds the window.
+pub async fn graph_subgraph<S: Store>(
+    store: &S,
+    root: &MemoryId,
+    depth: usize,
+) -> Result<GraphSubgraph, Error> {
+    let depth = depth.min(MAX_GRAPH_DEPTH);
+
+    // FIFO BFS so each node gets its shortest-path level; a node reached first along a long path
+    // and later along a short one keeps the short level (no early DFS mis-assignment).
+    let mut levels: HashMap<MemoryId, usize> = HashMap::new();
+    let mut queue: VecDeque<MemoryId> = VecDeque::new();
+    levels.insert(root.clone(), 0);
+    queue.push_back(root.clone());
+    let mut budget_exceeded = false;
+    while let Some(id) = queue.pop_front() {
+        let level = levels[&id];
+        if level >= depth {
+            continue;
+        }
+        for link in store.links_of(&id).await? {
+            for other in [link.source.clone(), link.target.clone()] {
+                if !levels.contains_key(&other) {
+                    if levels.len() >= GRAPH_NODE_BUDGET {
+                        budget_exceeded = true;
+                        queue.clear();
+                        break;
+                    }
+                    levels.insert(other.clone(), level + 1);
+                    queue.push_back(other);
+                }
+            }
+            if budget_exceeded {
+                break;
+            }
+        }
+    }
+    let discovered: HashSet<MemoryId> = levels.keys().cloned().collect();
+
+    // Enumerate every edge whose endpoints are both within the window — including edges that only
+    // surface from a frontier node's side (e.g. an A–B edge at depth 1) — so the dump is complete
+    // at the level it claims. Edges into unvisited territory are cut by the window.
+    let mut edges: Vec<GraphEdge> = Vec::new();
+    let mut seen_edges: HashSet<(MemoryId, MemoryId, Relation)> = HashSet::new();
+    for id in &discovered {
+        if edges.len() >= GRAPH_EDGE_BUDGET {
+            budget_exceeded = true;
+            break;
+        }
+        for link in store.links_of(id).await? {
+            if edges.len() >= GRAPH_EDGE_BUDGET {
+                budget_exceeded = true;
+                break;
+            }
+            if !discovered.contains(&link.source) || !discovered.contains(&link.target) {
+                continue;
+            }
+            let key = (link.source.clone(), link.target.clone(), link.relation);
+            if seen_edges.insert(key) {
+                edges.push(GraphEdge {
+                    source: link.source.clone(),
+                    target: link.target.clone(),
+                    relation: link.relation,
+                    directed: link.relation.is_directed(),
+                });
+            }
+        }
+    }
+
+    // A node on the frontier (shortest-path level == depth) is truncated iff it has a real
+    // neighbour beyond the window — one we did not expand. This stays accurate at MAX_GRAPH_DEPTH,
+    // which is exactly where the client cannot ask for a deeper follow-up.
+    let mut nodes = Vec::new();
+    for (id, level) in &levels {
+        let links = store.links_of(id).await?;
+        let truncated = level == &depth
+            && links.iter().any(|link| {
+                let other = if &link.source == id {
+                    &link.target
+                } else {
+                    &link.source
+                };
+                !discovered.contains(other)
+            });
+        nodes.push(GraphNode {
+            memory: store
+                .get(id)
+                .await?
+                .ok_or_else(|| Error::NotFound(id.clone()))?,
+            truncated,
+        });
+    }
+    nodes.sort_by(|a, b| a.memory.id.cmp(&b.memory.id));
+    edges.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| a.relation.cmp(&b.relation))
+    });
+
+    Ok(GraphSubgraph {
+        root: root.clone(),
+        depth,
+        truncated: budget_exceeded || nodes.iter().any(|n| n.truncated),
+        nodes,
+        edges,
+    })
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct RecallRequest {
     pub query: String,
     pub project: Option<String>,
     pub limit: usize,
+    /// When true, only surface linked neighbors whose scope matches the recall's scope filter.
+    /// Default false: cross-scope links surface too (Q17).
+    pub links_in_scope: bool,
+}
+
+/// A first-hop linked neighbor of a recalled memory, for recall surfacing. Ids and a phrase only —
+/// the agent traverses explicitly from here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecallLink {
+    pub id: MemoryId,
+    /// The display phrase from the recalled memory's perspective, e.g. "relates to" or
+    /// "is superseded by".
+    pub phrase: String,
+    /// The neighbor's scope, so a cross-scope link can be identified.
+    pub scope: Scope,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +551,10 @@ pub struct RecallHit {
     pub workspace: Workspace,
     pub memory: Memory,
     pub score: f64,
+    pub links: Vec<RecallLink>,
+    /// The memory has first-hop neighbours beyond the `RECALL_NEIGHBOUR_CAP` shown; `syn links`
+    /// walks the rest.
+    pub links_truncated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -216,6 +583,7 @@ pub async fn recall<S: Store, E: Embedder>(
         &req.query,
         &filter,
         req.limit.clamp(1, RECALL_LIMIT_CAP),
+        req.links_in_scope,
     )
     .await
 }
@@ -240,6 +608,7 @@ pub async fn recall_grouped<S: Store, E: Embedder>(
             &req.query,
             &filter,
             limit,
+            req.links_in_scope,
         )
         .await?;
         if !hits.is_empty() {
@@ -258,6 +627,7 @@ async fn hybrid_search<S: Store>(
     query: &str,
     filter: &ScopeFilter,
     limit: usize,
+    links_in_scope: bool,
 ) -> Result<Vec<RecallHit>, Error> {
     let mut origin: HashMap<MemoryId, usize> = HashMap::new();
     let mut vector_pool: Vec<(MemoryId, f32)> = Vec::new();
@@ -290,10 +660,19 @@ async fn hybrid_search<S: Store>(
     for (id, score) in rrf_scores(&lists) {
         let (workspace, store) = sides[origin[&id]];
         if let Some(memory) = store.get(&id).await? {
+            // A superseded memory is suppressed from standalone recall (it stays reachable as a
+            // neighbour of its superseder via build_recall_links below).
+            if is_superseded(store, &id).await? {
+                continue;
+            }
+            let (links, links_truncated) =
+                build_recall_links(store, &memory, filter, links_in_scope).await?;
             hits.push(RecallHit {
                 workspace: workspace.clone(),
                 memory,
                 score,
+                links,
+                links_truncated,
             });
         }
     }
@@ -306,6 +685,62 @@ async fn hybrid_search<S: Store>(
     });
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// The first-hop linked neighbors of `memory`, for recall surfacing. For each edge touching the
+/// memory, emits the other endpoint with a display phrase relative to `memory`. When
+/// `links_in_scope` is set, edges whose neighbor's scope doesn't match `filter` are dropped
+/// (cross-scope links otherwise surface, per Q17). At most `RECALL_NEIGHBOUR_CAP` neighbours are
+/// hydrated, lowest id first, so a hub memory cannot turn one recall into an unbounded fan-out;
+/// the flag says the rest exist.
+async fn build_recall_links<S: Store>(
+    store: &S,
+    memory: &Memory,
+    filter: &ScopeFilter,
+    links_in_scope: bool,
+) -> Result<(Vec<RecallLink>, bool), Error> {
+    let mut links = store.links_of(&memory.id).await?;
+    links.sort_by(|a, b| {
+        let left = if a.source == memory.id {
+            &a.target
+        } else {
+            &a.source
+        };
+        let right = if b.source == memory.id {
+            &b.target
+        } else {
+            &b.source
+        };
+        left.cmp(right).then(a.relation.cmp(&b.relation))
+    });
+    let mut out = Vec::new();
+    let mut truncated = false;
+    for link in links {
+        if out.len() == RECALL_NEIGHBOUR_CAP {
+            truncated = true;
+            break;
+        }
+        let (neighbor_id, directed, this_is_source) = if link.source == memory.id {
+            (link.target.clone(), true, true)
+        } else {
+            (link.source.clone(), false, false)
+        };
+        let Some(neighbor) = store.get(&neighbor_id).await? else {
+            continue;
+        };
+        if links_in_scope && !filter.matches(&neighbor.scope) {
+            continue;
+        }
+        out.push(RecallLink {
+            id: neighbor_id,
+            phrase: link
+                .relation
+                .phrase_from(directed, this_is_source)
+                .to_string(),
+            scope: neighbor.scope,
+        });
+    }
+    Ok((out, truncated))
 }
 
 #[derive(Clone, Debug)]
@@ -327,7 +762,16 @@ pub async fn context_digest<S: Store>(
     project: Option<&str>,
 ) -> Result<ContextDigest, Error> {
     let mut pool = Vec::new();
+    let mut effectively_pinned: HashSet<MemoryId> = HashSet::new();
     for memory in active.1.list().await? {
+        // A superseded memory is suppressed from the digest entirely (it stays reachable via
+        // its superseder as a neighbour); effective_pinned below reads the store, not the pool.
+        if is_superseded(active.1, &memory.id).await? {
+            continue;
+        }
+        if effective_pinned(active.1, &memory).await? {
+            effectively_pinned.insert(memory.id.clone());
+        }
         pool.push(DigestEntry {
             workspace: active.0.clone(),
             memory,
@@ -335,6 +779,12 @@ pub async fn context_digest<S: Store>(
     }
     if let Some((workspace, store)) = shared {
         for memory in store.list().await? {
+            if is_superseded(store, &memory.id).await? {
+                continue;
+            }
+            if effective_pinned(store, &memory).await? {
+                effectively_pinned.insert(memory.id.clone());
+            }
             pool.push(DigestEntry {
                 workspace: workspace.clone(),
                 memory,
@@ -352,7 +802,7 @@ pub async fn context_digest<S: Store>(
     let mut taken: HashSet<MemoryId> = HashSet::new();
     let pinned: Vec<DigestEntry> = pool
         .iter()
-        .filter(|entry| entry.memory.pinned)
+        .filter(|entry| effectively_pinned.contains(&entry.memory.id))
         .take(DIGEST_PINNED_CAP)
         .cloned()
         .collect();
@@ -365,7 +815,7 @@ pub async fn context_digest<S: Store>(
     let recent_project: Vec<DigestEntry> = pool
         .iter()
         .filter(|entry| {
-            !entry.memory.pinned
+            !effectively_pinned.contains(&entry.memory.id)
                 && entry.memory.scope == target_scope
                 && !taken.contains(&entry.memory.id)
         })
@@ -424,6 +874,45 @@ mod tests {
             created_at: ts(n % 60),
             updated_at: ts(n % 60),
         }
+    }
+
+    fn seed_pair(store: &FakeStore, a: u32, b: u32) {
+        store.seed(
+            mem(
+                a,
+                &format!("fact {a}"),
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![a as f32, 0.0],
+        );
+        store.seed(
+            mem(
+                b,
+                &format!("fact {b}"),
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![0.0, b as f32],
+        );
+    }
+
+    fn seed_triplet(store: &FakeStore) {
+        seed_pair(store, 1, 2);
+        store.seed(
+            mem(3, "fact 3", MemoryKind::Project, Scope::Workspace, false),
+            vec![0.0, 3.0],
+        );
+    }
+
+    fn super_links(store: &FakeStore, id: &MemoryId) -> Result<Vec<Link>, Error> {
+        block_on(store.links_of(id))
+    }
+
+    fn get_mem(store: &FakeStore, id: &MemoryId) -> Memory {
+        block_on(store.get(id)).unwrap().unwrap()
     }
 
     fn save_req(n: u32, content: &str) -> SaveRequest {
@@ -837,6 +1326,7 @@ mod tests {
                 query: "deploy staging".to_string(),
                 project: None,
                 limit: 10,
+                links_in_scope: false,
             },
         ))
         .unwrap();
@@ -878,6 +1368,7 @@ mod tests {
                 query: "deploy staging".to_string(),
                 project: None,
                 limit: 10,
+                links_in_scope: false,
             },
         ))
         .unwrap();
@@ -929,6 +1420,7 @@ mod tests {
                 query: "deploy verification".to_string(),
                 project: None,
                 limit: 10,
+                links_in_scope: false,
             },
         ))
         .unwrap();
@@ -975,6 +1467,7 @@ mod tests {
                 query: "deploy runbook".to_string(),
                 project: Some("fresha/offers".to_string()),
                 limit: 10,
+                links_in_scope: false,
             },
         ))
         .unwrap();
@@ -1031,6 +1524,7 @@ mod tests {
                 query: "deploy".to_string(),
                 project: None,
                 limit: 10,
+                links_in_scope: false,
             },
         ))
         .unwrap();
@@ -1150,6 +1644,38 @@ mod tests {
     }
 
     #[test]
+    fn digest_superseder_inherits_a_pinned_targets_pin() {
+        let ws = Workspace::new("work").unwrap();
+        let store = FakeStore::new();
+        // 2 is pinned; 1 supersedes it.
+        store.seed(
+            mem(
+                1,
+                "superseder",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![1.0],
+        );
+        store.seed(
+            mem(
+                2,
+                "pinned superseded",
+                MemoryKind::Project,
+                Scope::Workspace,
+                true,
+            ),
+            vec![1.0],
+        );
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+
+        let digest = block_on(context_digest((&ws, &store), None, None)).unwrap();
+        // 1 is not itself pinned but supersedes pinned 2, so it inherits the pin slot.
+        assert_eq!(entry_ids(&digest.pinned), vec![mid(1)]);
+    }
+
+    #[test]
     fn digest_ranks_importance_over_recency() {
         let work_ws = Workspace::new("work").unwrap();
         let work = FakeStore::new();
@@ -1261,5 +1787,427 @@ mod tests {
             vec![mid(6), mid(5), mid(4), mid(3), mid(2)]
         );
         assert_eq!(entry_ids(&digest.preferences), vec![mid(1)]);
+    }
+
+    #[test]
+    fn link_bidirectional_canonicalizes() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Support)).unwrap();
+        // reversed insertion collapses to the same canonical edge
+        block_on(link(&store, &mid(2), &mid(1), Relation::Support)).unwrap();
+        let from_1 = super_links(&store, &mid(1)).unwrap();
+        assert_eq!(from_1.len(), 1);
+        assert_eq!(from_1[0].relation, Relation::Support);
+    }
+
+    #[test]
+    fn supersede_rejects_direct_and_transitive_cycles() {
+        let store = FakeStore::new();
+        seed_triplet(&store);
+        // 1 supersedes 2 -> direct reverse 2->1 is a cycle
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        assert_eq!(
+            block_on(link(&store, &mid(2), &mid(1), Relation::Supersession)).unwrap_err(),
+            Error::Cycle(mid(2), mid(1))
+        );
+        // 2 supersedes 3 -> 3 supersedes 1 closes the loop 1->2->3->1
+        block_on(link(&store, &mid(2), &mid(3), Relation::Supersession)).unwrap();
+        assert_eq!(
+            block_on(link(&store, &mid(3), &mid(1), Relation::Supersession)).unwrap_err(),
+            Error::Cycle(mid(3), mid(1))
+        );
+    }
+
+    #[test]
+    fn supersede_rejects_self_and_accepts_idempotent_duplicate() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        assert_eq!(
+            block_on(link(&store, &mid(1), &mid(1), Relation::Supersession)).unwrap_err(),
+            Error::Cycle(mid(1), mid(1))
+        );
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        // exact duplicate is a no-op, not a cycle
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        assert!(block_on(is_superseded(&store, &mid(2))).unwrap());
+    }
+
+    #[test]
+    fn is_superseded_and_superseders_read_incoming_edges() {
+        let store = FakeStore::new();
+        seed_triplet(&store);
+        block_on(link(&store, &mid(1), &mid(3), Relation::Supersession)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Supersession)).unwrap();
+        assert!(block_on(is_superseded(&store, &mid(3))).unwrap());
+        assert!(!block_on(is_superseded(&store, &mid(1))).unwrap());
+        assert_eq!(
+            block_on(superseders_of(&store, &mid(3))).unwrap(),
+            vec![mid(1), mid(2)]
+        );
+    }
+
+    #[test]
+    fn effective_pinned_inherits_through_supersession() {
+        let store = FakeStore::new();
+        store.seed(
+            mem(
+                1,
+                "superseder",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![1.0, 0.0],
+        );
+        store.seed(
+            mem(
+                2,
+                "superseded pinned",
+                MemoryKind::Project,
+                Scope::Workspace,
+                true,
+            ),
+            vec![0.0, 1.0],
+        );
+        // A (1) not pinned, but supersedes pinned B (2) -> effectively pinned
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        let a = get_mem(&store, &mid(1));
+        assert!(block_on(effective_pinned(&store, &a)).unwrap());
+
+        // break the edge -> derived pin reverses
+        block_on(unlink(&store, &mid(1), &mid(2))).unwrap();
+        assert!(!block_on(effective_pinned(&store, &a)).unwrap());
+    }
+
+    #[test]
+    fn effective_pinned_follows_a_supersession_chain() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        store.seed(
+            mem(
+                3,
+                "oldest pinned",
+                MemoryKind::Project,
+                Scope::Workspace,
+                true,
+            ),
+            vec![0.0, 1.0],
+        );
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Supersession)).unwrap();
+        let a = get_mem(&store, &mid(1));
+        assert!(block_on(effective_pinned(&store, &a)).unwrap());
+
+        block_on(unlink(&store, &mid(2), &mid(3))).unwrap();
+        assert!(!block_on(effective_pinned(&store, &a)).unwrap());
+    }
+
+    #[test]
+    fn effective_pinned_not_inherited_from_unpinned_target() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        let a = get_mem(&store, &mid(1));
+        // B (2) not pinned -> A stays unpinned
+        assert!(!block_on(effective_pinned(&store, &a)).unwrap());
+    }
+
+    #[test]
+    fn unlink_removes_any_edge_between_pair() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(1), &mid(2), Relation::Support)).unwrap();
+        let removed = block_on(unlink(&store, &mid(1), &mid(2))).unwrap();
+        assert_eq!(removed, 2);
+        assert!(super_links(&store, &mid(1)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retype_link_moves_an_existing_edge() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(retype_link(
+            &store,
+            &mid(1),
+            &mid(2),
+            Relation::Supersession,
+        ))
+        .unwrap();
+        let links = super_links(&store, &mid(1)).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].relation, Relation::Supersession);
+        assert!(block_on(is_superseded(&store, &mid(2))).unwrap());
+    }
+
+    #[test]
+    fn recall_surfaces_linked_neighbors_and_suppresses_the_superseded() {
+        let store = FakeStore::new();
+        store.seed(
+            mem(
+                1,
+                "new deploy process",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![1.0, 0.0],
+        );
+        store.seed(
+            mem(
+                2,
+                "old deploy process",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![0.9, 0.1],
+        );
+        // 2 supersedes 1: 1 is the superseded (suppressed) one.
+        block_on(link(&store, &mid(2), &mid(1), Relation::Supersession)).unwrap();
+
+        let ws = Workspace::new("work").unwrap();
+        let embedder = FakeEmbedder::new().with("deploy process", vec![0.8, 0.2]);
+        let hits = block_on(recall(
+            &embedder,
+            (&ws, &store),
+            None,
+            &RecallRequest {
+                query: "deploy process".to_string(),
+                project: None,
+                limit: 10,
+                links_in_scope: false,
+            },
+        ))
+        .unwrap();
+
+        // The superseded memory (1) is suppressed from standalone recall...
+        assert!(
+            hits.iter().all(|h| h.memory.id != mid(1)),
+            "superseded memory should not rank on its own"
+        );
+        // ...but the superseder (2) surfaces and carries 1 as a neighbour.
+        let superseder = hits.iter().find(|h| h.memory.id == mid(2)).unwrap();
+        assert_eq!(superseder.links.len(), 1);
+        assert_eq!(superseder.links[0].id, mid(1));
+        assert_eq!(superseder.links[0].phrase, "supersedes");
+    }
+
+    #[test]
+    fn recall_caps_a_hubs_neighbors_and_flags_the_rest() {
+        let store = FakeStore::new();
+        store.seed(
+            mem(1, "hub fact", MemoryKind::Project, Scope::Workspace, false),
+            vec![1.0, 0.0],
+        );
+        let spokes = RECALL_NEIGHBOUR_CAP as u32 + 3;
+        for n in 2..2 + spokes {
+            store.seed(
+                mem(
+                    n,
+                    &format!("spoke {n}"),
+                    MemoryKind::Project,
+                    Scope::Workspace,
+                    false,
+                ),
+                vec![0.0, n as f32],
+            );
+            block_on(link(&store, &mid(1), &mid(n), Relation::Relation)).unwrap();
+        }
+
+        let ws = Workspace::new("work").unwrap();
+        let embedder = FakeEmbedder::new().with("hub fact", vec![1.0, 0.0]);
+        let hits = block_on(recall(
+            &embedder,
+            (&ws, &store),
+            None,
+            &RecallRequest {
+                query: "hub fact".to_string(),
+                project: None,
+                limit: 10,
+                links_in_scope: false,
+            },
+        ))
+        .unwrap();
+
+        let hub = hits.iter().find(|h| h.memory.id == mid(1)).unwrap();
+        assert_eq!(hub.links.len(), RECALL_NEIGHBOUR_CAP);
+        assert!(hub.links_truncated, "the cut neighbours must be announced");
+        assert_eq!(hub.links[0].id, mid(2));
+    }
+
+    #[test]
+    fn recall_links_in_scope_filters_cross_scope_neighbors() {
+        let store = FakeStore::new();
+        // 1 is workspace-scoped; 2 (its neighbor) is project-scoped.
+        store.seed(
+            mem(
+                1,
+                "root cause",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![1.0, 0.0],
+        );
+        store.seed(
+            mem(
+                2,
+                "symptom in offers",
+                MemoryKind::Project,
+                Scope::Project("acme/offers".into()),
+                false,
+            ),
+            vec![0.9, 0.1],
+        );
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+
+        let ws = Workspace::new("work").unwrap();
+        let embedder = FakeEmbedder::new().with("root cause", vec![0.8, 0.2]);
+        // Workspace-scoped recall with the flag ON: the project-scoped neighbor is dropped.
+        let hits = block_on(recall(
+            &embedder,
+            (&ws, &store),
+            None,
+            &RecallRequest {
+                query: "root cause".to_string(),
+                project: None,
+                limit: 10,
+                links_in_scope: true,
+            },
+        ))
+        .unwrap();
+        let hit = hits.iter().find(|h| h.memory.id == mid(1)).unwrap();
+        assert!(
+            hit.links.is_empty(),
+            "cross-scope neighbor should be filtered: {:?}",
+            hit.links
+        );
+    }
+
+    #[test]
+    fn graph_subgraph_dumps_neighborhood_with_edges() {
+        let store = FakeStore::new();
+        seed_triplet(&store);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Support)).unwrap();
+
+        let sub = block_on(graph_subgraph(&store, &mid(1), 2)).unwrap();
+        let ids: Vec<MemoryId> = sub.nodes.iter().map(|n| n.memory.id.clone()).collect();
+        assert_eq!(ids, vec![mid(1), mid(2), mid(3)]);
+        assert_eq!(sub.edges.len(), 2);
+        assert!(!sub.truncated);
+        assert!(sub.nodes.iter().all(|n| !n.truncated));
+    }
+
+    #[test]
+    fn graph_subgraph_respects_cycle_back_edges() {
+        let store = FakeStore::new();
+        seed_triplet(&store);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(3), &mid(1), Relation::Relation)).unwrap();
+
+        let sub = block_on(graph_subgraph(&store, &mid(1), 10)).unwrap();
+        assert_eq!(sub.nodes.len(), 3);
+        assert_eq!(sub.edges.len(), 3);
+        assert!(!sub.truncated);
+    }
+
+    #[test]
+    fn graph_subgraph_truncates_at_depth_with_flag() {
+        let store = FakeStore::new();
+        seed_triplet(&store);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Relation)).unwrap();
+
+        let sub = block_on(graph_subgraph(&store, &mid(1), 1)).unwrap();
+        let ids: Vec<MemoryId> = sub.nodes.iter().map(|n| n.memory.id.clone()).collect();
+        assert_eq!(ids, vec![mid(1), mid(2)]);
+        assert_eq!(sub.edges.len(), 1);
+        let node2 = sub.nodes.iter().find(|n| n.memory.id == mid(2)).unwrap();
+        assert!(node2.truncated);
+        assert!(sub.truncated);
+        let node1 = sub.nodes.iter().find(|n| n.memory.id == mid(1)).unwrap();
+        assert!(!node1.truncated);
+    }
+
+    #[test]
+    fn graph_subgraph_directed_supersession_is_marked() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+
+        let sub = block_on(graph_subgraph(&store, &mid(1), 2)).unwrap();
+        assert_eq!(sub.edges.len(), 1);
+        assert!(sub.edges[0].directed);
+        assert_eq!(sub.edges[0].relation, Relation::Supersession);
+        assert!(!sub.edges[0].directed || sub.edges[0].source == mid(1));
+    }
+
+    #[test]
+    fn graph_subgraph_emits_frontier_cross_edges() {
+        // Diamond: root 1 -> A(2), B(3); A and B also linked to each other. At depth 1 the A-B
+        // edge only surfaces from a frontier node's side, so it must still be emitted.
+        let store = FakeStore::new();
+        for n in 1..=3 {
+            store.seed(
+                mem(
+                    n,
+                    &format!("fact {n}"),
+                    MemoryKind::Project,
+                    Scope::Workspace,
+                    false,
+                ),
+                vec![1.0],
+            );
+        }
+        block_on(link(&store, &mid(1), &mid(2), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(1), &mid(3), Relation::Relation)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Relation)).unwrap();
+
+        let sub = block_on(graph_subgraph(&store, &mid(1), 1)).unwrap();
+        assert_eq!(
+            sub.edges.len(),
+            3,
+            "A-B cross edge must be included: {:?}",
+            sub.edges
+        );
+        assert!(!sub.truncated, "all neighbours are within the window");
+    }
+
+    #[test]
+    fn graph_subgraph_stays_truncated_at_max_depth() {
+        let store = FakeStore::new();
+        for n in 1..=(MAX_GRAPH_DEPTH as u32 + 3) {
+            store.seed(
+                mem(
+                    n,
+                    &format!("deep {n}"),
+                    MemoryKind::Project,
+                    Scope::Workspace,
+                    false,
+                ),
+                vec![1.0],
+            );
+        }
+        // Chain 1-2-3-... each relate-forward.
+        for n in 1..=(MAX_GRAPH_DEPTH as u32 + 2) {
+            block_on(link(&store, &mid(n), &mid(n + 1), Relation::Relation)).unwrap();
+        }
+        let sub = block_on(graph_subgraph(&store, &mid(1), MAX_GRAPH_DEPTH)).unwrap();
+        assert!(
+            sub.truncated,
+            "the chain continues beyond MAX_GRAPH_DEPTH, so the dump must report truncated"
+        );
+        assert_eq!(sub.nodes.len(), MAX_GRAPH_DEPTH + 1);
+        let frontier = sub
+            .nodes
+            .iter()
+            .find(|n| n.memory.id == mid(MAX_GRAPH_DEPTH as u32 + 1))
+            .unwrap();
+        assert!(frontier.truncated);
     }
 }

@@ -1,4 +1,5 @@
 use crate::error::Error;
+use crate::links::Link;
 use crate::memory::{Memory, MemoryId, Scope, Timestamp};
 use crate::usecases::EditRequest;
 
@@ -36,6 +37,19 @@ pub trait Store {
         filter: &ScopeFilter,
         limit: usize,
     ) -> Result<Vec<MemoryId>, Error>;
+    /// Insert a typed edge. Idempotent: symmetric links are canonicalized so (a,b) and (b,a)
+    /// collapse; inserting the same edge twice is a no-op. Existing memories for both endpoints
+    /// must exist.
+    async fn insert_link(&self, link: &Link) -> Result<(), Error>;
+    /// Remove every edge between the two memories, whatever its relation. Returns the number
+    /// removed (0 if none).
+    async fn delete_links_between(&self, a: &MemoryId, b: &MemoryId) -> Result<usize, Error>;
+    /// Every edge touching `id`. For symmetric relations the endpoints are canonicalised;
+    /// direction is preserved only for directed edges, where `source` is the memory at the
+    /// superseding end.
+    async fn links_of(&self, id: &MemoryId) -> Result<Vec<Link>, Error>;
+    /// Every edge in the store, deduplicated, for export.
+    async fn links_all(&self) -> Result<Vec<Link>, Error>;
 }
 
 pub trait Embedder {

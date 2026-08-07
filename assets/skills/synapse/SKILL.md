@@ -74,7 +74,7 @@ Datadog dashboard link over log tailing.
 
 A store that only grows becomes noise, and once the user stops reading the digest
 you have lost the channel, not just one fact. So recording is tending a network,
-not appending to a log. Four moves:
+not appending to a log. Five moves:
 
 | Move | Command | When |
 | --- | --- | --- |
@@ -82,9 +82,39 @@ not appending to a log. Four moves:
 | **Strengthen** | `syn edit <id>` | a synapse is nearly right and this sharpens it — two half-true synapses on one topic are worse than either alone |
 | **Prune** | `syn forget <id>` | a decision made an old synapse false; a retirement invalidates synapses, it does not merely add one |
 | **Rewire** | `syn move <id>` | true, but filed where the sessions that need it will never look |
+| **Link** | `syn relate/support/contradict`, `syn supersede` | recall surfaces a memory this fact is genuinely related to — neither Strengthen nor Prune applies, but the two belong together |
 
 Recall the topic first. Not as a rule to obey — it is the only way to know which
-of the four you are in.
+of the five you are in.
+
+### Linking memories
+
+When recall surfaces a memory this fact is **genuinely related to** — not merely
+same-topic, but actually connected — and neither Strengthen nor Prune applies,
+record the relationship instead of leaving it implicit. Linking is how the graph
+becomes traversable: a recall on one memory surfaces its linked neighbours, and
+`syn links <id>` walks the graph, so a related memory is reachable even when
+semantic search would never surface it.
+
+Pick the edge type by how confident you are about the nature of the relationship.
+When unsure, default to the weakest claim rather than guessing a specific one:
+
+- `syn support <A> <B>` — one memory is evidence for the other (positive).
+- `syn contradict <A> <B>` — the two memories disagree; a hint one may be stale.
+- `syn supersede --old <B> --new <A>` — the new fact replaces the old one (directed;
+  the superseded memory stops surfacing on its own but stays reachable).
+- `syn relate <A> <B>` — related in a way you can't characterise further. Use this
+  by default; upgrade to a specific type only when you're confident of it.
+
+The relevance bar is the guard against a noise bucket: link only when the two are
+**genuinely related**, not merely on the same topic. A `relation` edge between
+anything topically adjacent is how the graph drowns in edges nobody reads. When
+the relationship is real but a specific type feels forced, `relate` is the honest
+move — a weak-but-real edge beats an overstated one.
+
+Undo with `syn unlink <A> <B>`. The map owes it to the graph, not to cleanliness:
+a link is cheap to create and cheap to remove, and both remain searchable either
+way.
 
 ## 3. Pick the scope
 
@@ -197,18 +227,25 @@ the conversation that produced it.
 ## Reference
 
 ```
-syn edit <id> "<corrected fact>"
+syn edit <id> --content "<corrected fact>"
 syn forget <id>
 syn move <id> --to <workspace>   # filed in the wrong workspace
 syn move <id> --to everywhere    # should hold in every workspace
 syn pin <id> / syn unpin <id>    # keep it in the session-start digest
 syn show <id> / syn list
+syn relate <A> <B>               # generic relationship (default)
+syn support <A> <B>              # one backs the other
+syn contradict <A> <B>           # they disagree
+syn supersede --old <B> --new <A>  # the new fact replaces the old
+syn unlink <A> <B>               # drop whatever link(s) exist between them
+syn links <id> --depth N         # walk the graph around a memory (JSON, JGF v2)
 ```
 
 `syn move` keeps the id, the content and the original creation date, so prefer it
 to forget-and-re-save when a synapse is merely in the wrong place. Its source
 flags say where the synapse *is* (`--workspace`, `--scope everywhere`), its `--to`
-says where it belongs.
+says where it belongs. A link lives inside one store, so moving a linked synapse drops
+its edges — `syn move` says how many — and re-linking in the new store is on you.
 
 Every command acts on one store, so say which — read it off the hit line:
 `(work · fresha/offers, …)` → `--workspace work`; `(everywhere, …)` →

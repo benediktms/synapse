@@ -30,6 +30,18 @@ pub enum Command {
     List(ListArgs),
     /// Show a single memory
     Show(IdArgs),
+    /// Dump the linked-neighbors graph around a memory as JSON (JGF v2)
+    Links(LinksArgs),
+    /// Link two memories as generically related (bidirectional)
+    Relate(LinkPairArgs),
+    /// Link two memories, one supporting the other (bidirectional)
+    Support(LinkPairArgs),
+    /// Link two memories as contradicting each other (bidirectional)
+    Contradict(LinkPairArgs),
+    /// Mark one memory as superseding another (directed; de-ranks the superseded one)
+    Supersede(SupersedeArgs),
+    /// Remove whatever link(s) exist between two memories
+    Unlink(LinkPairArgs),
     /// Pin a memory into the digest
     Pin(IdArgs),
     /// Remove a memory from the digest
@@ -126,6 +138,9 @@ pub struct RecallArgs {
     pub all_workspaces: bool,
     #[arg(long)]
     pub project: Option<String>,
+    /// Only surface linked neighbors within the recall's scope (default: cross-scope links surface)
+    #[arg(long)]
+    pub links_in_scope: bool,
 }
 
 #[derive(Debug, Args)]
@@ -139,17 +154,64 @@ pub struct ContextArgs {
 #[derive(Debug, Args)]
 pub struct EditArgs {
     pub id: String,
-    pub content: String,
+    /// New content (memory edit); may be combined with --relation/--type to also retype a link
+    #[arg(long)]
+    pub content: Option<String>,
     /// New importance tier for the memory
     #[arg(long, value_name = "TIER", value_parser = clap::builder::PossibleValuesParser::new(tiers()))]
     pub importance: Option<String>,
+    /// Other endpoint of the link to retype (requires --type)
+    #[arg(long, requires = "type_")]
+    pub relation: Option<String>,
+    /// Retype an existing link (with --relation) to this type: relation/support/contradiction/supersession
+    #[arg(long, value_name = "TYPE", value_parser = clap::builder::PossibleValuesParser::new(relation_types()))]
+    pub type_: Option<String>,
     #[command(flatten)]
     pub store: StoreArgs,
+}
+
+fn relation_types() -> Vec<clap::builder::PossibleValue> {
+    ["relation", "support", "contradiction", "supersession"]
+        .iter()
+        .map(|s| clap::builder::PossibleValue::new(*s))
+        .collect()
 }
 
 #[derive(Debug, Args)]
 pub struct IdArgs {
     pub id: String,
+    #[command(flatten)]
+    pub store: StoreArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct LinksArgs {
+    pub id: String,
+    /// How many hops of the graph to expand (default 2)
+    #[arg(long, default_value_t = 2)]
+    pub depth: usize,
+    #[command(flatten)]
+    pub store: StoreArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct LinkPairArgs {
+    /// First memory id
+    pub a: String,
+    /// Second memory id
+    pub b: String,
+    #[command(flatten)]
+    pub store: StoreArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct SupersedeArgs {
+    /// The memory being superseded (the old one)
+    #[arg(long)]
+    pub old: String,
+    /// The memory that supersedes it (the new one)
+    #[arg(long)]
+    pub new: String,
     #[command(flatten)]
     pub store: StoreArgs,
 }

@@ -7,8 +7,9 @@ use adapters_fastembed::FastEmbedder;
 use adapters_sqlite::SqliteStore;
 use api::{Backend, BackendError, RestoreReport};
 use domain::{
-    ContextDigest, EditRequest, Embedder, Error, Memory, MemoryId, MoveOutcome, RecallHit,
-    RecallRequest, SaveOutcome, SaveRequest, Timestamp, Workspace, WorkspaceHits,
+    ContextDigest, EditRequest, Embedder, Error, GraphEdge, GraphSubgraph, Link, Memory, MemoryId,
+    MoveOutcome, RecallHit, RecallRequest, Relation, SaveOutcome, SaveRequest, Timestamp,
+    Workspace, WorkspaceHits,
 };
 use tokio::sync::RwLock;
 
@@ -24,6 +25,9 @@ struct AppInner {
     embedder: Arc<FastEmbedder>,
     stores: RwLock<HashMap<Workspace, Arc<SqliteStore>>>,
     ready: Result<(), String>,
+    /// Serializes link mutations (cycle check + insert) so two concurrent supersessions can't
+    /// both observe an acyclic graph and then both insert, closing the TOCTOU race.
+    links_mutation: tokio::sync::Mutex<()>,
 }
 
 impl App {
@@ -73,6 +77,7 @@ impl App {
                 embedder,
                 stores: RwLock::new(stores),
                 ready,
+                links_mutation: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -186,6 +191,7 @@ impl Backend for App {
         to: &Workspace,
         id: &MemoryId,
     ) -> Result<MoveOutcome, BackendError> {
+        let _guard = self.inner.links_mutation.lock().await;
         let source = self.store(from).await?;
         let target = self.store(to).await?;
         domain::move_memory((from, &*source), (to, &*target), id, self.now())
@@ -248,14 +254,83 @@ impl Backend for App {
             .map_err(Into::into)
     }
 
+    async fn links(
+        &self,
+        ws: &Workspace,
+        id: &MemoryId,
+        depth: usize,
+    ) -> Result<GraphSubgraph, BackendError> {
+        let (active, _) = self.active_and_shared(ws).await?;
+        domain::graph_subgraph(&*active, id, depth)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn links_all(&self, ws: &Workspace) -> Result<Vec<GraphEdge>, BackendError> {
+        use domain::Store;
+        let (active, _) = self.active_and_shared(ws).await?;
+        let links = active.links_all().await.map_err(BackendError::Domain)?;
+        Ok(links
+            .into_iter()
+            .map(|link| GraphEdge {
+                source: link.source,
+                target: link.target,
+                relation: link.relation,
+                directed: link.relation.is_directed(),
+            })
+            .collect())
+    }
+
+    async fn link(
+        &self,
+        ws: &Workspace,
+        source: &MemoryId,
+        target: &MemoryId,
+        relation: Relation,
+    ) -> Result<(), BackendError> {
+        let _guard = self.inner.links_mutation.lock().await;
+        let (active, _) = self.active_and_shared(ws).await?;
+        domain::link(&*active, source, target, relation)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn unlink(
+        &self,
+        ws: &Workspace,
+        a: &MemoryId,
+        b: &MemoryId,
+    ) -> Result<usize, BackendError> {
+        let _guard = self.inner.links_mutation.lock().await;
+        let (active, _) = self.active_and_shared(ws).await?;
+        domain::unlink(&*active, a, b).await.map_err(Into::into)
+    }
+
+    async fn retype_link(
+        &self,
+        ws: &Workspace,
+        a: &MemoryId,
+        b: &MemoryId,
+        relation: Relation,
+    ) -> Result<(), BackendError> {
+        let _guard = self.inner.links_mutation.lock().await;
+        let (active, _) = self.active_and_shared(ws).await?;
+        domain::retype_link(&*active, a, b, relation)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn restore(
         &self,
         ws: &Workspace,
         memories: Vec<Memory>,
+        links: Vec<Link>,
     ) -> Result<RestoreReport, BackendError> {
         use domain::Store;
         let store = self.store(ws).await?;
         let mut report = RestoreReport::default();
+        let _guard = self.inner.links_mutation.lock().await;
+        domain::check_import_acyclic(&store.links_all().await?, &links)?;
         for memory in memories {
             if let Some(existing) = store.get(&memory.id).await? {
                 let same_payload = existing.content == memory.content
@@ -271,6 +346,13 @@ impl Backend for App {
             let embedding = self.inner.embedder.embed(&memory.content).await?;
             store.insert(&memory, &embedding).await?;
             report.imported += 1;
+        }
+        // Recreate links through the same serialized, cycle-checked path as ordinary mutations,
+        // so a dump's A→B + B→A (or a merge cycle) is rejected, not smuggled past the guard.
+        for link in links {
+            domain::link(&*store, &link.source, &link.target, link.relation)
+                .await
+                .map_err(BackendError::Domain)?;
         }
         Ok(report)
     }

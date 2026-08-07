@@ -25,13 +25,12 @@ impl GitFacts {
     /// `Ok(None)` when cwd is not in a working tree; `Err` when git could not be
     /// asked at all, or answered something unparseable.
     pub fn discover(cwd: &Path) -> Result<Option<Self>, String> {
-        let deadline = Instant::now() + DEADLINE;
-        let Some(inner) = structural(cwd, deadline)? else {
+        let Some(inner) = structural(cwd)? else {
             return Ok(None);
         };
         let toplevel = inner.toplevel.clone();
-        let anchor = outermost_anchor(inner, deadline)?;
-        let slug = origin_slug(&toplevel, deadline)?;
+        let anchor = outermost_anchor(inner)?;
+        let slug = origin_slug(&toplevel)?;
         let owner = slug
             .as_deref()
             .and_then(|slug| slug.split('/').next())
@@ -59,7 +58,7 @@ struct Structural {
 // but git refuses to use it" (missing gitdir, safe.directory, GIT_CEILING_DIRECTORIES) —
 // a `.git` entry on an ancestor disambiguates it to the latter, a routing error rather
 // than a silent absence.
-fn structural(dir: &Path, deadline: Instant) -> Result<Option<Structural>, String> {
+fn structural(dir: &Path) -> Result<Option<Structural>, String> {
     let output = run_git(
         dir,
         &[
@@ -70,7 +69,6 @@ fn structural(dir: &Path, deadline: Instant) -> Result<Option<Structural>, Strin
             "--show-toplevel",
             "--show-superproject-working-tree",
         ],
-        deadline,
     )?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -106,11 +104,11 @@ fn structural(dir: &Path, deadline: Instant) -> Result<Option<Structural>, Strin
     }
 }
 
-fn outermost_anchor(mut tree: Structural, deadline: Instant) -> Result<PathBuf, String> {
+fn outermost_anchor(mut tree: Structural) -> Result<PathBuf, String> {
     let mut visited = HashSet::from([tree.toplevel.clone()]);
     for _ in 0..MAX_SUPERPROJECT_DEPTH {
         let Some(superproject) = tree.superproject.clone() else {
-            return primary_worktree(&tree, deadline);
+            return primary_worktree(&tree);
         };
         if superproject == tree.toplevel
             || !starts_with_components(&tree.toplevel, &superproject)
@@ -122,7 +120,7 @@ fn outermost_anchor(mut tree: Structural, deadline: Instant) -> Result<PathBuf, 
                 tree.toplevel.display()
             ));
         }
-        tree = structural(&superproject, deadline)?.ok_or_else(|| {
+        tree = structural(&superproject)?.ok_or_else(|| {
             format!(
                 "superproject {} is not a working tree",
                 superproject.display()
@@ -135,15 +133,11 @@ fn outermost_anchor(mut tree: Structural, deadline: Instant) -> Result<PathBuf, 
     ))
 }
 
-fn primary_worktree(tree: &Structural, deadline: Instant) -> Result<PathBuf, String> {
+fn primary_worktree(tree: &Structural) -> Result<PathBuf, String> {
     if canonical(&tree.git_dir) == canonical(&tree.common_dir) {
         return Ok(tree.toplevel.clone());
     }
-    let output = run_git(
-        &tree.toplevel,
-        &["worktree", "list", "--porcelain"],
-        deadline,
-    )?;
+    let output = run_git(&tree.toplevel, &["worktree", "list", "--porcelain"])?;
     if !output.status.success() {
         return Err(format!(
             "git worktree list failed in {}: {}",
@@ -172,15 +166,16 @@ fn has_dot_git_ancestor(dir: &Path) -> bool {
     canonical(dir).ancestors().any(|d| d.join(".git").exists())
 }
 
-fn origin_slug(dir: &Path, deadline: Instant) -> Result<Option<String>, String> {
-    let output = run_git(dir, &["config", "--get", "remote.origin.url"], deadline)?;
+fn origin_slug(dir: &Path) -> Result<Option<String>, String> {
+    let output = run_git(dir, &["config", "--get", "remote.origin.url"])?;
+
     if !output.status.success() {
         return Ok(None);
     }
     Ok(parse_origin_url(&String::from_utf8_lossy(&output.stdout)))
 }
 
-fn run_git(dir: &Path, args: &[&str], deadline: Instant) -> Result<Output, String> {
+fn run_git(dir: &Path, args: &[&str]) -> Result<Output, String> {
     let child = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -194,6 +189,10 @@ fn run_git(dir: &Path, args: &[&str], deadline: Instant) -> Result<Output, Strin
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not run git: {e}"))?;
+    // Deadline starts after spawn: the probe does a short pipeline of git calls, and counting
+    // process-spawn latency against a child's window would let a fast call under load be killed
+    // before it runs. This still bounds a hung git at one DEADLINE per call.
+    let deadline = Instant::now() + DEADLINE;
     output_by(child, deadline)
 }
 

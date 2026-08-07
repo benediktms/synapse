@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT low_id AS \"low_id!\", high_id AS \"high_id!\", relation AS \"relation!\" FROM links WHERE low_id = ? OR high_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "low_id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "high_id!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "relation!",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4a386590355cbae8580bf43d0836590fd7a1eb71969ed8af195a824c7fd87daa"
+}

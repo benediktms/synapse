@@ -305,6 +305,136 @@ async fn search_fuses_and_respects_workspace_isolation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn search_hits_carry_a_neighbors_array_and_accept_links_scope() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    put_memory(&router, "work", 1, "argocd deploy to staging for offers").await;
+
+    // Default: hits include a (here empty) neighbors array.
+    let (status, body) = req(
+        &router,
+        Method::GET,
+        "/memories/search?ws=work&q=deploy%20staging",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hit = body["hits"][0].as_object().expect("hit object");
+    assert!(
+        hit.contains_key("neighbors"),
+        "recall hit is missing the neighbors field: {body}"
+    );
+    assert_eq!(hit["neighbors"], json!([]));
+
+    // The links_scope route param is accepted (cross-scope neighbor tightening flag).
+    let (status, _) = req(
+        &router,
+        Method::GET,
+        "/memories/search?ws=work&q=deploy&links_scope=true",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn links_route_returns_a_jgf_graph_and_validates_depth() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    put_memory(&router, "work", 1, "argocd deploy to staging").await;
+
+    // A single memory with no links -> a JGF graph with just the root.
+    let (status, body) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}/links?ws=work", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["graph"]["metadata"]["root"], mid(1));
+    assert_eq!(body["graph"]["metadata"]["depth"], 2);
+    assert_eq!(body["graph"]["metadata"]["truncated"], false);
+    assert_eq!(body["graph"]["edges"].as_array().unwrap().len(), 0);
+    assert!(body["graph"]["nodes"][&mid(1)]["label"].is_string());
+
+    // Depth is bounded at MAX_GRAPH_DEPTH.
+    let (status, _) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}/links?ws=work&depth=99", mid(1)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Unknown memory is a not-found.
+    let (status, _) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}/links?ws=work", mid(999)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_mutation_create_retype_unlink_over_http() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    put_memory(&router, "work", 1, "old deploy process").await;
+    put_memory(&router, "work", 2, "new deploy process").await;
+
+    let links_url = |a: u32| format!("/memories/{}/links?ws=work", mid(a));
+    let link_body =
+        |target: u32, relation: &str| json!({ "target": mid(target), "relation": relation });
+
+    let (status, _) = req(
+        &router,
+        Method::POST,
+        &links_url(2),
+        Some(link_body(1, "supersession")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = req(&router, Method::GET, &links_url(1), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let edges = body["graph"]["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["relation"], "supersession");
+    assert_eq!(edges[0]["directed"], true);
+
+    let (status, _) = req(
+        &router,
+        Method::PATCH,
+        &links_url(2),
+        Some(link_body(1, "support")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = req(&router, Method::GET, &links_url(1), None).await;
+    let edges = body["graph"]["edges"].as_array().unwrap();
+    assert_eq!(edges[0]["relation"], "support");
+    assert_eq!(edges[0]["directed"], false);
+
+    let (status, _) = req(
+        &router,
+        Method::DELETE,
+        &format!("/memories/{}/links?ws=work&target={}", mid(1), mid(2)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = req(&router, Method::GET, &links_url(1), None).await;
+    assert_eq!(body["graph"]["edges"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn shared_is_not_addressable_as_a_workspace() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;
@@ -901,11 +1031,23 @@ async fn export_import_round_trip_and_merge_idempotency() {
         Some(json!({ "pinned": true })),
     )
     .await;
+    req(
+        &router,
+        Method::POST,
+        &format!("/memories/{}/links?ws=work", mid(2)),
+        Some(json!({ "target": mid(1), "relation": "supersession" })),
+    )
+    .await;
 
     let (status, export) = req(&router, Method::GET, "/export?ws=work", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(export["version"], 1);
+    assert_eq!(export["version"], 2);
     assert_eq!(export["memories"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        export["links"].as_array().unwrap().len(),
+        1,
+        "export must carry the graph"
+    );
 
     let (status, report) = req(
         &router,
@@ -923,6 +1065,18 @@ async fn export_import_round_trip_and_merge_idempotency() {
         export["memories"], restored["memories"],
         "round trip drifted"
     );
+    assert_eq!(
+        export["links"], restored["links"],
+        "links must round-trip through export/import"
+    );
+    let (_, graph) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}/links?ws=restore", mid(2)),
+        None,
+    )
+    .await;
+    assert_eq!(graph["graph"]["edges"].as_array().unwrap().len(), 1);
 
     let (status, report) = req(
         &router,
@@ -999,6 +1153,188 @@ async fn export_import_round_trip_and_merge_idempotency() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn import_accepts_v1_dumps_as_linkless() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/old", None).await;
+
+    let v1 = json!({
+        "version": 1,
+        "origin": { "workspace": "old" },
+        "memories": [{
+            "id": mid(1),
+            "content": "backup made before links existed",
+            "kind": "project",
+            "scope": "workspace",
+            "tags": [],
+            "pinned": false,
+            "created_at": "2026-07-01T00:00:00Z",
+            "updated_at": "2026-07-01T00:00:00Z",
+        }],
+    });
+    let (status, report) = req(&router, Method::POST, "/import?ws=old", Some(v1)).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["imported"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn import_rejects_a_supersession_cycle_in_the_dump() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/cyc", None).await;
+
+    let doc = json!({
+        "version": 2,
+        "origin": { "workspace": "cyc" },
+        "memories": [
+            { "id": mid(1), "content": "a", "kind": "project", "scope": "workspace",
+              "tags": [], "pinned": false, "created_at": "2026-07-01T00:00:00Z",
+              "updated_at": "2026-07-01T00:00:00Z" },
+            { "id": mid(2), "content": "b", "kind": "project", "scope": "workspace",
+              "tags": [], "pinned": false, "created_at": "2026-07-01T00:00:00Z",
+              "updated_at": "2026-07-01T00:00:00Z" },
+        ],
+        "links": [
+            { "source": mid(1), "relation": "supersession", "target": mid(2), "directed": true },
+            { "source": mid(2), "relation": "supersession", "target": mid(1), "directed": true },
+        ],
+    });
+    let (status, body) = req(&router, Method::POST, "/import?ws=cyc", Some(doc)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a cyclic supersession dump must be rejected: {body}"
+    );
+
+    let (status, listed) = req(&router, Method::GET, "/memories?ws=cyc", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        listed["memories"].as_array().unwrap().is_empty(),
+        "a rejected import must leave nothing behind: {listed}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn move_drops_links_and_reports_how_many() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    req(&router, Method::PUT, "/workspaces/personal", None).await;
+    put_memory(&router, "work", 1, "old deploy process").await;
+    put_memory(&router, "work", 2, "new deploy process").await;
+    req(
+        &router,
+        Method::POST,
+        &format!("/memories/{}/links?ws=work", mid(2)),
+        Some(json!({ "target": mid(1), "relation": "supersession" })),
+    )
+    .await;
+
+    let (status, body) = move_memory(
+        &router,
+        1,
+        json!({ "workspace": "work" }),
+        json!({ "workspace": "personal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["moved"], true);
+    assert_eq!(
+        body["links_dropped"], 1,
+        "a dropped edge must be reported, not silent: {body}"
+    );
+    let (status, left_behind) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}/links?ws=work", mid(2)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        left_behind["graph"]["edges"].as_array().unwrap().is_empty(),
+        "the edge cannot survive with its endpoint in another store: {left_behind}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preference_import_refuses_links_no_route_can_reach() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+
+    let doc = json!({
+        "version": 2,
+        "origin": "preference",
+        "memories": [
+            { "id": mid(1), "content": "prefers ripgrep", "kind": "user", "scope": "workspace",
+              "tags": [], "pinned": false, "created_at": "2026-07-01T00:00:00Z",
+              "updated_at": "2026-07-01T00:00:00Z" },
+            { "id": mid(2), "content": "prefers fd", "kind": "user", "scope": "workspace",
+              "tags": [], "pinned": false, "created_at": "2026-07-01T00:00:00Z",
+              "updated_at": "2026-07-01T00:00:00Z" },
+        ],
+        "links": [
+            { "source": mid(1), "relation": "supersession", "target": mid(2), "directed": true },
+        ],
+    });
+    let (status, body) = req(&router, Method::POST, "/preferences/import", Some(doc)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a preference dump must not smuggle in unreachable edges: {body}"
+    );
+    let (_, listed) = req(&router, Method::GET, "/preferences", None).await;
+    assert!(
+        listed["memories"].as_array().unwrap().is_empty(),
+        "{listed}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_import_conflicts_on_a_link_the_dump_lacks() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    put_memory(&router, "work", 1, "old deploy process").await;
+    put_memory(&router, "work", 2, "new deploy process").await;
+
+    let (_, linkless) = req(&router, Method::GET, "/export?ws=work", None).await;
+    req(
+        &router,
+        Method::POST,
+        &format!("/memories/{}/links?ws=work", mid(2)),
+        Some(json!({ "target": mid(1), "relation": "supersession" })),
+    )
+    .await;
+
+    let (status, body) = req(
+        &router,
+        Method::POST,
+        "/import?ws=work",
+        Some(linkless.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a default restore must not leave a link the dump never held: {body}"
+    );
+
+    let (status, body) = req(
+        &router,
+        Method::POST,
+        "/import?ws=work&mode=merge",
+        Some(linkless),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "merge keeps unrelated state: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn import_keeps_preferences_and_workspaces_apart() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;
@@ -1069,7 +1405,7 @@ async fn import_normalizes_timestamps_and_rejects_impossible_ones() {
 
     let dump = |created: &str, updated: &str| {
         json!({
-            "version": 1,
+            "version": 2,
             "origin": { "workspace": "restore" },
             "memories": [{
                 "id": mid(1),

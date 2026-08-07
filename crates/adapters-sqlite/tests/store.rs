@@ -1,6 +1,7 @@
 use adapters_sqlite::SqliteStore;
 use domain::{
-    EditRequest, Error, Memory, MemoryId, MemoryKind, Scope, ScopeFilter, Store, Timestamp,
+    EditRequest, Error, Link, Memory, MemoryId, MemoryKind, Relation, Scope, ScopeFilter, Store,
+    Timestamp,
 };
 use tempfile::TempDir;
 
@@ -550,4 +551,218 @@ async fn concurrent_writes_do_not_surface_sqlite_busy() {
         handle.await.unwrap();
     }
     assert_eq!(store.list().await.unwrap().len(), 8 * 20);
+}
+
+#[tokio::test]
+async fn link_crud_bidirectional_canonicalizes_and_dedupes() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let a = MemoryId::generate();
+    let b = MemoryId::generate();
+    store
+        .insert(&mem(&a, "alpha", Scope::Workspace), &vec4(0.1))
+        .await
+        .unwrap();
+    store
+        .insert(&mem(&b, "beta", Scope::Workspace), &vec4(0.2))
+        .await
+        .unwrap();
+
+    // Reversed insertion collapses to one canonical row.
+    store
+        .insert_link(&Link {
+            source: b.clone(),
+            target: a.clone(),
+            relation: Relation::Support,
+        })
+        .await
+        .unwrap();
+    store
+        .insert_link(&Link {
+            source: a.clone(),
+            target: b.clone(),
+            relation: Relation::Support,
+        })
+        .await
+        .unwrap();
+
+    let from_a = store.links_of(&a).await.unwrap();
+    assert_eq!(from_a.len(), 1);
+    // Canonical: source is the lexicographically-lower id.
+    let (lo, hi) = if a < b { (&a, &b) } else { (&b, &a) };
+    assert_eq!(from_a[0].source, *lo);
+    assert_eq!(from_a[0].target, *hi);
+    assert_eq!(from_a[0].relation, Relation::Support);
+
+    // Same pair, different relation types coexist.
+    store
+        .insert_link(&Link {
+            source: a.clone(),
+            target: b.clone(),
+            relation: Relation::Contradiction,
+        })
+        .await
+        .unwrap();
+    let from_b = store.links_of(&b).await.unwrap();
+    assert_eq!(from_b.len(), 2);
+}
+
+#[tokio::test]
+async fn link_supersession_preserves_direction() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let old = MemoryId::generate();
+    let new = MemoryId::generate();
+    store
+        .insert(
+            &mem(&old, "old", Scope::Project("acme/web".into())),
+            &vec4(0.1),
+        )
+        .await
+        .unwrap();
+    store
+        .insert(&mem(&new, "new", Scope::Workspace), &vec4(0.2))
+        .await
+        .unwrap();
+
+    store
+        .insert_link(&Link {
+            source: new.clone(),
+            target: old.clone(),
+            relation: Relation::Supersession,
+        })
+        .await
+        .unwrap();
+
+    let from_new = store.links_of(&new).await.unwrap();
+    assert_eq!(from_new.len(), 1);
+    assert_eq!(from_new[0].source, new);
+    assert_eq!(from_new[0].target, old);
+    assert_eq!(from_new[0].relation, Relation::Supersession);
+
+    // The superseded memory sees the same edge from its side.
+    let from_old = store.links_of(&old).await.unwrap();
+    assert_eq!(from_old, from_new);
+}
+
+#[tokio::test]
+async fn link_insert_requires_existing_memories() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let present = MemoryId::generate();
+    let absent = MemoryId::generate();
+    store
+        .insert(&mem(&present, "here", Scope::Workspace), &vec4(0.1))
+        .await
+        .unwrap();
+
+    let err = store
+        .insert_link(&Link {
+            source: present.clone(),
+            target: absent.clone(),
+            relation: Relation::Relation,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)));
+}
+
+#[tokio::test]
+async fn link_delete_between_removes_all_relations() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let a = MemoryId::generate();
+    let b = MemoryId::generate();
+    store
+        .insert(&mem(&a, "a", Scope::Workspace), &vec4(0.1))
+        .await
+        .unwrap();
+    store
+        .insert(&mem(&b, "b", Scope::Workspace), &vec4(0.2))
+        .await
+        .unwrap();
+
+    for rel in [
+        Relation::Relation,
+        Relation::Support,
+        Relation::Supersession,
+    ] {
+        store
+            .insert_link(&Link {
+                source: a.clone(),
+                target: b.clone(),
+                relation: rel,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.links_of(&a).await.unwrap().len(), 3);
+
+    let removed = store.delete_links_between(&a, &b).await.unwrap();
+    assert_eq!(removed, 3);
+    assert!(store.links_of(&a).await.unwrap().is_empty());
+
+    // Idempotent: deleting again removes nothing.
+    assert_eq!(store.delete_links_between(&a, &b).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn supersession_engine_cycle_guard_and_derived_pin() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let mut old = mem(&MemoryId::generate(), "old fact", Scope::Workspace);
+    old.pinned = true;
+    let new = MemoryId::generate();
+    store.insert(&old, &vec4(0.1)).await.unwrap();
+    store
+        .insert(&mem(&new, "new fact", Scope::Workspace), &vec4(0.2))
+        .await
+        .unwrap();
+
+    // new supersedes old -> old becomes superseded, new effectively pinned (old was pinned).
+    domain::link(&store, &new, &old.id, Relation::Supersession)
+        .await
+        .unwrap();
+    let old_mem = store.get(&old.id).await.unwrap().unwrap();
+    let new_mem = store.get(&new).await.unwrap().unwrap();
+    assert!(domain::is_superseded(&store, &old.id).await.unwrap());
+    assert!(domain::effective_pinned(&store, &new_mem).await.unwrap());
+    assert!(!domain::effective_pinned(&store, &old_mem).await.unwrap() || old_mem.pinned);
+
+    // Breaking the edge reverses the derived pin on `new`.
+    domain::unlink(&store, &new, &old.id).await.unwrap();
+    let new_mem = store.get(&new).await.unwrap().unwrap();
+    assert!(!domain::effective_pinned(&store, &new_mem).await.unwrap());
+    assert!(!domain::is_superseded(&store, &old.id).await.unwrap());
+}
+
+#[tokio::test]
+async fn forget_cascades_away_links_on_either_endpoint() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let a = MemoryId::generate();
+    let b = MemoryId::generate();
+    store
+        .insert(&mem(&a, "a", Scope::Workspace), &vec4(0.1))
+        .await
+        .unwrap();
+    store
+        .insert(&mem(&b, "b", Scope::Workspace), &vec4(0.2))
+        .await
+        .unwrap();
+    store
+        .insert_link(&Link {
+            source: a.clone(),
+            target: b.clone(),
+            relation: Relation::Support,
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.links_of(&a).await.unwrap().len(), 1);
+
+    store.delete(&a).await.unwrap();
+    assert!(
+        store.links_of(&b).await.unwrap().is_empty(),
+        "edge must cascade away"
+    );
 }

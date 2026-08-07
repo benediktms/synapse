@@ -9,8 +9,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use domain::{
-    EditRequest, Importance, Memory, MemoryId, MemoryKind, RECALL_LIMIT_CAP, RecallRequest,
-    SaveOutcome, SaveRequest, Scope, Workspace,
+    EditRequest, Importance, Link, MAX_GRAPH_DEPTH, Memory, MemoryId, MemoryKind, RECALL_LIMIT_CAP,
+    RecallRequest, Relation, SaveOutcome, SaveRequest, Scope, Workspace,
 };
 use serde::Deserialize;
 use tower_http::timeout::TimeoutLayer;
@@ -19,9 +19,10 @@ use tracing::Level;
 
 use crate::backend::Backend;
 use crate::dto::{
-    ContextResponse, EXPORT_VERSION, ExportDoc, HealthResponse, HitDto, HitGroupDto, ImportReport,
-    ListResponse, MemoryDto, MoveBody, MoveResponse, Origin, PatchMemoryBody, PutMemoryBody,
-    PutPreferenceBody, SearchResponse, WorkspaceDto, WorkspacesResponse,
+    ContextResponse, EXPORT_VERSION, ExportDoc, GraphDto, HealthResponse, HitDto, HitGroupDto,
+    ImportReport, LinkDto, ListResponse, MemoryDto, MoveBody, MoveResponse, Origin,
+    PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse, WorkspaceDto,
+    WorkspacesResponse,
 };
 use crate::error::ApiError;
 use crate::validate::{normalize_timestamp, validate_content, validate_query, validate_tags};
@@ -30,6 +31,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(600);
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
+const DEFAULT_GRAPH_DEPTH: usize = 2;
 const UNREADY_PUBLIC_REASON: &str = "server is not ready; see server logs for detail";
 
 pub struct AppState<B> {
@@ -72,6 +74,13 @@ pub fn router<B: Backend>(backend: B, token: &str) -> Router {
                 .get(get_memory::<B>),
         )
         .route("/memories/{id}/move", axum::routing::post(move_memory::<B>))
+        .route(
+            "/memories/{id}/links",
+            get(links::<B>)
+                .post(create_link::<B>)
+                .patch(retype_link::<B>)
+                .delete(delete_link::<B>),
+        )
         .route("/memories", get(list_memories::<B>))
         .route("/memories/search", get(search::<B>))
         .route(
@@ -315,6 +324,8 @@ struct SearchParams {
     scope: Option<String>,
     limit: Option<usize>,
     all: Option<bool>,
+    /// true: only surface linked neighbors within the recall's scope. Default false.
+    links_scope: Option<bool>,
 }
 
 async fn search<B: Backend>(
@@ -337,6 +348,7 @@ async fn search<B: Backend>(
         query: query.to_string(),
         project: parse_project(params.scope.as_deref())?,
         limit,
+        links_in_scope: params.links_scope.unwrap_or(false),
     };
     if params.all.unwrap_or(false) {
         let groups = state.backend.recall_all(&request).await?;
@@ -454,6 +466,7 @@ async fn move_memory<B: Backend>(
         from: body.from,
         to: body.to,
         from_scope: outcome.from_scope.as_str().to_string(),
+        links_dropped: outcome.links_dropped,
         memory: MemoryDto::from(&outcome.memory),
     }))
 }
@@ -479,6 +492,80 @@ async fn get_memory<B: Backend>(
 ) -> Result<Json<MemoryDto>, ApiError> {
     let ws = require_ws(&query)?;
     fetch_in(&state, &ws, &id).await
+}
+
+#[derive(Deserialize)]
+struct LinksQuery {
+    ws: Option<String>,
+    depth: Option<usize>,
+    target: Option<String>,
+}
+
+async fn links<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Query(query): Query<LinksQuery>,
+) -> Result<Json<GraphDto>, ApiError> {
+    let ws = require_ws(&WsQuery { ws: query.ws })?;
+    let id = MemoryId::parse(&id)?;
+    let depth = query.depth.unwrap_or(DEFAULT_GRAPH_DEPTH);
+    if depth > MAX_GRAPH_DEPTH {
+        return Err(ApiError::BadRequest(format!(
+            "depth must be at most {MAX_GRAPH_DEPTH}"
+        )));
+    }
+    let sub = state.backend.links(&ws, &id, depth).await?;
+    Ok(Json(GraphDto::from(&sub)))
+}
+
+/// Body for creating or retyping a link: the other endpoint and the noun relation.
+#[derive(Deserialize)]
+struct LinkBody {
+    target: String,
+    relation: String,
+}
+
+async fn create_link<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Query(query): Query<WsQuery>,
+    Json(body): Json<LinkBody>,
+) -> Result<StatusCode, ApiError> {
+    let ws = require_ws(&query)?;
+    let source = MemoryId::parse(&id)?;
+    let target = MemoryId::parse(&body.target)?;
+    let relation = Relation::parse(&body.relation)?;
+    state.backend.link(&ws, &source, &target, relation).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn retype_link<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Query(query): Query<WsQuery>,
+    Json(body): Json<LinkBody>,
+) -> Result<StatusCode, ApiError> {
+    let ws = require_ws(&query)?;
+    let a = MemoryId::parse(&id)?;
+    let b = MemoryId::parse(&body.target)?;
+    let relation = Relation::parse(&body.relation)?;
+    state.backend.retype_link(&ws, &a, &b, relation).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_link<B: Backend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    Query(query): Query<LinksQuery>,
+) -> Result<StatusCode, ApiError> {
+    let ws = require_ws(&WsQuery { ws: query.ws })?;
+    let a = MemoryId::parse(&id)?;
+    let target = query
+        .target
+        .ok_or_else(|| ApiError::BadRequest("missing required query parameter: target".into()))?;
+    let b = MemoryId::parse(&target)?;
+    state.backend.unlink(&ws, &a, &b).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_preference<B: Backend>(
@@ -517,10 +604,12 @@ async fn export_in<B: Backend>(
     ws: &Workspace,
 ) -> Result<Json<ExportDoc>, ApiError> {
     let memories = state.backend.list(ws).await?;
+    let links = state.backend.links_all(ws).await?;
     Ok(Json(ExportDoc {
         version: EXPORT_VERSION,
         origin: Origin::of(ws),
         memories: memories.iter().map(MemoryDto::from).collect(),
+        links: links.iter().map(LinkDto::from).collect(),
     }))
 }
 
@@ -561,6 +650,15 @@ async fn import_preferences<B: Backend>(
     import_into(&state, &Workspace::shared(), params.mode.as_deref(), doc).await
 }
 
+fn link_err(link: &LinkDto, err: domain::Error) -> ApiError {
+    match ApiError::from(err) {
+        ApiError::BadRequest(msg) => {
+            ApiError::BadRequest(format!("link {} → {}: {msg}", link.source, link.target))
+        }
+        other => other,
+    }
+}
+
 async fn import_into<B: Backend>(
     state: &AppState<B>,
     ws: &Workspace,
@@ -576,7 +674,8 @@ async fn import_into<B: Backend>(
             )));
         }
     };
-    if doc.version != EXPORT_VERSION {
+    // v1 (linkless) dumps stay importable as backups made before links existed; only v2 is emitted.
+    if doc.version != EXPORT_VERSION && doc.version != 1 {
         return Err(ApiError::BadRequest(format!(
             "unsupported export version {}, this server reads version {EXPORT_VERSION}",
             doc.version
@@ -611,6 +710,29 @@ async fn import_into<B: Backend>(
         memory.updated_at = updated_at;
         memories.push(memory);
     }
+    if into_preferences && !doc.links.is_empty() {
+        return Err(ApiError::BadRequest(
+            "preferences carry no links; every link command acts on workspace memories".into(),
+        ));
+    }
+    let known: std::collections::HashSet<&str> = memories.iter().map(|m| m.id.as_str()).collect();
+    let mut parsed_links: Vec<Link> = Vec::with_capacity(doc.links.len());
+    for link in &doc.links {
+        let source = MemoryId::parse(&link.source).map_err(|e| link_err(link, e))?;
+        let target = MemoryId::parse(&link.target).map_err(|e| link_err(link, e))?;
+        if !known.contains(link.source.as_str()) || !known.contains(link.target.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "link {} → {} references a memory this dump does not contain",
+                link.source, link.target
+            )));
+        }
+        let relation = Relation::parse(&link.relation).map_err(|e| link_err(link, e))?;
+        parsed_links.push(Link {
+            source,
+            target,
+            relation,
+        });
+    }
     if !merge {
         let incoming: std::collections::HashSet<&str> =
             memories.iter().map(|m| m.id.as_str()).collect();
@@ -628,8 +750,37 @@ async fn import_into<B: Backend>(
                 stray.id
             )));
         }
+        let dump: std::collections::HashSet<(String, String, Relation)> = parsed_links
+            .iter()
+            .cloned()
+            .map(|link| {
+                let link = link.canonical();
+                (
+                    link.source.to_string(),
+                    link.target.to_string(),
+                    link.relation,
+                )
+            })
+            .collect();
+        let extra = state.backend.links_all(ws).await?.into_iter().find(|edge| {
+            !dump.contains(&(
+                edge.source.to_string(),
+                edge.target.to_string(),
+                edge.relation,
+            ))
+        });
+        if let Some(extra) = extra {
+            return Err(ApiError::Conflict(format!(
+                "{} already holds a {} link {} → {} which this dump does not contain; \
+                 use mode=merge to import into it",
+                Origin::of(ws).label(),
+                extra.relation.as_str(),
+                extra.source,
+                extra.target
+            )));
+        }
     }
-    let report = state.backend.restore(ws, memories).await?;
+    let report = state.backend.restore(ws, memories, parsed_links).await?;
     Ok(Json(ImportReport {
         imported: report.imported,
         unchanged: report.unchanged,

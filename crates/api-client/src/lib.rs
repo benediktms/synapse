@@ -2,9 +2,9 @@ use std::fmt;
 use std::time::Duration;
 
 use api::{
-    ContextResponse, ExportDoc, HealthResponse, ImportReport, ListResponse, MemoryDto, MoveBody,
-    MoveResponse, PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse, WorkspaceDto,
-    WorkspacesResponse,
+    ContextResponse, ExportDoc, GraphDto, HealthResponse, ImportReport, ListResponse, MemoryDto,
+    MoveBody, MoveResponse, PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse,
+    WorkspaceDto, WorkspacesResponse,
 };
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -192,6 +192,7 @@ impl SynapseApiClient {
         scope: Option<&str>,
         limit: usize,
         all_workspaces: bool,
+        links_in_scope: bool,
     ) -> Result<SearchResponse, ClientError> {
         let limit = limit.to_string();
         let mut params: Vec<(&str, &str)> = vec![("q", query), ("limit", &limit)];
@@ -202,6 +203,9 @@ impl SynapseApiClient {
         }
         if let Some(scope) = scope {
             params.push(("scope", scope));
+        }
+        if links_in_scope {
+            params.push(("links_scope", "true"));
         }
         json(self.http.get(self.url("/memories/search")).query(&params))
     }
@@ -255,6 +259,58 @@ impl SynapseApiClient {
                 .get(self.url(&format!("/memories/{id}")))
                 .query(&[("ws", workspace)]),
         )
+    }
+
+    pub fn links(&self, workspace: &str, id: &str, depth: usize) -> Result<GraphDto, ClientError> {
+        json(
+            self.http
+                .get(self.url(&format!("/memories/{id}/links")))
+                .query(&[("ws", workspace), ("depth", &depth.to_string())]),
+        )
+    }
+
+    pub fn link(
+        &self,
+        workspace: &str,
+        source: &str,
+        target: &str,
+        relation: &str,
+    ) -> Result<(), ClientError> {
+        check(
+            self.http
+                .post(self.url(&format!("/memories/{source}/links")))
+                .query(&[("ws", workspace)])
+                .json(&serde_json::json!({ "target": target, "relation": relation }))
+                .send()?,
+        )?;
+        Ok(())
+    }
+
+    pub fn retype_link(
+        &self,
+        workspace: &str,
+        a: &str,
+        b: &str,
+        relation: &str,
+    ) -> Result<(), ClientError> {
+        check(
+            self.http
+                .patch(self.url(&format!("/memories/{a}/links")))
+                .query(&[("ws", workspace)])
+                .json(&serde_json::json!({ "target": b, "relation": relation }))
+                .send()?,
+        )?;
+        Ok(())
+    }
+
+    pub fn unlink(&self, workspace: &str, a: &str, b: &str) -> Result<(), ClientError> {
+        check(
+            self.http
+                .delete(self.url(&format!("/memories/{a}/links")))
+                .query(&[("ws", workspace), ("target", b)])
+                .send()?,
+        )?;
+        Ok(())
     }
 
     pub fn list(&self, workspace: &str) -> Result<Vec<MemoryDto>, ClientError> {

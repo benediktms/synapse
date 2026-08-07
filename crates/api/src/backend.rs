@@ -1,8 +1,9 @@
 use std::future::Future;
 
 use domain::{
-    ContextDigest, EditRequest, Error, Memory, MemoryId, MoveOutcome, RecallHit, RecallRequest,
-    SaveOutcome, SaveRequest, Timestamp, Workspace, WorkspaceHits,
+    ContextDigest, EditRequest, Error, GraphEdge, GraphSubgraph, Link, Memory, MemoryId,
+    MoveOutcome, RecallHit, RecallRequest, Relation, SaveOutcome, SaveRequest, Timestamp,
+    Workspace, WorkspaceHits,
 };
 
 #[derive(Clone, Debug)]
@@ -78,9 +79,40 @@ pub trait Backend: Clone + Send + Sync + 'static {
         ws: &Workspace,
         project: Option<&str>,
     ) -> impl Future<Output = Result<ContextDigest, BackendError>> + Send;
+    fn links(
+        &self,
+        ws: &Workspace,
+        id: &MemoryId,
+        depth: usize,
+    ) -> impl Future<Output = Result<GraphSubgraph, BackendError>> + Send;
+    fn links_all(
+        &self,
+        ws: &Workspace,
+    ) -> impl Future<Output = Result<Vec<GraphEdge>, BackendError>> + Send;
+    fn link(
+        &self,
+        ws: &Workspace,
+        source: &MemoryId,
+        target: &MemoryId,
+        relation: Relation,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send;
+    fn unlink(
+        &self,
+        ws: &Workspace,
+        a: &MemoryId,
+        b: &MemoryId,
+    ) -> impl Future<Output = Result<usize, BackendError>> + Send;
+    fn retype_link(
+        &self,
+        ws: &Workspace,
+        a: &MemoryId,
+        b: &MemoryId,
+        relation: Relation,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send;
     fn restore(
         &self,
         ws: &Workspace,
         memories: Vec<Memory>,
+        links: Vec<Link>,
     ) -> impl Future<Output = Result<RestoreReport, BackendError>> + Send;
 }

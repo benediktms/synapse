@@ -11,9 +11,9 @@ use api_client::SynapseApiClient;
 use domain::MemoryId;
 
 use crate::args::{
-    Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, ListArgs, MoveArgs,
-    RecallArgs, RetiredArgs, SCOPE_EVERYWHERE, SaveArgs, StoreArgs, WorkspaceArgs,
-    WorkspaceCommand,
+    Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, LinkPairArgs,
+    LinksArgs, ListArgs, MoveArgs, RecallArgs, RetiredArgs, SCOPE_EVERYWHERE, SaveArgs, StoreArgs,
+    SupersedeArgs, WorkspaceArgs, WorkspaceCommand,
 };
 use crate::config::{Config, OrgRule, WorkspaceRule};
 use crate::git::GitFacts;
@@ -47,6 +47,12 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Command::Move(args) => move_memory(&ctx, args),
         Command::List(args) => list(&ctx, args),
         Command::Show(args) => show(&ctx, args),
+        Command::Links(args) => links(&ctx, args),
+        Command::Relate(args) => link_pair(&ctx, args, domain::Relation::Relation),
+        Command::Support(args) => link_pair(&ctx, args, domain::Relation::Support),
+        Command::Contradict(args) => link_pair(&ctx, args, domain::Relation::Contradiction),
+        Command::Supersede(args) => supersede(&ctx, args),
+        Command::Unlink(args) => unlink(&ctx, args),
         Command::Pin(args) => set_pinned(&ctx, args, true),
         Command::Unpin(args) => set_pinned(&ctx, args, false),
         Command::Workspace(command) => workspace(&ctx, command),
@@ -241,6 +247,7 @@ fn recall(ctx: &Context, args: RecallArgs) -> Result<(), String> {
             scope.project(),
             args.limit,
             args.all_workspaces,
+            args.links_in_scope,
         )
         .map_err(|e| e.to_string())?;
     let elapsed = started.elapsed().as_millis();
@@ -308,13 +315,86 @@ fn patch(
 fn edit(ctx: &Context, args: EditArgs) -> Result<(), String> {
     let client = ctx.client(WRITE_TIMEOUT)?;
     let target = resolve_target(ctx, &args.store)?;
-    let body = PatchMemoryBody {
-        content: Some(args.content),
-        importance: args.importance,
-        ..PatchMemoryBody::default()
+
+    if let Some(relation) = args.relation.as_deref() {
+        let ty = args
+            .type_
+            .as_deref()
+            .ok_or("retyping requires --type <relation|support|contradiction|supersession>")?;
+        let workspace = match &target {
+            Origin::Preference => {
+                return Err("syn edit --relation acts on a workspace memory".into());
+            }
+            Origin::Workspace(workspace) => workspace.to_string(),
+        };
+        client
+            .retype_link(&workspace, &args.id, relation, ty)
+            .map_err(|e| e.to_string())?;
+        println!("retyped {} ↔ {relation} ({ty})", args.id);
+    }
+
+    let wants_memory_edit = args.content.is_some() || args.importance.is_some();
+    if wants_memory_edit {
+        let body = PatchMemoryBody {
+            content: args.content,
+            importance: args.importance,
+            ..PatchMemoryBody::default()
+        };
+        let memory = patch(&client, &target, &args.id, &body)?;
+        println!("updated {} ({})", memory.id, output::store_label(&target));
+    }
+
+    if args.relation.is_none() && !wants_memory_edit {
+        return Err(
+            "syn edit needs --content (or --importance), or --relation/--type to retype a link"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// `syn relate/support/contradict` — a bidirectional typed edge.
+fn link_pair(ctx: &Context, args: LinkPairArgs, relation: domain::Relation) -> Result<(), String> {
+    let client = ctx.client(WRITE_TIMEOUT)?;
+    let target = resolve_target(ctx, &args.store)?;
+    let workspace = match &target {
+        Origin::Preference => return Err("links act on workspace memories".into()),
+        Origin::Workspace(workspace) => workspace.to_string(),
     };
-    let memory = patch(&client, &target, &args.id, &body)?;
-    println!("updated {} ({})", memory.id, output::store_label(&target));
+    client
+        .link(&workspace, &args.a, &args.b, relation.as_str())
+        .map_err(|e| e.to_string())?;
+    println!("linked {} ↔ {} ({})", args.a, args.b, relation);
+    Ok(())
+}
+
+/// `syn supersede --old <B> --new <A>` — directed; cycle-guarded, de-ranks the superseded memory.
+fn supersede(ctx: &Context, args: SupersedeArgs) -> Result<(), String> {
+    let client = ctx.client(WRITE_TIMEOUT)?;
+    let target = resolve_target(ctx, &args.store)?;
+    let workspace = match &target {
+        Origin::Preference => return Err("links act on workspace memories".into()),
+        Origin::Workspace(workspace) => workspace.to_string(),
+    };
+    client
+        .link(&workspace, &args.new, &args.old, "supersession")
+        .map_err(|e| e.to_string())?;
+    println!("superseded {} by {}", args.old, args.new);
+    Ok(())
+}
+
+/// `syn unlink <A> <B>` — remove whatever edge(s) exist between the pair.
+fn unlink(ctx: &Context, args: LinkPairArgs) -> Result<(), String> {
+    let client = ctx.client(WRITE_TIMEOUT)?;
+    let target = resolve_target(ctx, &args.store)?;
+    let workspace = match &target {
+        Origin::Preference => return Err("links act on workspace memories".into()),
+        Origin::Workspace(workspace) => workspace.to_string(),
+    };
+    client
+        .unlink(&workspace, &args.a, &args.b)
+        .map_err(|e| e.to_string())?;
+    println!("unlinked {} ↔ {}", args.a, args.b);
     Ok(())
 }
 
@@ -356,6 +436,13 @@ fn move_memory(ctx: &Context, args: MoveArgs) -> Result<(), String> {
         eprintln!(
             "note: scope widened from {} to workspace; it applies everywhere now",
             response.from_scope
+        );
+    }
+    if response.links_dropped > 0 {
+        eprintln!(
+            "note: dropped {} link(s); links do not cross stores, so re-link it in {}",
+            response.links_dropped,
+            output::place(&to, &response.memory.scope)
         );
     }
     println!(
@@ -463,6 +550,21 @@ fn show(ctx: &Context, args: IdArgs) -> Result<(), String> {
         memory.importance,
         memory.created_at
     );
+    Ok(())
+}
+
+fn links(ctx: &Context, args: LinksArgs) -> Result<(), String> {
+    let client = ctx.client(READ_TIMEOUT)?;
+    flush_before_read(ctx);
+    if args.store.everywhere() {
+        return Err("syn links acts on a workspace memory; drop --scope everywhere".into());
+    }
+    let workspace = ctx.workspace(args.store.workspace.as_deref(), false)?;
+    let graph = client
+        .links(&workspace, &args.id, args.depth)
+        .map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?;
+    println!("{json}");
     Ok(())
 }
 
