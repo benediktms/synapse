@@ -438,6 +438,13 @@ fn move_memory(ctx: &Context, args: MoveArgs) -> Result<(), String> {
             response.from_scope
         );
     }
+    if response.links_dropped > 0 {
+        eprintln!(
+            "note: dropped {} link(s); links do not cross stores, so re-link it in {}",
+            response.links_dropped,
+            output::place(&to, &response.memory.scope)
+        );
+    }
     println!(
         "moved {} ({source} → {})",
         response.memory.id,

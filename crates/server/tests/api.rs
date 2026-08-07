@@ -1215,7 +1215,7 @@ async fn import_rejects_a_supersession_cycle_in_the_dump() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn move_refuses_a_linked_memory() {
+async fn move_drops_links_and_reports_how_many() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;
     req(&router, Method::PUT, "/workspaces/work", None).await;
@@ -1237,20 +1237,24 @@ async fn move_refuses_a_linked_memory() {
         json!({ "workspace": "personal" }),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["moved"], true);
     assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "moving a linked memory would drop its edges: {body}"
+        body["links_dropped"], 1,
+        "a dropped edge must be reported, not silent: {body}"
     );
-    let (status, still) = req(
+    let (status, left_behind) = req(
         &router,
         Method::GET,
-        &format!("/memories/{}/links?ws=work", mid(1)),
+        &format!("/memories/{}/links?ws=work", mid(2)),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(still["graph"]["edges"].as_array().unwrap().len(), 1);
+    assert!(
+        left_behind["graph"]["edges"].as_array().unwrap().is_empty(),
+        "the edge cannot survive with its endpoint in another store: {left_behind}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

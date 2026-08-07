@@ -117,6 +117,7 @@ pub struct MoveOutcome {
     pub memory: Memory,
     pub from_scope: Scope,
     pub moved: bool,
+    pub links_dropped: usize,
 }
 
 pub async fn move_memory<S: Store>(
@@ -136,11 +137,12 @@ pub async fn move_memory<S: Store>(
             memory,
             from_scope,
             moved: false,
+            links_dropped: 0,
         });
     }
-    if !source.1.links_of(id).await?.is_empty() {
-        return Err(Error::Linked(id.clone()));
-    }
+    // ponytail: a link cannot span two stores, so a move drops the memory's edges and reports the
+    // count; qualifying link endpoints with a workspace removes the loss (#9).
+    let links_dropped = source.1.links_of(id).await?.len();
     let mut moved = memory;
     if target.0.is_shared() {
         moved.scope = Scope::Workspace;
@@ -159,6 +161,7 @@ pub async fn move_memory<S: Store>(
         memory: stored,
         from_scope,
         moved: true,
+        links_dropped,
     })
 }
 

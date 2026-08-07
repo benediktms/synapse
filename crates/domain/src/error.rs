@@ -17,8 +17,6 @@ pub enum Error {
     Cycle(MemoryId, MemoryId),
     /// Retyping an edge between two memories was ambiguous because several typed edges coexist.
     Ambiguous(MemoryId, MemoryId),
-    /// An operation that cannot carry links was asked to act on a memory that has them.
-    Linked(MemoryId),
     Store(String),
     Embed(String),
 }
@@ -41,10 +39,6 @@ impl fmt::Display for Error {
             Error::Ambiguous(a, b) => write!(
                 f,
                 "multiple links exist between {a} and {b}; unlink the one you mean or pick a pair with a single link"
-            ),
-            Error::Linked(id) => write!(
-                f,
-                "memory {id} has links, which cannot cross workspaces; unlink it first"
             ),
             Error::Store(msg) => write!(f, "store error: {msg}"),
             Error::Embed(msg) => write!(f, "embedding error: {msg}"),

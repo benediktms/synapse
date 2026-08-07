@@ -466,6 +466,7 @@ async fn move_memory<B: Backend>(
         from: body.from,
         to: body.to,
         from_scope: outcome.from_scope.as_str().to_string(),
+        links_dropped: outcome.links_dropped,
         memory: MemoryDto::from(&outcome.memory),
     }))
 }

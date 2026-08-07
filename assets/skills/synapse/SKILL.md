@@ -244,8 +244,8 @@ syn links <id> --depth N         # walk the graph around a memory (JSON, JGF v2)
 `syn move` keeps the id, the content and the original creation date, so prefer it
 to forget-and-re-save when a synapse is merely in the wrong place. Its source
 flags say where the synapse *is* (`--workspace`, `--scope everywhere`), its `--to`
-says where it belongs. Links live inside one store, so a linked synapse cannot move:
-`syn move` refuses it, and `syn unlink` first is the deliberate choice to drop the edges.
+says where it belongs. A link lives inside one store, so moving a linked synapse drops
+its edges — `syn move` says how many — and re-linking in the new store is on you.
 
 Every command acts on one store, so say which — read it off the hit line:
 `(work · fresha/offers, …)` → `--workspace work`; `(everywhere, …)` →

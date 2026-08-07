@@ -116,6 +116,8 @@ pub struct MoveResponse {
     pub from: Origin,
     pub to: Origin,
     pub from_scope: String,
+    #[serde(default)]
+    pub links_dropped: usize,
     #[serde(flatten)]
     pub memory: MemoryDto,
 }
