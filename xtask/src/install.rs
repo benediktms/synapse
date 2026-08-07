@@ -61,7 +61,7 @@ impl Homes {
             claude: harness_home("CLAUDE_CONFIG_DIR", ".claude")?,
             copilot: harness_home("COPILOT_HOME", ".copilot")?,
             codex: harness_home("CODEX_HOME", ".codex")?,
-            omp: harness_home("PI_CODING_AGENT_DIR", ".omp/agent")?,
+            omp: omp_home()?,
         })
     }
 
@@ -75,12 +75,62 @@ impl Homes {
     }
 }
 
-fn harness_home(env: &str, fallback: &str) -> Result<PathBuf, String> {
+fn harness_home(env: &str, fallback: impl AsRef<Path>) -> Result<PathBuf, String> {
     if let Some(explicit) = std::env::var_os(env) {
         return Ok(PathBuf::from(explicit));
     }
+    under_home(fallback)
+}
+
+fn under_home(path: impl AsRef<Path>) -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    Ok(PathBuf::from(home).join(fallback))
+    Ok(PathBuf::from(home).join(path))
+}
+
+/// The env vars omp reads to place its agent directory.
+struct OmpEnv {
+    profile: Option<String>,
+    legacy_profile: Option<String>,
+    config_dir: Option<String>,
+}
+
+impl OmpEnv {
+    fn from_env() -> Self {
+        Self {
+            profile: std::env::var("OMP_PROFILE").ok(),
+            legacy_profile: std::env::var("PI_PROFILE").ok(),
+            config_dir: std::env::var("PI_CONFIG_DIR").ok(),
+        }
+    }
+
+    fn root(&self) -> PathBuf {
+        PathBuf::from(self.config_dir.as_deref().unwrap_or(".omp"))
+    }
+
+    /// A profile omp treats as named. `OMP_PROFILE` shadows `PI_PROFILE` even
+    /// when it is empty, and an empty or `default` name selects no profile.
+    fn named_profile(&self) -> Option<&str> {
+        self.profile
+            .as_deref()
+            .or(self.legacy_profile.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != "default")
+    }
+
+    /// The agent directory below `$HOME`, or `None` for the default profile,
+    /// which is the only one where `PI_CODING_AGENT_DIR` still applies.
+    fn profile_agent_dir(&self) -> Option<PathBuf> {
+        let named = self.named_profile()?;
+        Some(self.root().join("profiles").join(named).join("agent"))
+    }
+}
+
+fn omp_home() -> Result<PathBuf, String> {
+    let env = OmpEnv::from_env();
+    match env.profile_agent_dir() {
+        Some(dir) => under_home(dir),
+        None => harness_home("PI_CODING_AGENT_DIR", env.root().join("agent")),
+    }
 }
 
 pub fn run(harnesses: &[Harness], options: &InstallOptions) -> Result<Report, String> {
@@ -963,6 +1013,38 @@ mod tests {
     }
 
     #[test]
+    fn a_named_omp_profile_keeps_its_own_agent_dir() {
+        let named = |profile: Option<&str>, legacy: Option<&str>| OmpEnv {
+            profile: profile.map(str::to_string),
+            legacy_profile: legacy.map(str::to_string),
+            config_dir: None,
+        };
+
+        assert_eq!(
+            named(Some("work"), None).profile_agent_dir(),
+            Some(PathBuf::from(".omp/profiles/work/agent"))
+        );
+        assert_eq!(
+            named(None, Some("work")).profile_agent_dir(),
+            Some(PathBuf::from(".omp/profiles/work/agent"))
+        );
+        assert_eq!(named(Some(""), Some("work")).profile_agent_dir(), None);
+        assert_eq!(named(Some("default"), None).profile_agent_dir(), None);
+        assert_eq!(named(None, None).profile_agent_dir(), None);
+
+        let relocated = OmpEnv {
+            profile: Some("work".into()),
+            legacy_profile: None,
+            config_dir: Some(".pi".into()),
+        };
+        assert_eq!(
+            relocated.profile_agent_dir(),
+            Some(PathBuf::from(".pi/profiles/work/agent"))
+        );
+        assert_eq!(relocated.root().join("agent"), PathBuf::from(".pi/agent"));
+    }
+
+    #[test]
     fn omp_installs_a_ts_hook_module_not_a_json_hook() {
         let sandbox = Sandbox::new();
         sandbox.install(Harness::Omp, &fresh());
@@ -970,8 +1052,10 @@ mod tests {
 
         let hook = sandbox.homes.omp.join("extensions/synapse.ts");
         let text = fs::read_to_string(&hook).expect("read hook");
-        assert!(text.contains("syn"));
-        assert!(text.contains("context"));
+        assert!(
+            text.contains(r#"run("syn", ["context"]"#),
+            "the module reads the digest from `syn context`"
+        );
         assert!(
             text.contains("// synapse:managed 1"),
             "managed marker present"

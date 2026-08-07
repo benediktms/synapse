@@ -27,7 +27,8 @@ fmt:
 # everything CI would check
 check: lint test
 
-# install the skill and session hooks into Claude Code, Codex CLI and Copilot CLI
+# install the skill and session hooks into every harness — Claude Code, Codex CLI,
+# Copilot CLI and Oh My Pi. Narrow it with `just agents --harness claude`.
 agents *args:
     cargo run --quiet -p xtask -- install-agents {{ args }}
 
