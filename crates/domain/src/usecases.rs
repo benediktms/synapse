@@ -138,6 +138,9 @@ pub async fn move_memory<S: Store>(
             moved: false,
         });
     }
+    if !source.1.links_of(id).await?.is_empty() {
+        return Err(Error::Linked(id.clone()));
+    }
     let mut moved = memory;
     if target.0.is_shared() {
         moved.scope = Scope::Workspace;
@@ -185,6 +188,47 @@ pub async fn link<S: Store>(
             relation,
         })
         .await
+}
+
+/// Reject an incoming edge set whose merged supersession graph holds a cycle — checked before
+/// anything is written, so a bad dump cannot leave half an import behind. The stored graph is
+/// acyclic by construction, so every cycle runs through at least one incoming edge.
+pub fn check_import_acyclic(existing: &[Link], incoming: &[Link]) -> Result<(), Error> {
+    let mut adjacency: HashMap<MemoryId, Vec<MemoryId>> = HashMap::new();
+    for link in existing.iter().chain(incoming) {
+        if link.relation == Relation::Supersession {
+            adjacency
+                .entry(link.source.clone())
+                .or_default()
+                .push(link.target.clone());
+        }
+    }
+    for link in incoming {
+        if link.relation != Relation::Supersession {
+            continue;
+        }
+        if link.source == link.target || reaches(&adjacency, &link.target, &link.source) {
+            return Err(Error::Cycle(link.source.clone(), link.target.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn reaches(adjacency: &HashMap<MemoryId, Vec<MemoryId>>, from: &MemoryId, to: &MemoryId) -> bool {
+    let mut stack = vec![from.clone()];
+    let mut seen: HashSet<MemoryId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if id == *to {
+            return true;
+        }
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(next) = adjacency.get(&id) {
+            stack.extend(next.iter().cloned());
+        }
+    }
+    false
 }
 
 /// Remove every edge between two memories, whatever its relation. Returns the number removed.

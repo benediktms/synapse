@@ -328,6 +328,7 @@ impl Backend for App {
         use domain::Store;
         let store = self.store(ws).await?;
         let mut report = RestoreReport::default();
+        domain::check_import_acyclic(&store.links_all().await?, &links)?;
         for memory in memories {
             if let Some(existing) = store.get(&memory.id).await? {
                 let same_payload = existing.content == memory.content

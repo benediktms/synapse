@@ -21,9 +21,10 @@ pub use usecases::{
     ContextDigest, DIGEST_PINNED_CAP, DIGEST_RECENT_PROJECT_CAP, DIGEST_SHARED_USER_CAP,
     DigestEntry, EditRequest, GRAPH_EDGE_BUDGET, GRAPH_NODE_BUDGET, GraphEdge, GraphNode,
     GraphSubgraph, MAX_GRAPH_DEPTH, MIN_VECTOR_SIMILARITY, MoveOutcome, RECALL_LIMIT_CAP,
-    RecallHit, RecallLink, RecallRequest, SaveOutcome, SaveRequest, WorkspaceHits, context_digest,
-    edit, effective_pinned, forget, graph_subgraph, is_superseded, link, list_memories,
-    move_memory, recall, recall_grouped, retype_link, save, superseders_of, unlink,
+    RecallHit, RecallLink, RecallRequest, SaveOutcome, SaveRequest, WorkspaceHits,
+    check_import_acyclic, context_digest, edit, effective_pinned, forget, graph_subgraph,
+    is_superseded, link, list_memories, move_memory, recall, recall_grouped, retype_link, save,
+    superseders_of, unlink,
 };
 pub use workspace::Workspace;
 
