@@ -760,7 +760,7 @@ async fn forget_cascades_away_links_on_either_endpoint() {
         .unwrap();
     assert_eq!(store.links_of(&a).await.unwrap().len(), 1);
 
-        store.delete(&a).await.unwrap();
+    store.delete(&a).await.unwrap();
     assert!(
         store.links_of(&b).await.unwrap().is_empty(),
         "edge must cascade away"

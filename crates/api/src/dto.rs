@@ -458,7 +458,7 @@ mod tests {
         );
         assert_eq!(json["graph"]["edges"][0]["relation"], "supersession");
         assert_eq!(json["graph"]["edges"][0]["directed"], true);
-                assert!(json["graph"]["root"].is_null());
+        assert!(json["graph"]["root"].is_null());
         assert!(json["graph"]["depth"].is_null());
         assert!(json["graph"]["truncated"].is_null());
     }
