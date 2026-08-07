@@ -8,10 +8,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
-use domain::{
-    EditRequest, Importance, Link, MAX_GRAPH_DEPTH, Memory, MemoryId, MemoryKind, RECALL_LIMIT_CAP,
-    RecallRequest, Relation, SaveOutcome, SaveRequest, Scope, Workspace,
-};
+use domain::{Scope, Workspace};
 use serde::Deserialize;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnResponse, MakeSpan, TraceLayer};
@@ -19,19 +16,16 @@ use tracing::Level;
 
 use crate::backend::Backend;
 use crate::dto::{
-    ContextResponse, EXPORT_VERSION, ExportDoc, GraphDto, HealthResponse, HitDto, HitGroupDto,
-    ImportReport, LinkDto, ListResponse, MemoryDto, MoveBody, MoveResponse, Origin,
-    PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse, WorkspaceDto,
-    WorkspacesResponse,
+    ContextResponse, ExportDoc, GraphDto, HealthResponse, ImportReport, ListResponse, MemoryDto,
+    MoveBody, MoveResponse, PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse,
+    WorkspaceDto, WorkspacesResponse,
 };
 use crate::error::ApiError;
-use crate::validate::{normalize_timestamp, validate_content, validate_query, validate_tags};
+use crate::ops::{self, SearchArgs};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(600);
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
-const DEFAULT_SEARCH_LIMIT: usize = 10;
-const DEFAULT_GRAPH_DEPTH: usize = 2;
 const UNREADY_PUBLIC_REASON: &str = "server is not ready; see server logs for detail";
 
 pub struct AppState<B> {
@@ -195,39 +189,12 @@ struct WsQuery {
     ws: Option<String>,
 }
 
-fn parse_ws(name: &str) -> Result<Workspace, ApiError> {
-    if name == "shared" {
-        return Err(ApiError::BadRequest(
-            "\"shared\" is not a workspace; memories that apply everywhere live under /preferences"
-                .into(),
-        ));
-    }
-    Workspace::new(name).map_err(ApiError::from)
-}
-
-fn workspace_of(origin: &Origin) -> Result<Workspace, ApiError> {
-    match origin {
-        Origin::Preference => Ok(Workspace::shared()),
-        Origin::Workspace(name) => parse_ws(name),
-    }
-}
-
 fn require_ws(query: &WsQuery) -> Result<Workspace, ApiError> {
     match query.ws.as_deref() {
-        Some(name) => parse_ws(name),
+        Some(name) => ops::parse_ws(name),
         None => Err(ApiError::BadRequest(
             "missing required query parameter: ws".into(),
         )),
-    }
-}
-
-fn parse_project(value: Option<&str>) -> Result<Option<String>, ApiError> {
-    match value {
-        None => Ok(None),
-        Some(raw) => match Scope::parse(raw)? {
-            Scope::Workspace => Ok(None),
-            Scope::Project(slug) => Ok(Some(slug)),
-        },
     }
 }
 
@@ -235,34 +202,19 @@ async fn put_workspace<B: Backend>(
     State(state): State<AppState<B>>,
     Path(name): Path<String>,
 ) -> Result<(StatusCode, Json<WorkspaceDto>), ApiError> {
-    let ws = Workspace::new(&name)?;
-    let created = state.backend.create_workspace(&ws).await?;
+    let (created, dto) = ops::create_workspace(&state.backend, &name).await?;
     let status = if created {
         StatusCode::CREATED
     } else {
         StatusCode::OK
     };
-    Ok((
-        status,
-        Json(WorkspaceDto {
-            workspace: ws.to_string(),
-        }),
-    ))
+    Ok((status, Json(dto)))
 }
 
 async fn get_workspaces<B: Backend>(
     State(state): State<AppState<B>>,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
-    let mut workspaces: Vec<String> = state
-        .backend
-        .workspaces()
-        .await?
-        .iter()
-        .filter(|ws| !ws.is_shared())
-        .map(Workspace::to_string)
-        .collect();
-    workspaces.sort();
-    Ok(Json(WorkspacesResponse { workspaces }))
+    Ok(Json(ops::workspaces(&state.backend).await?))
 }
 
 async fn save_into<B: Backend>(
@@ -271,25 +223,13 @@ async fn save_into<B: Backend>(
     id: &str,
     body: PutMemoryBody,
 ) -> Result<(StatusCode, Json<MemoryDto>), ApiError> {
-    let id = MemoryId::parse(id)?;
-    validate_content(&state.backend, &body.content)?;
-    validate_tags(&body.tags)?;
-    let request = SaveRequest {
-        id,
-        content: body.content,
-        kind: MemoryKind::parse(&body.kind)?,
-        scope: Scope::parse(&body.scope)?,
-        tags: body.tags,
-        importance: body
-            .importance
-            .as_deref()
-            .map(Importance::parse)
-            .transpose()?,
+    let saved = ops::save(&state.backend, ws, id, body).await?;
+    let status = if saved.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
     };
-    match state.backend.save(ws, request).await? {
-        SaveOutcome::Created(memory) => Ok((StatusCode::CREATED, Json(MemoryDto::from(&memory)))),
-        SaveOutcome::Unchanged(memory) => Ok((StatusCode::OK, Json(MemoryDto::from(&memory)))),
-    }
+    Ok((status, Json(saved.memory)))
 }
 
 async fn put_memory<B: Backend>(
@@ -332,37 +272,18 @@ async fn search<B: Backend>(
     State(state): State<AppState<B>>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<SearchResponse>, ApiError> {
-    let ws = params.ws.as_deref().map(parse_ws).transpose()?;
-    let query = params
+    let q = params
         .q
-        .as_deref()
         .ok_or_else(|| ApiError::BadRequest("missing required query parameter: q".into()))?;
-    validate_query(&state.backend, query)?;
-    let limit = params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
-    if !(1..=RECALL_LIMIT_CAP).contains(&limit) {
-        return Err(ApiError::BadRequest(format!(
-            "limit must be between 1 and {RECALL_LIMIT_CAP}"
-        )));
-    }
-    let request = RecallRequest {
-        query: query.to_string(),
-        project: parse_project(params.scope.as_deref())?,
-        limit,
-        links_in_scope: params.links_scope.unwrap_or(false),
+    let args = SearchArgs {
+        ws: params.ws,
+        q,
+        scope: params.scope,
+        limit: params.limit,
+        all: params.all.unwrap_or(false),
+        links_scope: params.links_scope.unwrap_or(false),
     };
-    if params.all.unwrap_or(false) {
-        let groups = state.backend.recall_all(&request).await?;
-        Ok(Json(SearchResponse::Grouped {
-            groups: groups.iter().map(HitGroupDto::from).collect(),
-        }))
-    } else {
-        let ws =
-            ws.ok_or_else(|| ApiError::BadRequest("missing required query parameter: ws".into()))?;
-        let hits = state.backend.recall(&ws, &request).await?;
-        Ok(Json(SearchResponse::Flat {
-            hits: hits.iter().map(HitDto::from).collect(),
-        }))
-    }
+    Ok(Json(ops::search(&state.backend, args).await?))
 }
 
 #[derive(Deserialize)]
@@ -376,36 +297,9 @@ async fn context<B: Backend>(
     Query(params): Query<ContextParams>,
 ) -> Result<Json<ContextResponse>, ApiError> {
     let ws = require_ws(&WsQuery { ws: params.ws })?;
-    let project = parse_project(params.project.as_deref())?;
-    let digest = state.backend.context(&ws, project.as_deref()).await?;
-    Ok(Json(ContextResponse::from(&digest)))
-}
-
-async fn edit_in<B: Backend>(
-    state: &AppState<B>,
-    ws: &Workspace,
-    id: &str,
-    body: PatchMemoryBody,
-) -> Result<Json<MemoryDto>, ApiError> {
-    let id = MemoryId::parse(id)?;
-    if let Some(content) = &body.content {
-        validate_content(&state.backend, content)?;
-    }
-    if let Some(tags) = &body.tags {
-        validate_tags(tags)?;
-    }
-    let request = EditRequest {
-        content: body.content,
-        tags: body.tags,
-        pinned: body.pinned,
-        importance: body
-            .importance
-            .as_deref()
-            .map(Importance::parse)
-            .transpose()?,
-    };
-    let memory = state.backend.edit(ws, &id, request).await?;
-    Ok(Json(MemoryDto::from(&memory)))
+    Ok(Json(
+        ops::context(&state.backend, &ws, params.project.as_deref()).await?,
+    ))
 }
 
 async fn patch_memory<B: Backend>(
@@ -415,7 +309,7 @@ async fn patch_memory<B: Backend>(
     Json(body): Json<PatchMemoryBody>,
 ) -> Result<Json<MemoryDto>, ApiError> {
     let ws = require_ws(&query)?;
-    edit_in(&state, &ws, &id, body).await
+    Ok(Json(ops::edit(&state.backend, &ws, &id, body).await?))
 }
 
 async fn patch_preference<B: Backend>(
@@ -423,17 +317,9 @@ async fn patch_preference<B: Backend>(
     Path(id): Path<String>,
     Json(body): Json<PatchMemoryBody>,
 ) -> Result<Json<MemoryDto>, ApiError> {
-    edit_in(&state, &Workspace::shared(), &id, body).await
-}
-
-async fn forget_in<B: Backend>(
-    state: &AppState<B>,
-    ws: &Workspace,
-    id: &str,
-) -> Result<StatusCode, ApiError> {
-    let id = MemoryId::parse(id)?;
-    state.backend.forget(ws, &id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(
+        ops::edit(&state.backend, &Workspace::shared(), &id, body).await?,
+    ))
 }
 
 async fn delete_memory<B: Backend>(
@@ -442,14 +328,16 @@ async fn delete_memory<B: Backend>(
     Query(query): Query<WsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let ws = require_ws(&query)?;
-    forget_in(&state, &ws, &id).await
+    ops::forget(&state.backend, &ws, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_preference<B: Backend>(
     State(state): State<AppState<B>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    forget_in(&state, &Workspace::shared(), &id).await
+    ops::forget(&state.backend, &Workspace::shared(), &id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn move_memory<B: Backend>(
@@ -457,32 +345,7 @@ async fn move_memory<B: Backend>(
     Path(id): Path<String>,
     Json(body): Json<MoveBody>,
 ) -> Result<Json<MoveResponse>, ApiError> {
-    let id = MemoryId::parse(&id)?;
-    let from = workspace_of(&body.from)?;
-    let to = workspace_of(&body.to)?;
-    let outcome = state.backend.move_memory(&from, &to, &id).await?;
-    Ok(Json(MoveResponse {
-        moved: outcome.moved,
-        from: body.from,
-        to: body.to,
-        from_scope: outcome.from_scope.as_str().to_string(),
-        links_dropped: outcome.links_dropped,
-        memory: MemoryDto::from(&outcome.memory),
-    }))
-}
-
-async fn fetch_in<B: Backend>(
-    state: &AppState<B>,
-    ws: &Workspace,
-    id: &str,
-) -> Result<Json<MemoryDto>, ApiError> {
-    let id = MemoryId::parse(id)?;
-    let memory = state
-        .backend
-        .get(ws, &id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found")))?;
-    Ok(Json(MemoryDto::from(&memory)))
+    Ok(Json(ops::move_memory(&state.backend, &id, body).await?))
 }
 
 async fn get_memory<B: Backend>(
@@ -491,7 +354,7 @@ async fn get_memory<B: Backend>(
     Query(query): Query<WsQuery>,
 ) -> Result<Json<MemoryDto>, ApiError> {
     let ws = require_ws(&query)?;
-    fetch_in(&state, &ws, &id).await
+    Ok(Json(ops::fetch(&state.backend, &ws, &id).await?))
 }
 
 #[derive(Deserialize)]
@@ -507,15 +370,9 @@ async fn links<B: Backend>(
     Query(query): Query<LinksQuery>,
 ) -> Result<Json<GraphDto>, ApiError> {
     let ws = require_ws(&WsQuery { ws: query.ws })?;
-    let id = MemoryId::parse(&id)?;
-    let depth = query.depth.unwrap_or(DEFAULT_GRAPH_DEPTH);
-    if depth > MAX_GRAPH_DEPTH {
-        return Err(ApiError::BadRequest(format!(
-            "depth must be at most {MAX_GRAPH_DEPTH}"
-        )));
-    }
-    let sub = state.backend.links(&ws, &id, depth).await?;
-    Ok(Json(GraphDto::from(&sub)))
+    Ok(Json(
+        ops::links_graph(&state.backend, &ws, &id, query.depth).await?,
+    ))
 }
 
 /// Body for creating or retyping a link: the other endpoint and the noun relation.
@@ -532,10 +389,7 @@ async fn create_link<B: Backend>(
     Json(body): Json<LinkBody>,
 ) -> Result<StatusCode, ApiError> {
     let ws = require_ws(&query)?;
-    let source = MemoryId::parse(&id)?;
-    let target = MemoryId::parse(&body.target)?;
-    let relation = Relation::parse(&body.relation)?;
-    state.backend.link(&ws, &source, &target, relation).await?;
+    ops::create_link(&state.backend, &ws, &id, &body.target, &body.relation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -546,10 +400,7 @@ async fn retype_link<B: Backend>(
     Json(body): Json<LinkBody>,
 ) -> Result<StatusCode, ApiError> {
     let ws = require_ws(&query)?;
-    let a = MemoryId::parse(&id)?;
-    let b = MemoryId::parse(&body.target)?;
-    let relation = Relation::parse(&body.relation)?;
-    state.backend.retype_link(&ws, &a, &b, relation).await?;
+    ops::retype_link(&state.backend, &ws, &id, &body.target, &body.relation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -559,12 +410,10 @@ async fn delete_link<B: Backend>(
     Query(query): Query<LinksQuery>,
 ) -> Result<StatusCode, ApiError> {
     let ws = require_ws(&WsQuery { ws: query.ws })?;
-    let a = MemoryId::parse(&id)?;
     let target = query
         .target
         .ok_or_else(|| ApiError::BadRequest("missing required query parameter: target".into()))?;
-    let b = MemoryId::parse(&target)?;
-    state.backend.unlink(&ws, &a, &b).await?;
+    ops::delete_link(&state.backend, &ws, &id, &target).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -572,17 +421,9 @@ async fn get_preference<B: Backend>(
     State(state): State<AppState<B>>,
     Path(id): Path<String>,
 ) -> Result<Json<MemoryDto>, ApiError> {
-    fetch_in(&state, &Workspace::shared(), &id).await
-}
-
-async fn list_in<B: Backend>(
-    state: &AppState<B>,
-    ws: &Workspace,
-) -> Result<Json<ListResponse>, ApiError> {
-    let memories = state.backend.list(ws).await?;
-    Ok(Json(ListResponse {
-        memories: memories.iter().map(MemoryDto::from).collect(),
-    }))
+    Ok(Json(
+        ops::fetch(&state.backend, &Workspace::shared(), &id).await?,
+    ))
 }
 
 async fn list_memories<B: Backend>(
@@ -590,27 +431,13 @@ async fn list_memories<B: Backend>(
     Query(query): Query<WsQuery>,
 ) -> Result<Json<ListResponse>, ApiError> {
     let ws = require_ws(&query)?;
-    list_in(&state, &ws).await
+    Ok(Json(ops::list(&state.backend, &ws).await?))
 }
 
 async fn list_preferences<B: Backend>(
     State(state): State<AppState<B>>,
 ) -> Result<Json<ListResponse>, ApiError> {
-    list_in(&state, &Workspace::shared()).await
-}
-
-async fn export_in<B: Backend>(
-    state: &AppState<B>,
-    ws: &Workspace,
-) -> Result<Json<ExportDoc>, ApiError> {
-    let memories = state.backend.list(ws).await?;
-    let links = state.backend.links_all(ws).await?;
-    Ok(Json(ExportDoc {
-        version: EXPORT_VERSION,
-        origin: Origin::of(ws),
-        memories: memories.iter().map(MemoryDto::from).collect(),
-        links: links.iter().map(LinkDto::from).collect(),
-    }))
+    Ok(Json(ops::list(&state.backend, &Workspace::shared()).await?))
 }
 
 async fn export<B: Backend>(
@@ -618,13 +445,15 @@ async fn export<B: Backend>(
     Query(query): Query<WsQuery>,
 ) -> Result<Json<ExportDoc>, ApiError> {
     let ws = require_ws(&query)?;
-    export_in(&state, &ws).await
+    Ok(Json(ops::export(&state.backend, &ws).await?))
 }
 
 async fn export_preferences<B: Backend>(
     State(state): State<AppState<B>>,
 ) -> Result<Json<ExportDoc>, ApiError> {
-    export_in(&state, &Workspace::shared()).await
+    Ok(Json(
+        ops::export(&state.backend, &Workspace::shared()).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -639,7 +468,9 @@ async fn import<B: Backend>(
     Json(doc): Json<ExportDoc>,
 ) -> Result<Json<ImportReport>, ApiError> {
     let ws = require_ws(&WsQuery { ws: params.ws })?;
-    import_into(&state, &ws, params.mode.as_deref(), doc).await
+    Ok(Json(
+        ops::import(&state.backend, &ws, params.mode.as_deref(), doc).await?,
+    ))
 }
 
 async fn import_preferences<B: Backend>(
@@ -647,142 +478,13 @@ async fn import_preferences<B: Backend>(
     Query(params): Query<ImportParams>,
     Json(doc): Json<ExportDoc>,
 ) -> Result<Json<ImportReport>, ApiError> {
-    import_into(&state, &Workspace::shared(), params.mode.as_deref(), doc).await
-}
-
-fn link_err(link: &LinkDto, err: domain::Error) -> ApiError {
-    match ApiError::from(err) {
-        ApiError::BadRequest(msg) => {
-            ApiError::BadRequest(format!("link {} → {}: {msg}", link.source, link.target))
-        }
-        other => other,
-    }
-}
-
-async fn import_into<B: Backend>(
-    state: &AppState<B>,
-    ws: &Workspace,
-    mode: Option<&str>,
-    doc: ExportDoc,
-) -> Result<Json<ImportReport>, ApiError> {
-    let merge = match mode {
-        None | Some("fail-if-nonempty") => false,
-        Some("merge") => true,
-        Some(other) => {
-            return Err(ApiError::BadRequest(format!(
-                "invalid mode {other:?}: expected fail-if-nonempty or merge"
-            )));
-        }
-    };
-    // v1 (linkless) dumps stay importable as backups made before links existed; only v2 is emitted.
-    if doc.version != EXPORT_VERSION && doc.version != 1 {
-        return Err(ApiError::BadRequest(format!(
-            "unsupported export version {}, this server reads version {EXPORT_VERSION}",
-            doc.version
-        )));
-    }
-    let into_preferences = ws.is_shared();
-    if into_preferences != matches!(doc.origin, Origin::Preference) {
-        return Err(ApiError::BadRequest(if into_preferences {
-            "this dump came from a workspace; import it with /import?ws=<workspace>".into()
-        } else {
-            "this dump holds preferences; import it with /preferences/import".into()
-        }));
-    }
-    let mut memories: Vec<Memory> = Vec::with_capacity(doc.memories.len());
-    for dto in &doc.memories {
-        let item = |err: ApiError| match err {
-            ApiError::BadRequest(msg) => ApiError::BadRequest(format!("memory {}: {msg}", dto.id)),
-            other => other,
-        };
-        validate_content(&state.backend, &dto.content).map_err(item)?;
-        validate_tags(&dto.tags).map_err(item)?;
-        let created_at = normalize_timestamp(&dto.created_at).map_err(item)?;
-        let updated_at = normalize_timestamp(&dto.updated_at).map_err(item)?;
-        let mut memory = dto.to_memory().map_err(|e| item(ApiError::from(e)))?;
-        if into_preferences && memory.scope != Scope::Workspace {
-            return Err(item(ApiError::BadRequest(format!(
-                "preferences apply everywhere and cannot carry the project scope {:?}",
-                memory.scope.as_str()
-            ))));
-        }
-        memory.created_at = created_at;
-        memory.updated_at = updated_at;
-        memories.push(memory);
-    }
-    if into_preferences && !doc.links.is_empty() {
-        return Err(ApiError::BadRequest(
-            "preferences carry no links; every link command acts on workspace memories".into(),
-        ));
-    }
-    let known: std::collections::HashSet<&str> = memories.iter().map(|m| m.id.as_str()).collect();
-    let mut parsed_links: Vec<Link> = Vec::with_capacity(doc.links.len());
-    for link in &doc.links {
-        let source = MemoryId::parse(&link.source).map_err(|e| link_err(link, e))?;
-        let target = MemoryId::parse(&link.target).map_err(|e| link_err(link, e))?;
-        if !known.contains(link.source.as_str()) || !known.contains(link.target.as_str()) {
-            return Err(ApiError::BadRequest(format!(
-                "link {} → {} references a memory this dump does not contain",
-                link.source, link.target
-            )));
-        }
-        let relation = Relation::parse(&link.relation).map_err(|e| link_err(link, e))?;
-        parsed_links.push(Link {
-            source,
-            target,
-            relation,
-        });
-    }
-    if !merge {
-        let incoming: std::collections::HashSet<&str> =
-            memories.iter().map(|m| m.id.as_str()).collect();
-        let stray = state
-            .backend
-            .list(ws)
-            .await?
-            .into_iter()
-            .find(|existing| !incoming.contains(existing.id.as_str()));
-        if let Some(stray) = stray {
-            return Err(ApiError::Conflict(format!(
-                "{} already holds memory {} which this dump does not contain; \
-                 use mode=merge to import into it",
-                Origin::of(ws).label(),
-                stray.id
-            )));
-        }
-        let dump: std::collections::HashSet<(String, String, Relation)> = parsed_links
-            .iter()
-            .cloned()
-            .map(|link| {
-                let link = link.canonical();
-                (
-                    link.source.to_string(),
-                    link.target.to_string(),
-                    link.relation,
-                )
-            })
-            .collect();
-        let extra = state.backend.links_all(ws).await?.into_iter().find(|edge| {
-            !dump.contains(&(
-                edge.source.to_string(),
-                edge.target.to_string(),
-                edge.relation,
-            ))
-        });
-        if let Some(extra) = extra {
-            return Err(ApiError::Conflict(format!(
-                "{} already holds a {} link {} → {} which this dump does not contain; \
-                 use mode=merge to import into it",
-                Origin::of(ws).label(),
-                extra.relation.as_str(),
-                extra.source,
-                extra.target
-            )));
-        }
-    }
-    let report = state.backend.restore(ws, memories, parsed_links).await?;
-    Ok(Json(ImportReport {
-        imported: report.imported,
-        unchanged: report.unchanged,
-    }))
+    Ok(Json(
+        ops::import(
+            &state.backend,
+            &Workspace::shared(),
+            params.mode.as_deref(),
+            doc,
+        )
+        .await?,
+    ))
 }
