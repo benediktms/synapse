@@ -140,6 +140,9 @@ pub struct HitDto {
     /// First-hop linked neighbors, for graph surfacing. Ids and phrases only.
     #[serde(default)]
     pub neighbors: Vec<NeighborDto>,
+    /// More first-hop neighbors exist than `neighbors` carries; walk them with the links route.
+    #[serde(default)]
+    pub neighbors_truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,6 +169,7 @@ impl From<&RecallHit> for HitDto {
             score: hit.score,
             memory: MemoryDto::from(&hit.memory),
             neighbors: hit.links.iter().map(NeighborDto::from).collect(),
+            neighbors_truncated: hit.links_truncated,
         }
     }
 }
@@ -417,6 +421,7 @@ mod tests {
             score: 0.5,
             memory: memory(),
             neighbors: vec![],
+            neighbors_truncated: false,
         })
         .unwrap();
         assert!(json.contains(r#""origin":"preference""#), "{json}");
@@ -431,6 +436,7 @@ mod tests {
                 score: 0.75,
                 memory: memory(),
                 neighbors: vec![],
+                neighbors_truncated: false,
             };
             let text = serde_json::to_string(&hit).unwrap();
             let back: HitDto = serde_json::from_str(&text).unwrap();

@@ -364,7 +364,7 @@ fn link_pair(ctx: &Context, args: LinkPairArgs, relation: domain::Relation) -> R
     client
         .link(&workspace, &args.a, &args.b, relation.as_str())
         .map_err(|e| e.to_string())?;
-    println!("linked {} → {} ({})", args.a, args.b, relation);
+    println!("linked {} ↔ {} ({})", args.a, args.b, relation);
     Ok(())
 }
 

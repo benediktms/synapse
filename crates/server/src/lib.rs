@@ -191,6 +191,7 @@ impl Backend for App {
         to: &Workspace,
         id: &MemoryId,
     ) -> Result<MoveOutcome, BackendError> {
+        let _guard = self.inner.links_mutation.lock().await;
         let source = self.store(from).await?;
         let target = self.store(to).await?;
         domain::move_memory((from, &*source), (to, &*target), id, self.now())
@@ -328,6 +329,7 @@ impl Backend for App {
         use domain::Store;
         let store = self.store(ws).await?;
         let mut report = RestoreReport::default();
+        let _guard = self.inner.links_mutation.lock().await;
         domain::check_import_acyclic(&store.links_all().await?, &links)?;
         for memory in memories {
             if let Some(existing) = store.get(&memory.id).await? {
@@ -347,7 +349,6 @@ impl Backend for App {
         }
         // Recreate links through the same serialized, cycle-checked path as ordinary mutations,
         // so a dump's A→B + B→A (or a merge cycle) is rejected, not smuggled past the guard.
-        let _guard = self.inner.links_mutation.lock().await;
         for link in links {
             domain::link(&*store, &link.source, &link.target, link.relation)
                 .await

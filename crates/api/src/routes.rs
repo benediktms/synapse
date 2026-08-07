@@ -710,6 +710,11 @@ async fn import_into<B: Backend>(
         memory.updated_at = updated_at;
         memories.push(memory);
     }
+    if into_preferences && !doc.links.is_empty() {
+        return Err(ApiError::BadRequest(
+            "preferences carry no links; every link command acts on workspace memories".into(),
+        ));
+    }
     let known: std::collections::HashSet<&str> = memories.iter().map(|m| m.id.as_str()).collect();
     let mut parsed_links: Vec<Link> = Vec::with_capacity(doc.links.len());
     for link in &doc.links {
@@ -743,6 +748,35 @@ async fn import_into<B: Backend>(
                  use mode=merge to import into it",
                 Origin::of(ws).label(),
                 stray.id
+            )));
+        }
+        let dump: std::collections::HashSet<(String, String, Relation)> = parsed_links
+            .iter()
+            .cloned()
+            .map(|link| {
+                let link = link.canonical();
+                (
+                    link.source.to_string(),
+                    link.target.to_string(),
+                    link.relation,
+                )
+            })
+            .collect();
+        let extra = state.backend.links_all(ws).await?.into_iter().find(|edge| {
+            !dump.contains(&(
+                edge.source.to_string(),
+                edge.target.to_string(),
+                edge.relation,
+            ))
+        });
+        if let Some(extra) = extra {
+            return Err(ApiError::Conflict(format!(
+                "{} already holds a {} link {} → {} which this dump does not contain; \
+                 use mode=merge to import into it",
+                Origin::of(ws).label(),
+                extra.relation.as_str(),
+                extra.source,
+                extra.target
             )));
         }
     }

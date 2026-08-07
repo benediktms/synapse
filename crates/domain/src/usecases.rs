@@ -13,6 +13,7 @@ use crate::workspace::Workspace;
 // paraphrases ~0.95 — 0.6 sits above the noise band.
 pub const MIN_VECTOR_SIMILARITY: f32 = 0.6;
 pub const RECALL_LIMIT_CAP: usize = 20;
+pub const RECALL_NEIGHBOUR_CAP: usize = 5;
 pub const DIGEST_PINNED_CAP: usize = 10;
 pub const DIGEST_RECENT_PROJECT_CAP: usize = 5;
 pub const DIGEST_SHARED_USER_CAP: usize = 5;
@@ -298,20 +299,30 @@ pub async fn superseders_of<S: Store>(store: &S, id: &MemoryId) -> Result<Vec<Me
     Ok(out)
 }
 
-/// Derived pin status. A memory is effectively pinned if it is itself pinned, or it supersedes a
-/// memory that is pinned (pin inherits upward through supersession). Derived — nothing is written;
-/// breaking the supersession edge reverses it automatically.
+/// Derived pin status. A memory is effectively pinned if it is itself pinned, or it supersedes —
+/// directly or down a chain of supersessions — a memory that is pinned (pin inherits upward).
+/// Derived — nothing is written; breaking the supersession edge reverses it automatically.
 pub async fn effective_pinned<S: Store>(store: &S, memory: &Memory) -> Result<bool, Error> {
     if memory.pinned {
         return Ok(true);
     }
-    for link in store.links_of(&memory.id).await? {
-        if link.relation == Relation::Supersession
-            && link.source == memory.id
-            && let Some(target) = store.get(&link.target).await?
-            && target.pinned
-        {
-            return Ok(true);
+    let mut stack = vec![memory.id.clone()];
+    let mut seen: HashSet<MemoryId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        for link in store.links_of(&id).await? {
+            if link.relation != Relation::Supersession || link.source != id {
+                continue;
+            }
+            let Some(target) = store.get(&link.target).await? else {
+                continue;
+            };
+            if target.pinned {
+                return Ok(true);
+            }
+            stack.push(link.target.clone());
         }
     }
     Ok(false)
@@ -429,11 +440,15 @@ pub async fn graph_subgraph<S: Store>(
                 if !levels.contains_key(&other) {
                     if levels.len() >= GRAPH_NODE_BUDGET {
                         budget_exceeded = true;
-                        continue;
+                        queue.clear();
+                        break;
                     }
                     levels.insert(other.clone(), level + 1);
                     queue.push_back(other);
                 }
+            }
+            if budget_exceeded {
+                break;
             }
         }
     }
@@ -537,6 +552,9 @@ pub struct RecallHit {
     pub memory: Memory,
     pub score: f64,
     pub links: Vec<RecallLink>,
+    /// The memory has first-hop neighbours beyond the `RECALL_NEIGHBOUR_CAP` shown; `syn links`
+    /// walks the rest.
+    pub links_truncated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -647,12 +665,14 @@ async fn hybrid_search<S: Store>(
             if is_superseded(store, &id).await? {
                 continue;
             }
-            let links = build_recall_links(store, &memory, filter, links_in_scope).await?;
+            let (links, links_truncated) =
+                build_recall_links(store, &memory, filter, links_in_scope).await?;
             hits.push(RecallHit {
                 workspace: workspace.clone(),
                 memory,
                 score,
                 links,
+                links_truncated,
             });
         }
     }
@@ -670,15 +690,36 @@ async fn hybrid_search<S: Store>(
 /// The first-hop linked neighbors of `memory`, for recall surfacing. For each edge touching the
 /// memory, emits the other endpoint with a display phrase relative to `memory`. When
 /// `links_in_scope` is set, edges whose neighbor's scope doesn't match `filter` are dropped
-/// (cross-scope links otherwise surface, per Q17).
+/// (cross-scope links otherwise surface, per Q17). At most `RECALL_NEIGHBOUR_CAP` neighbours are
+/// hydrated, lowest id first, so a hub memory cannot turn one recall into an unbounded fan-out;
+/// the flag says the rest exist.
 async fn build_recall_links<S: Store>(
     store: &S,
     memory: &Memory,
     filter: &ScopeFilter,
     links_in_scope: bool,
-) -> Result<Vec<RecallLink>, Error> {
+) -> Result<(Vec<RecallLink>, bool), Error> {
+    let mut links = store.links_of(&memory.id).await?;
+    links.sort_by(|a, b| {
+        let left = if a.source == memory.id {
+            &a.target
+        } else {
+            &a.source
+        };
+        let right = if b.source == memory.id {
+            &b.target
+        } else {
+            &b.source
+        };
+        left.cmp(right).then(a.relation.cmp(&b.relation))
+    });
     let mut out = Vec::new();
-    for link in store.links_of(&memory.id).await? {
+    let mut truncated = false;
+    for link in links {
+        if out.len() == RECALL_NEIGHBOUR_CAP {
+            truncated = true;
+            break;
+        }
         let (neighbor_id, directed, this_is_source) = if link.source == memory.id {
             (link.target.clone(), true, true)
         } else {
@@ -699,8 +740,7 @@ async fn build_recall_links<S: Store>(
             scope: neighbor.scope,
         });
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(out)
+    Ok((out, truncated))
 }
 
 #[derive(Clone, Debug)]
@@ -1841,6 +1881,29 @@ mod tests {
     }
 
     #[test]
+    fn effective_pinned_follows_a_supersession_chain() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        store.seed(
+            mem(
+                3,
+                "oldest pinned",
+                MemoryKind::Project,
+                Scope::Workspace,
+                true,
+            ),
+            vec![0.0, 1.0],
+        );
+        block_on(link(&store, &mid(1), &mid(2), Relation::Supersession)).unwrap();
+        block_on(link(&store, &mid(2), &mid(3), Relation::Supersession)).unwrap();
+        let a = get_mem(&store, &mid(1));
+        assert!(block_on(effective_pinned(&store, &a)).unwrap());
+
+        block_on(unlink(&store, &mid(2), &mid(3))).unwrap();
+        assert!(!block_on(effective_pinned(&store, &a)).unwrap());
+    }
+
+    #[test]
     fn effective_pinned_not_inherited_from_unpinned_target() {
         let store = FakeStore::new();
         seed_pair(&store, 1, 2);
@@ -1930,6 +1993,49 @@ mod tests {
         assert_eq!(superseder.links.len(), 1);
         assert_eq!(superseder.links[0].id, mid(1));
         assert_eq!(superseder.links[0].phrase, "supersedes");
+    }
+
+    #[test]
+    fn recall_caps_a_hubs_neighbors_and_flags_the_rest() {
+        let store = FakeStore::new();
+        store.seed(
+            mem(1, "hub fact", MemoryKind::Project, Scope::Workspace, false),
+            vec![1.0, 0.0],
+        );
+        let spokes = RECALL_NEIGHBOUR_CAP as u32 + 3;
+        for n in 2..2 + spokes {
+            store.seed(
+                mem(
+                    n,
+                    &format!("spoke {n}"),
+                    MemoryKind::Project,
+                    Scope::Workspace,
+                    false,
+                ),
+                vec![0.0, n as f32],
+            );
+            block_on(link(&store, &mid(1), &mid(n), Relation::Relation)).unwrap();
+        }
+
+        let ws = Workspace::new("work").unwrap();
+        let embedder = FakeEmbedder::new().with("hub fact", vec![1.0, 0.0]);
+        let hits = block_on(recall(
+            &embedder,
+            (&ws, &store),
+            None,
+            &RecallRequest {
+                query: "hub fact".to_string(),
+                project: None,
+                limit: 10,
+                links_in_scope: false,
+            },
+        ))
+        .unwrap();
+
+        let hub = hits.iter().find(|h| h.memory.id == mid(1)).unwrap();
+        assert_eq!(hub.links.len(), RECALL_NEIGHBOUR_CAP);
+        assert!(hub.links_truncated, "the cut neighbours must be announced");
+        assert_eq!(hub.links[0].id, mid(2));
     }
 
     #[test]

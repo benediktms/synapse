@@ -1258,6 +1258,83 @@ async fn move_drops_links_and_reports_how_many() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn preference_import_refuses_links_no_route_can_reach() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+
+    let doc = json!({
+        "version": 2,
+        "origin": "preference",
+        "memories": [
+            { "id": mid(1), "content": "prefers ripgrep", "kind": "user", "scope": "workspace",
+              "tags": [], "pinned": false, "created_at": "2026-07-01T00:00:00Z",
+              "updated_at": "2026-07-01T00:00:00Z" },
+            { "id": mid(2), "content": "prefers fd", "kind": "user", "scope": "workspace",
+              "tags": [], "pinned": false, "created_at": "2026-07-01T00:00:00Z",
+              "updated_at": "2026-07-01T00:00:00Z" },
+        ],
+        "links": [
+            { "source": mid(1), "relation": "supersession", "target": mid(2), "directed": true },
+        ],
+    });
+    let (status, body) = req(&router, Method::POST, "/preferences/import", Some(doc)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a preference dump must not smuggle in unreachable edges: {body}"
+    );
+    let (_, listed) = req(&router, Method::GET, "/preferences", None).await;
+    assert!(
+        listed["memories"].as_array().unwrap().is_empty(),
+        "{listed}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_import_conflicts_on_a_link_the_dump_lacks() {
+    let dir = TempDir::new().unwrap();
+    let (router, _) = boot(dir.path()).await;
+    req(&router, Method::PUT, "/workspaces/work", None).await;
+    put_memory(&router, "work", 1, "old deploy process").await;
+    put_memory(&router, "work", 2, "new deploy process").await;
+
+    let (_, linkless) = req(&router, Method::GET, "/export?ws=work", None).await;
+    req(
+        &router,
+        Method::POST,
+        &format!("/memories/{}/links?ws=work", mid(2)),
+        Some(json!({ "target": mid(1), "relation": "supersession" })),
+    )
+    .await;
+
+    let (status, body) = req(
+        &router,
+        Method::POST,
+        "/import?ws=work",
+        Some(linkless.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a default restore must not leave a link the dump never held: {body}"
+    );
+
+    let (status, body) = req(
+        &router,
+        Method::POST,
+        "/import?ws=work&mode=merge",
+        Some(linkless),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "merge keeps unrelated state: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn import_keeps_preferences_and_workspaces_apart() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;

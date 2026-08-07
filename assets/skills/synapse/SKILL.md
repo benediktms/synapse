@@ -100,7 +100,7 @@ Pick the edge type by how confident you are about the nature of the relationship
 When unsure, default to the weakest claim rather than guessing a specific one:
 
 - `syn support <A> <B>` — one memory is evidence for the other (positive).
-- `syn contradict <A> <B>` — the two memory disagree; a hint one may be stale.
+- `syn contradict <A> <B>` — the two memories disagree; a hint one may be stale.
 - `syn supersede --old <B> --new <A>` — the new fact replaces the old one (directed;
   the superseded memory stops surfacing on its own but stays reachable).
 - `syn relate <A> <B>` — related in a way you can't characterise further. Use this

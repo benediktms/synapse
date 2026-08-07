@@ -38,7 +38,7 @@ impl fmt::Display for Error {
             }
             Error::Ambiguous(a, b) => write!(
                 f,
-                "multiple links exist between {a} and {b}; unlink the one you mean or pick a pair with a single link"
+                "multiple links exist between {a} and {b}; unlink the pair and create the one link you want"
             ),
             Error::Store(msg) => write!(f, "store error: {msg}"),
             Error::Embed(msg) => write!(f, "embedding error: {msg}"),

@@ -6,13 +6,19 @@ pub fn hit_line(hit: &HitDto) -> String {
     if hit.neighbors.is_empty() {
         return memory_line(&hit.origin, &hit.memory);
     }
-    let links = hit
+    let mut links = hit
         .neighbors
         .iter()
         .map(|n| format!("{} {}", n.phrase, n.id))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{} ({links})", memory_line(&hit.origin, &hit.memory))
+        .collect::<Vec<_>>();
+    if hit.neighbors_truncated {
+        links.push("more via syn links".to_string());
+    }
+    format!(
+        "{} ({})",
+        memory_line(&hit.origin, &hit.memory),
+        links.join(", ")
+    )
 }
 
 pub fn memory_line(origin: &Origin, memory: &MemoryDto) -> String {
@@ -132,6 +138,7 @@ mod tests {
                 neighbor("m_31bc", "supersedes", "workspace"),
                 neighbor("m_00B1", "is superseded by", "work · fresha/offers"),
             ],
+            neighbors_truncated: false,
         };
         assert_eq!(
             hit_line(&hit),
@@ -147,6 +154,7 @@ mod tests {
             score: 0.9,
             memory: memory("m_7f2a", "fresha/offers", "Staging deploys via ArgoCD."),
             neighbors: vec![],
+            neighbors_truncated: false,
         };
         assert_eq!(
             hit_line(&hit),
@@ -161,6 +169,7 @@ mod tests {
             score: 0.5,
             memory: memory("m_31bc", "workspace", "Team uses trunk-based development."),
             neighbors: vec![],
+            neighbors_truncated: false,
         };
         assert_eq!(
             hit_line(&hit),
@@ -175,6 +184,7 @@ mod tests {
             score: 0.4,
             memory: memory("m_31bc", "workspace", "Prefers Datadog links."),
             neighbors: vec![],
+            neighbors_truncated: false,
         };
         assert_eq!(
             hit_line(&hit),
