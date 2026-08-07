@@ -110,8 +110,14 @@ fn flush_before_read(ctx: &Context) {
     let flushed = ctx
         .client(FLUSH_SEND_TIMEOUT)
         .and_then(|client| outbox.flush(&client, Some(FLUSH_BUDGET)));
-    let Ok(report) = flushed else {
-        return;
+    let report = match flushed {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!(
+                "note: the local queue could not be flushed ({e}); this read may predate anything in it — see: syn list --pending"
+            );
+            return;
+        }
     };
     for (id, failure) in &report.dead_lettered {
         eprintln!("note: {id} moved to dead-letter: {failure}");
@@ -119,9 +125,23 @@ fn flush_before_read(ctx: &Context) {
     if report.still_queued > 0 {
         let reason = report.deferred.as_deref().unwrap_or("still unsent");
         eprintln!(
-            "note: {} saves are queued locally ({reason}); this read may predate them — see: syn list --pending",
-            report.still_queued
+            "note: {} ({reason}); this read may predate them — see: syn list --pending",
+            backlog_note(&report)
         );
+    }
+}
+
+/// A count alone reads as a momentary outage, which under a minute is what it usually is.
+/// Past that, the age of the oldest item is what names a queue that has stopped draining.
+fn backlog_note(report: &FlushReport) -> String {
+    let count = report.still_queued;
+    let now = now_millis();
+    match report.oldest_queued_at {
+        Some(queued_at) if now.saturating_sub(queued_at) >= 60_000 => format!(
+            "{count} saves are queued locally, oldest {}",
+            age(now, queued_at)
+        ),
+        _ => format!("{count} saves are queued locally"),
     }
 }
 
@@ -665,8 +685,8 @@ fn drain_before_export(client: &SynapseApiClient) -> Result<(), String> {
     report_backlog(&report);
     if report.still_queued > 0 {
         return Err(format!(
-            "{} saves are still queued locally and would be missing from this dump (see: syn list --pending)",
-            report.still_queued
+            "{} — the dump would omit them, so nothing was written (see: syn list --pending)",
+            backlog_note(&report)
         ));
     }
     let dead_lettered = outbox.dead_letters()?.len();
@@ -709,9 +729,13 @@ fn set_config(mut config: Config, command: ConfigCommand) -> Result<(), String> 
             println!("token stored in {}", crate::config::config_path().display());
         }
         ConfigCommand::SetUrl { url } => {
-            config.url = Some(url.trim_end_matches('/').to_string());
+            config.url = Some(api_client::parse_base_url(&url)?);
             config.save()?;
-            println!("server url set to {}", config.url());
+            println!(
+                "server url set to {} in {}",
+                config.url(),
+                crate::config::config_path().display()
+            );
         }
     }
     Ok(())

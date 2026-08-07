@@ -375,7 +375,8 @@ fn export_refuses_an_incomplete_dump_and_flushes_the_queue_once_the_server_retur
     let refused = machine.run(&["export", "--workspace", "work"]);
     assert!(!refused.status.success());
     assert!(
-        stderr(&refused).contains("still queued locally"),
+        stderr(&refused).contains("1 saves are queued locally")
+            && stderr(&refused).contains("the dump would omit them"),
         "{}",
         stderr(&refused)
     );
@@ -400,7 +401,8 @@ fn export_refuses_an_incomplete_dump_and_flushes_the_queue_once_the_server_retur
 
 #[test]
 fn a_read_says_so_when_it_may_predate_a_queued_save() {
-    let machine = Machine::new(&format!("http://127.0.0.1:{}", dead_port()));
+    let port = dead_port();
+    let machine = Machine::new(&format!("http://127.0.0.1:{port}"));
     assert!(
         machine
             .run(&["save", "unsendable", "--type", "project"])
@@ -412,10 +414,39 @@ fn a_read_says_so_when_it_may_predate_a_queued_save() {
 
     assert!(!read.status.success(), "the read itself needs the server");
     assert!(
-        stderr(&read).contains("1 saves are queued locally")
+        stderr(&read).contains("1 saves are queued locally (")
             && stderr(&read).contains("this read may predate them"),
-        "{}",
+        "a queue younger than a minute carries no age: {}",
         stderr(&read)
+    );
+    assert!(
+        stderr(&read).contains(&format!(
+            "cannot reach synapse server at http://127.0.0.1:{port}: "
+        )),
+        "an unreachable server must name the url it was pointed at, and nothing more: {}",
+        stderr(&read)
+    );
+}
+
+#[test]
+fn a_url_that_can_never_reach_a_server_is_refused_where_it_is_set() {
+    let machine = Machine::with_config("");
+
+    for bad in ["127.0.0.1:8737", "htttp://127.0.0.1:8737", ""] {
+        let output = machine.run(&["config", "set-url", bad]);
+        assert!(!output.status.success(), "{bad:?} was accepted");
+        assert!(
+            stderr(&output).contains("is not a usable server url"),
+            "{bad:?}: {}",
+            stderr(&output)
+        );
+    }
+
+    assert!(
+        machine
+            .run(&["config", "set-url", "https://memory.example/"])
+            .status
+            .success()
     );
 }
 

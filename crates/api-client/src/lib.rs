@@ -14,8 +14,14 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8737";
 
 #[derive(Clone, Debug)]
 pub enum ClientError {
-    Transport(String),
-    Status { status: u16, message: String },
+    Transport {
+        origin: Option<String>,
+        message: String,
+    },
+    Status {
+        status: u16,
+        message: String,
+    },
     Decode(String),
 }
 
@@ -24,7 +30,7 @@ impl ClientError {
     /// of a committed write, and replaying it under the same id is cheaper than a duplicate.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(_) | Self::Decode(_) => true,
+            Self::Transport { .. } | Self::Decode(_) => true,
             Self::Status { status, .. } => *status >= 500 || *status == 408 || *status == 429,
         }
     }
@@ -33,7 +39,14 @@ impl ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Transport(msg) => write!(f, "cannot reach synapse server: {msg}"),
+            Self::Transport {
+                origin: Some(origin),
+                message,
+            } => write!(f, "cannot reach synapse server at {origin}: {message}"),
+            Self::Transport {
+                origin: None,
+                message,
+            } => write!(f, "cannot reach synapse server: {message}"),
             Self::Status { status, message } => write!(f, "server returned {status}: {message}"),
             Self::Decode(msg) => write!(f, "unreadable server response: {msg}"),
         }
@@ -45,12 +58,16 @@ impl std::error::Error for ClientError {}
 impl From<reqwest::Error> for ClientError {
     fn from(err: reqwest::Error) -> Self {
         // `without_url` keeps the queued content and workspace out of the error line.
+        let origin = err.url().map(|url| url.origin().ascii_serialization());
         let cause = root_cause(&err);
         let summary = err.without_url().to_string();
-        Self::Transport(match cause {
-            Some(cause) => format!("{summary}: {cause}"),
-            None => summary,
-        })
+        Self::Transport {
+            origin,
+            message: match cause {
+                Some(cause) => format!("{summary}: {cause}"),
+                None => summary,
+            },
+        }
     }
 }
 
@@ -67,21 +84,42 @@ pub struct SynapseApiClient {
     base: String,
 }
 
+/// An unparsed or non-http base url never reaches a request, so a later failure could
+/// name no server at all — and `Url::origin()` serializes an exotic scheme as "null".
+/// Rejecting it here keeps every downstream error able to name where it was pointed.
+pub fn parse_base_url(base_url: &str) -> Result<String, String> {
+    let trimmed = base_url.trim_end_matches('/');
+    let url = reqwest::Url::parse(trimmed)
+        .map_err(|e| format!("{base_url:?} is not a usable server url: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "{base_url:?} is not a usable server url: expected an http:// or https:// scheme, found {:?}",
+            url.scheme()
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 impl SynapseApiClient {
     pub fn new(base_url: &str, token: &str, timeout: Duration) -> Result<Self, ClientError> {
+        let base = parse_base_url(base_url).map_err(|message| ClientError::Transport {
+            origin: None,
+            message,
+        })?;
         let mut headers = HeaderMap::new();
-        let mut auth = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| ClientError::Transport("token contains invalid characters".into()))?;
+        let mut auth = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+            ClientError::Transport {
+                origin: None,
+                message: "token contains invalid characters".into(),
+            }
+        })?;
         auth.set_sensitive(true);
         headers.insert(AUTHORIZATION, auth);
         let http = Client::builder()
             .timeout(timeout)
             .default_headers(headers)
             .build()?;
-        Ok(Self {
-            http,
-            base: base_url.trim_end_matches('/').to_string(),
-        })
+        Ok(Self { http, base })
     }
 
     fn url(&self, path: &str) -> String {
@@ -382,7 +420,10 @@ mod tests {
 
     #[test]
     fn retryability_splits_on_status_class() {
-        let transport = ClientError::Transport("connection refused".into());
+        let transport = ClientError::Transport {
+            origin: None,
+            message: "connection refused".into(),
+        };
         assert!(transport.is_retryable());
         assert!(
             ClientError::Decode("expected value at line 1".into()).is_retryable(),
