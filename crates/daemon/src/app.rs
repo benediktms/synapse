@@ -14,8 +14,7 @@ use domain::{
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
-    Config, Manifest, WorkspaceBinding, offline_bindings, open_binding, replica_path,
-    resolve_bindings,
+    Config, Manifest, WorkspaceBinding, open_binding, replica_path, resolve_bindings,
 };
 use crate::rpc::{RpcHost, WorkspaceStatus};
 
@@ -47,48 +46,34 @@ impl DaemonApp {
             .map_err(|e| format!("cannot create state dir {}: {e}", state_dir.display()))?;
         let embedder = Arc::new(FastEmbedder::new().map_err(|e| format!("embedder: {e}"))?);
 
-        let mut problems = Vec::new();
         let mut stores = HashMap::new();
         let mut bindings = HashMap::new();
 
-        // Online resolution (list scoped orgs, provision shared if missing) then open; on failure
-        // fall back to offline bindings from the cached manifest.
-        match resolve_bindings(&state_dir, &config).await {
-            Ok(resolved) => {
-                for binding in resolved {
-                    match open_binding(&binding).await {
-                        Ok(store) => {
-                            let ws = binding.workspace.clone();
-                            bindings.insert(ws.clone(), binding);
-                            stores.insert(ws, Arc::new(store));
-                        }
-                        Err(e) => problems.push(e),
-                    }
+        let (resolved, mut problems) = resolve_bindings(&state_dir, &config).await;
+        for binding in resolved {
+            match open_binding(&binding).await {
+                Ok(store) => {
+                    let ws = binding.workspace.clone();
+                    bindings.insert(ws.clone(), binding);
+                    stores.insert(ws, Arc::new(store));
                 }
-            }
-            Err(_) => {
-                for binding in offline_bindings(&state_dir, &config) {
-                    match open_binding(&binding).await {
-                        Ok(store) => {
-                            let ws = binding.workspace.clone();
-                            bindings.insert(ws.clone(), binding);
-                            stores.insert(ws, Arc::new(store));
-                        }
-                        Err(e) => problems.push(e),
-                    }
-                }
+                Err(e) => problems.push(e),
             }
         }
 
-        if stores.is_empty() && problems.is_empty() {
-            problems.push(
-                "no replicas available: the first run needs the network to bootstrap".to_string(),
-            );
-        }
-        let ready = if problems.is_empty() {
-            Ok(())
+        // Partial failure must not brick the daemon: healthy workspaces keep serving, and
+        // unready blocks everything only when no replica opened at all.
+        let ready = if stores.is_empty() {
+            Err(if problems.is_empty() {
+                "no replicas available: the first run needs the network to bootstrap".to_string()
+            } else {
+                problems.join("; ")
+            })
         } else {
-            Err(problems.join("; "))
+            for problem in &problems {
+                tracing::warn!("boot: {problem}");
+            }
+            Ok(())
         };
 
         Ok(Self {
@@ -259,16 +244,21 @@ impl Backend for DaemonApp {
     }
 
     async fn create_workspace(&self, ws: &Workspace) -> Result<bool, BackendError> {
-        let mut stores = self.inner.stores.write().await;
-        if stores.contains_key(ws) {
+        if self.inner.stores.read().await.contains_key(ws) {
             return Ok(false);
         }
+        // Provision and open without the stores write-lock: both hit the network with no
+        // bound, and a held write guard would stall every other request on the daemon.
         let binding = self.provision_binding(ws).await?;
         let store = Arc::new(
             open_binding(&binding)
                 .await
                 .map_err(|e| BackendError::Domain(Error::Store(e)))?,
         );
+        let mut stores = self.inner.stores.write().await;
+        if stores.contains_key(ws) {
+            return Ok(false);
+        }
         stores.insert(ws.clone(), store);
         Ok(true)
     }
@@ -324,6 +314,7 @@ impl Backend for DaemonApp {
     async fn get(&self, ws: &Workspace, id: &MemoryId) -> Result<Option<Memory>, BackendError> {
         use domain::Store;
         let store = self.store(ws).await?;
+        self.freshen(&store).await;
         store.get(id).await.map_err(Into::into)
     }
 
@@ -393,6 +384,7 @@ impl Backend for DaemonApp {
         depth: usize,
     ) -> Result<GraphSubgraph, BackendError> {
         let (active, _) = self.active_and_shared(ws).await?;
+        self.freshen(&active).await;
         domain::graph_subgraph(&*active, id, depth)
             .await
             .map_err(Into::into)
@@ -401,6 +393,7 @@ impl Backend for DaemonApp {
     async fn links_all(&self, ws: &Workspace) -> Result<Vec<GraphEdge>, BackendError> {
         use domain::Store;
         let (active, _) = self.active_and_shared(ws).await?;
+        self.freshen(&active).await;
         let links = active.links_all().await.map_err(BackendError::Domain)?;
         Ok(links
             .into_iter()

@@ -100,55 +100,101 @@ impl Manifest {
     }
 }
 
-/// Resolve workspace bindings for the scoped orgs, provisioning a missing shared DB in the first
-/// scoped org (fully programmatic). Refreshes the manifest with any URLs learned online.
-pub async fn resolve_bindings(
+/// The workspace a Turso DB name maps to. `Workspace::new` rejects the reserved name
+/// "shared", but the shared DB does exist remotely and must round-trip through
+/// enumeration, or every boot after the first re-creates it and fails on the 409.
+fn workspace_named(name: &str) -> Option<Workspace> {
+    let shared = Workspace::shared();
+    if name == shared.as_str() {
+        Some(shared)
+    } else {
+        Workspace::new(name).ok()
+    }
+}
+
+fn cached_bindings_for_org(
     dir: &Path,
-    config: &Config,
-) -> Result<Vec<WorkspaceBinding>, String> {
+    manifest: &Manifest,
+    org: &ScopedOrg,
+) -> Vec<WorkspaceBinding> {
+    manifest
+        .entries
+        .iter()
+        .filter(|(_, e)| e.org == org.name)
+        .filter_map(|(name, e)| {
+            let ws = workspace_named(name)?;
+            replica_path(dir, &ws).exists().then(|| WorkspaceBinding {
+                workspace: ws.clone(),
+                replica: replica_path(dir, &ws),
+                url: e.url.clone(),
+                token: org.token.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Resolve workspace bindings for the scoped orgs, provisioning a missing shared DB in the
+/// first reachable org (fully programmatic). An unreachable org degrades to its cached
+/// manifest bindings instead of aborting the other orgs. Refreshes the manifest with any
+/// URLs learned online. Returns the bindings plus the problems hit along the way.
+pub async fn resolve_bindings(dir: &Path, config: &Config) -> (Vec<WorkspaceBinding>, Vec<String>) {
     let platform = TursoPlatform::new();
     let mut manifest = Manifest::load(dir);
     let mut bindings: Vec<WorkspaceBinding> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    let mut online_org: Option<&ScopedOrg> = None;
 
     for org in &config.scoped_orgs {
-        let dbs = platform
-            .list_databases(&org.name, &org.token)
-            .await
-            .map_err(|e| format!("enum {}: {e}", org.name))?;
-        for db in dbs {
-            let Ok(ws) = Workspace::new(&db.name) else {
-                continue; // DB name isn't a valid workspace id; ignore
-            };
-            manifest.set(&ws, &db.url, &org.name);
-            bindings.push(WorkspaceBinding {
-                workspace: ws.clone(),
-                replica: replica_path(dir, &ws),
-                url: db.url,
-                token: org.token.clone(),
-            });
+        match platform.list_databases(&org.name, &org.token).await {
+            Ok(dbs) => {
+                online_org.get_or_insert(org);
+                for db in dbs {
+                    let Some(ws) = workspace_named(&db.name) else {
+                        continue;
+                    };
+                    manifest.set(&ws, &db.url, &org.name);
+                    bindings.push(WorkspaceBinding {
+                        workspace: ws.clone(),
+                        replica: replica_path(dir, &ws),
+                        url: db.url,
+                        token: org.token.clone(),
+                    });
+                }
+            }
+            Err(e) => {
+                problems.push(format!(
+                    "enumerate {}: {e}; falling back to cached bindings",
+                    org.name
+                ));
+                bindings.extend(cached_bindings_for_org(dir, &manifest, org));
+            }
         }
     }
 
-    // Provision the shared workspace in the first scoped org if no org hosts one yet.
+    // Provision the shared workspace in the first reachable org if no org hosts one yet.
     let shared = Workspace::shared();
     if !bindings.iter().any(|b| b.workspace == shared)
-        && let Some(org) = config.scoped_orgs.first()
+        && let Some(org) = online_org
     {
-        let db = platform
+        match platform
             .create_database(&org.name, &org.token, shared.as_str())
             .await
-            .map_err(|e| format!("create shared in {}: {e}", org.name))?;
-        manifest.set(&shared, &db.url, &org.name);
-        bindings.push(WorkspaceBinding {
-            workspace: shared.clone(),
-            replica: replica_path(dir, &shared),
-            url: db.url,
-            token: org.token.clone(),
-        });
+        {
+            Ok(db) => {
+                manifest.set(&shared, &db.url, &org.name);
+                bindings.push(WorkspaceBinding {
+                    workspace: shared.clone(),
+                    replica: replica_path(dir, &shared),
+                    url: db.url,
+                    token: org.token.clone(),
+                });
+            }
+            Err(e) => problems.push(format!("create shared in {}: {e}", org.name)),
+        }
     }
 
     manifest.save(dir);
-    Ok(bindings)
+    (bindings, problems)
 }
 
 /// Open a workspace's replica, online or offline. Offline opens use the cached manifest (url +
@@ -169,31 +215,25 @@ pub async fn open_binding(binding: &WorkspaceBinding) -> Result<LibsqlStore, Str
 /// Bindings available offline from the cached manifest, using org tokens from config.
 pub fn offline_bindings(dir: &Path, config: &Config) -> Vec<WorkspaceBinding> {
     let manifest = Manifest::load(dir);
-    let tokens: HashMap<&str, &str> = config
-        .scoped_orgs
-        .iter()
-        .map(|o| (o.name.as_str(), o.token.as_str()))
-        .collect();
     config
         .scoped_orgs
         .iter()
-        .flat_map(|org| {
-            manifest
-                .entries
-                .iter()
-                .filter(move |(_, e)| e.org == org.name)
-                .filter_map(|(name, e)| {
-                    let ws = Workspace::new(name).ok()?;
-                    if !replica_path(dir, &ws).exists() {
-                        return None;
-                    }
-                    Some(WorkspaceBinding {
-                        workspace: ws.clone(),
-                        replica: replica_path(dir, &ws),
-                        url: e.url.clone(),
-                        token: tokens.get(org.name.as_str())?.to_string(),
-                    })
-                })
-        })
+        .flat_map(|org| cached_bindings_for_org(dir, &manifest, org))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_named;
+    use domain::Workspace;
+
+    #[test]
+    fn shared_db_name_maps_to_the_shared_workspace() {
+        assert_eq!(workspace_named("shared"), Some(Workspace::shared()));
+        assert_eq!(
+            workspace_named("work"),
+            Some(Workspace::new("work").unwrap())
+        );
+        assert_eq!(workspace_named("Not A Workspace"), None);
+    }
 }

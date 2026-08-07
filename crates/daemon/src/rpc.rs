@@ -1,9 +1,10 @@
 use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use api::ops::{self, SearchArgs};
@@ -186,19 +187,34 @@ impl From<BackendError> for RpcError {
     }
 }
 
+/// Mirrors the HTTP transport's DefaultBodyLimit; without a cap an endless byte stream
+/// with no newline would be buffered until the daemon is OOM-killed.
+const MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(600);
+
 pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
     if path.exists() {
         // Tolerate a stale socket left behind by a killed daemon; the flock gate above ensures we
         // only reach here when no live daemon holds the lock.
         let _ = std::fs::remove_file(path);
     }
-    UnixListener::bind(path)
+    let listener = UnixListener::bind(path)?;
+    // The socket is the auth boundary; never leave its mode to the process umask.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
 }
 
 pub async fn serve<H: RpcHost>(listener: UnixListener, host: H) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                tracing::warn!("accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let host = host.clone();
         tokio::spawn(async move {
@@ -208,14 +224,19 @@ pub async fn serve<H: RpcHost>(listener: UnixListener, host: H) {
 }
 
 async fn handle_conn<H: RpcHost>(stream: UnixStream, host: H) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream).take(MAX_REQUEST_BYTES);
     let mut line = String::new();
     // Newline-framed, per-command short connection: read one request, reply, close.
-    if reader.read_line(&mut line).await? == 0 {
+    let read = reader.read_line(&mut line).await?;
+    if read == 0 {
         return Ok(());
     }
-    let mut writer = reader.into_inner();
-    let response = dispatch(&line, &host).await;
+    let mut writer = reader.into_inner().into_inner();
+    let response = if read as u64 == MAX_REQUEST_BYTES && !line.ends_with('\n') {
+        fail(0, -32600, "request exceeds the 32 MiB limit")
+    } else {
+        dispatch(&line, &host).await
+    };
     let mut bytes = response.into_bytes();
     bytes.push(b'\n');
     writer.write_all(&bytes).await?;
@@ -323,14 +344,20 @@ pub async fn dispatch<H: RpcHost>(line: &str, host: &H) -> String {
     let Some(method) = Method::parse(&req.method) else {
         return fail(req.id, -32601, &format!("method not found: {}", req.method));
     };
-    match call(method, req.params, host).await {
-        Ok(result) => serde_json::to_string(&Success {
+    let deadline = if method == Method::Import {
+        IMPORT_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    };
+    match tokio::time::timeout(deadline, call(method, req.params, host)).await {
+        Ok(Ok(result)) => serde_json::to_string(&Success {
             jsonrpc: "2.0",
             id: req.id,
             result,
         })
         .unwrap_or_default(),
-        Err(e) => fail(req.id, e.code, &e.message),
+        Ok(Err(e)) => fail(req.id, e.code, &e.message),
+        Err(_) => fail(req.id, -32000, "request timed out"),
     }
 }
 

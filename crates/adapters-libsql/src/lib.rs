@@ -244,9 +244,9 @@ impl Store for LibsqlStore {
             .await
             .map_err(store_err)?;
         if affected == 1 {
+            self.mark_dirty();
             return Ok(());
         }
-        self.mark_dirty();
         let existing = self
             .get(&memory.id)
             .await?
@@ -404,17 +404,20 @@ impl Store for LibsqlStore {
             return Err(Error::NotFound(canonical.target));
         }
         let conn = self.conn()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO links (low_id, high_id, relation) VALUES (?, ?, ?)",
-            params![
-                canonical.source.as_str(),
-                canonical.target.as_str(),
-                canonical.relation.as_str(),
-            ],
-        )
-        .await
-        .map_err(store_err)?;
-        self.mark_dirty();
+        let affected = conn
+            .execute(
+                "INSERT OR IGNORE INTO links (low_id, high_id, relation) VALUES (?, ?, ?)",
+                params![
+                    canonical.source.as_str(),
+                    canonical.target.as_str(),
+                    canonical.relation.as_str(),
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        if affected > 0 {
+            self.mark_dirty();
+        }
         Ok(())
     }
 
@@ -732,6 +735,9 @@ mod tests {
         };
         let embedding = vec![0.1f32, 0.2, 0.3, 0.4];
         store.insert(&memory, &embedding).await.unwrap();
+        assert_eq!(store.pending_outbox(), 1, "a real write counts as pending");
+        store.insert(&memory, &embedding).await.unwrap();
+        assert_eq!(store.pending_outbox(), 1, "an idempotent re-save does not");
         let got = store.get(&memory.id).await.unwrap().unwrap();
         assert_eq!(got.content, memory.content);
         assert_eq!(got.tags, memory.tags);

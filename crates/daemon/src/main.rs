@@ -27,6 +27,11 @@ async fn main() {
 
     let dir = state_dir();
     std::fs::create_dir_all(&dir).expect("create state dir");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict state dir");
+    }
 
     // Single instance: flock the lock file; a second daemon exits 0 immediately. The binding is
     // held for the process lifetime (dropping it would release the lock).
