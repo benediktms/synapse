@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 const SKILL_BODY: &str = include_str!("../../assets/skills/synapse/SKILL.md");
 const HOOK_BODY: &str = include_str!("../../assets/hooks/session-start.sh");
+const OMP_HOOK_BODY: &str = include_str!("../../assets/hooks/omp-session-start.ts");
 const MARKER: &str = "synapse:managed 1";
 
 /// Codex has no match-everything wildcard, so the events are named outright.
@@ -19,11 +20,17 @@ pub enum Harness {
     Claude,
     Copilot,
     Codex,
+    Omp,
 }
 
 impl Harness {
     pub fn all() -> &'static [Harness] {
-        &[Harness::Claude, Harness::Copilot, Harness::Codex]
+        &[
+            Harness::Claude,
+            Harness::Copilot,
+            Harness::Codex,
+            Harness::Omp,
+        ]
     }
 
     fn label(self) -> &'static str {
@@ -31,6 +38,7 @@ impl Harness {
             Harness::Claude => "claude code",
             Harness::Copilot => "copilot cli",
             Harness::Codex => "codex cli",
+            Harness::Omp => "oh my pi",
         }
     }
 }
@@ -44,6 +52,7 @@ pub struct Homes {
     claude: PathBuf,
     copilot: PathBuf,
     codex: PathBuf,
+    omp: PathBuf,
 }
 
 impl Homes {
@@ -52,6 +61,7 @@ impl Homes {
             claude: harness_home("CLAUDE_CONFIG_DIR", ".claude")?,
             copilot: harness_home("COPILOT_HOME", ".copilot")?,
             codex: harness_home("CODEX_HOME", ".codex")?,
+            omp: harness_home("PI_CODING_AGENT_DIR", ".omp/agent")?,
         })
     }
 
@@ -60,6 +70,7 @@ impl Homes {
             Harness::Claude => &self.claude,
             Harness::Copilot => &self.copilot,
             Harness::Codex => &self.codex,
+            Harness::Omp => &self.omp,
         }
     }
 }
@@ -103,6 +114,19 @@ fn targets(harness: Harness, home: &Path) -> Result<Vec<Target>, String> {
         style: Comment::Html,
         executable: false,
     });
+    if harness == Harness::Omp {
+        // omp auto-discovers `.ts` extension modules from the agent extensions dir.
+        // It does read `~/.claude`, but only `hooks/pre|post` there — never
+        // `settings.json` — so the Claude registration cannot serve it. This `.ts`
+        // module is the target itself; there is no JSON hook config to merge.
+        let hook = Target::Owned(Owned {
+            path: home.join("extensions/synapse.ts"),
+            body: OMP_HOOK_BODY.to_string(),
+            style: Comment::Slash,
+            executable: false,
+        });
+        return Ok(vec![skill, hook]);
+    }
     let (script, hook) = match harness {
         Harness::Claude => {
             let script = home.join("hooks/synapse-session-start.sh");
@@ -119,6 +143,7 @@ fn targets(harness: Harness, home: &Path) -> Result<Vec<Target>, String> {
             let hook = copilot_hook(home.join("hooks/synapse.json"), &script)?;
             (script, hook)
         }
+        Harness::Omp => unreachable!("handled above"),
     };
     Ok(vec![skill, hook_script(script), hook])
 }
@@ -180,6 +205,7 @@ impl Target {
 enum Comment {
     Hash,
     Html,
+    Slash,
 }
 
 impl Comment {
@@ -187,6 +213,7 @@ impl Comment {
         match self {
             Comment::Hash => "# ",
             Comment::Html => "<!-- ",
+            Comment::Slash => "// ",
         }
     }
 
@@ -194,6 +221,7 @@ impl Comment {
         match self {
             Comment::Hash => "",
             Comment::Html => " -->",
+            Comment::Slash => "",
         }
     }
 
@@ -598,6 +626,7 @@ mod tests {
                 claude: root.path().join(".claude"),
                 copilot: root.path().join(".copilot"),
                 codex: root.path().join(".codex"),
+                omp: root.path().join(".omp/agent"),
             };
             Self { _root: root, homes }
         }
@@ -710,7 +739,14 @@ mod tests {
             Harness::Claude => "settings.json",
             Harness::Copilot => "hooks/synapse.json",
             Harness::Codex => "hooks.json",
+            Harness::Omp => "extensions/synapse.ts",
         })
+    }
+
+    /// The harnesses whose hook registration is a JSON hook config merge.
+    /// omp's hook is an `Owned` `.ts` module, not a JSON hook.
+    fn json_hooks() -> [Harness; 3] {
+        [Harness::Claude, Harness::Copilot, Harness::Codex]
     }
 
     fn json_at(path: &Path) -> Value {
@@ -745,10 +781,10 @@ mod tests {
 
     #[test]
     fn an_edited_registration_blocks_until_forced() {
-        for harness in Harness::all() {
+        for harness in json_hooks() {
             let sandbox = Sandbox::new();
-            sandbox.install(*harness, &fresh());
-            let config = config_of(&sandbox, *harness);
+            sandbox.install(harness, &fresh());
+            let config = config_of(&sandbox, harness);
 
             let mut root = json_at(&config);
             match harness {
@@ -758,12 +794,12 @@ mod tests {
             let edited = serde_json::to_string(&root).expect("render");
             fs::write(&config, &edited).expect("seed");
 
-            let report = sandbox.install(*harness, &fresh());
+            let report = sandbox.install(harness, &fresh());
             assert!(report.blocked(), "{harness:?}");
             assert_eq!(fs::read_to_string(&config).expect("read"), edited);
 
             let forced = sandbox.install(
-                *harness,
+                harness,
                 &InstallOptions {
                     dry_run: false,
                     force: true,
@@ -923,6 +959,44 @@ mod tests {
         assert_eq!(
             root["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
             "audit.sh"
+        );
+    }
+
+    #[test]
+    fn omp_installs_a_ts_hook_module_not_a_json_hook() {
+        let sandbox = Sandbox::new();
+        sandbox.install(Harness::Omp, &fresh());
+        sandbox.install(Harness::Omp, &fresh());
+
+        let hook = sandbox.homes.omp.join("extensions/synapse.ts");
+        let text = fs::read_to_string(&hook).expect("read hook");
+        assert!(text.contains("syn"));
+        assert!(text.contains("context"));
+        assert!(
+            text.contains("// synapse:managed 1"),
+            "managed marker present"
+        );
+        assert!(!sandbox.homes.omp.join("settings.json").exists());
+        let files = sandbox.files(Harness::Omp);
+        assert_eq!(
+            files
+                .iter()
+                .map(|(p, _)| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                sandbox
+                    .homes
+                    .omp
+                    .join("extensions/synapse.ts")
+                    .display()
+                    .to_string(),
+                sandbox
+                    .homes
+                    .omp
+                    .join("skills/synapse/SKILL.md")
+                    .display()
+                    .to_string(),
+            ]
         );
     }
 
