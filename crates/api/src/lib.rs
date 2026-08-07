@@ -11,9 +11,9 @@ mod validate;
 
 pub use dto::{
     ContextResponse, DigestEntryDto, EXPORT_VERSION, ExportDoc, GraphDto, HealthResponse, HitDto,
-    HitGroupDto, ImportReport, ListResponse, MemoryDto, MoveBody, MoveResponse, NeighborDto,
-    Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse, WorkspaceDto,
-    WorkspacesResponse,
+    HitGroupDto, ImportReport, LinkDto, ListResponse, MemoryDto, MoveBody, MoveResponse,
+    NeighborDto, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse,
+    WorkspaceDto, WorkspacesResponse,
 };
 
 #[cfg(feature = "server")]

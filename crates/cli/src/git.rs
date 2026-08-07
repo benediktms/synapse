@@ -176,10 +176,6 @@ fn origin_slug(dir: &Path) -> Result<Option<String>, String> {
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Result<Output, String> {
-    // Deadline starts at spawn, not before: the probe does a short pipeline of git calls, and a
-    // single shared budget lets process-spawn latency under load consume a call's window before
-    // the child even runs. This still bounds a hung git at one DEADLINE per call.
-    let deadline = Instant::now() + DEADLINE;
     let child = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -193,6 +189,10 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<Output, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not run git: {e}"))?;
+    // Deadline starts after spawn: the probe does a short pipeline of git calls, and counting
+    // process-spawn latency against a child's window would let a fast call under load be killed
+    // before it runs. This still bounds a hung git at one DEADLINE per call.
+    let deadline = Instant::now() + DEADLINE;
     output_by(child, deadline)
 }
 

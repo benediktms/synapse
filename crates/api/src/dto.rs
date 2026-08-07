@@ -5,7 +5,7 @@ use domain::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const EXPORT_VERSION: u32 = 1;
+pub const EXPORT_VERSION: u32 = 2;
 
 fn default_tier() -> String {
     domain::Importance::DEFAULT.as_str().to_string()
@@ -236,11 +236,34 @@ pub struct ListResponse {
     pub memories: Vec<MemoryDto>,
 }
 
+/// A link in an export dump. Endpoints are the canonical stored form (symmetric links
+/// low-id first; supersession in true source->target orientation).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LinkDto {
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+    pub directed: bool,
+}
+
+impl From<&GraphEdge> for LinkDto {
+    fn from(edge: &GraphEdge) -> Self {
+        Self {
+            source: edge.source.to_string(),
+            relation: edge.relation.as_str().to_string(),
+            target: edge.target.to_string(),
+            directed: edge.directed,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExportDoc {
     pub version: u32,
     pub origin: Origin,
     pub memories: Vec<MemoryDto>,
+    #[serde(default)]
+    pub links: Vec<LinkDto>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

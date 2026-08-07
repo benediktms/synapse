@@ -7,9 +7,9 @@ use adapters_fastembed::FastEmbedder;
 use adapters_sqlite::SqliteStore;
 use api::{Backend, BackendError, RestoreReport};
 use domain::{
-    ContextDigest, EditRequest, Embedder, Error, GraphSubgraph, Memory, MemoryId, MoveOutcome,
-    RecallHit, RecallRequest, Relation, SaveOutcome, SaveRequest, Timestamp, Workspace,
-    WorkspaceHits,
+    ContextDigest, EditRequest, Embedder, Error, GraphEdge, GraphSubgraph, Link, Memory, MemoryId,
+    MoveOutcome, RecallHit, RecallRequest, Relation, SaveOutcome, SaveRequest, Timestamp,
+    Workspace, WorkspaceHits,
 };
 use tokio::sync::RwLock;
 
@@ -265,6 +265,21 @@ impl Backend for App {
             .map_err(Into::into)
     }
 
+    async fn links_all(&self, ws: &Workspace) -> Result<Vec<GraphEdge>, BackendError> {
+        use domain::Store;
+        let (active, _) = self.active_and_shared(ws).await?;
+        let links = active.links_all().await.map_err(BackendError::Domain)?;
+        Ok(links
+            .into_iter()
+            .map(|link| GraphEdge {
+                source: link.source,
+                target: link.target,
+                relation: link.relation,
+                directed: link.relation.is_directed(),
+            })
+            .collect())
+    }
+
     async fn link(
         &self,
         ws: &Workspace,
@@ -308,6 +323,7 @@ impl Backend for App {
         &self,
         ws: &Workspace,
         memories: Vec<Memory>,
+        links: Vec<Link>,
     ) -> Result<RestoreReport, BackendError> {
         use domain::Store;
         let store = self.store(ws).await?;
@@ -327,6 +343,13 @@ impl Backend for App {
             let embedding = self.inner.embedder.embed(&memory.content).await?;
             store.insert(&memory, &embedding).await?;
             report.imported += 1;
+        }
+        // Recreate the graph after its endpoint memories exist.
+        for link in links {
+            store
+                .insert_link(&link)
+                .await
+                .map_err(BackendError::Domain)?;
         }
         Ok(report)
     }

@@ -207,6 +207,13 @@ impl Store for FakeStore {
         out.sort();
         Ok(out)
     }
+
+    async fn links_all(&self) -> Result<Vec<Link>, Error> {
+        let mut out: Vec<Link> = self.links.lock().unwrap().clone();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
 }
 
 fn tokenize(text: &str) -> Vec<String> {

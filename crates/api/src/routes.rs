@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use domain::{
-    EditRequest, Importance, MAX_GRAPH_DEPTH, Memory, MemoryId, MemoryKind, RECALL_LIMIT_CAP,
+    EditRequest, Importance, Link, MAX_GRAPH_DEPTH, Memory, MemoryId, MemoryKind, RECALL_LIMIT_CAP,
     RecallRequest, Relation, SaveOutcome, SaveRequest, Scope, Workspace,
 };
 use serde::Deserialize;
@@ -20,8 +20,9 @@ use tracing::Level;
 use crate::backend::Backend;
 use crate::dto::{
     ContextResponse, EXPORT_VERSION, ExportDoc, GraphDto, HealthResponse, HitDto, HitGroupDto,
-    ImportReport, ListResponse, MemoryDto, MoveBody, MoveResponse, Origin, PatchMemoryBody,
-    PutMemoryBody, PutPreferenceBody, SearchResponse, WorkspaceDto, WorkspacesResponse,
+    ImportReport, LinkDto, ListResponse, MemoryDto, MoveBody, MoveResponse, Origin,
+    PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse, WorkspaceDto,
+    WorkspacesResponse,
 };
 use crate::error::ApiError;
 use crate::validate::{normalize_timestamp, validate_content, validate_query, validate_tags};
@@ -602,10 +603,12 @@ async fn export_in<B: Backend>(
     ws: &Workspace,
 ) -> Result<Json<ExportDoc>, ApiError> {
     let memories = state.backend.list(ws).await?;
+    let links = state.backend.links_all(ws).await?;
     Ok(Json(ExportDoc {
         version: EXPORT_VERSION,
         origin: Origin::of(ws),
         memories: memories.iter().map(MemoryDto::from).collect(),
+        links: links.iter().map(LinkDto::from).collect(),
     }))
 }
 
@@ -644,6 +647,15 @@ async fn import_preferences<B: Backend>(
     Json(doc): Json<ExportDoc>,
 ) -> Result<Json<ImportReport>, ApiError> {
     import_into(&state, &Workspace::shared(), params.mode.as_deref(), doc).await
+}
+
+fn link_err(link: &LinkDto, err: domain::Error) -> ApiError {
+    match ApiError::from(err) {
+        ApiError::BadRequest(msg) => {
+            ApiError::BadRequest(format!("link {} → {}: {msg}", link.source, link.target))
+        }
+        other => other,
+    }
 }
 
 async fn import_into<B: Backend>(
@@ -696,6 +708,24 @@ async fn import_into<B: Backend>(
         memory.updated_at = updated_at;
         memories.push(memory);
     }
+    let known: std::collections::HashSet<&str> = memories.iter().map(|m| m.id.as_str()).collect();
+    let mut parsed_links: Vec<Link> = Vec::with_capacity(doc.links.len());
+    for link in &doc.links {
+        let source = MemoryId::parse(&link.source).map_err(|e| link_err(link, e))?;
+        let target = MemoryId::parse(&link.target).map_err(|e| link_err(link, e))?;
+        if !known.contains(link.source.as_str()) || !known.contains(link.target.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "link {} → {} references a memory this dump does not contain",
+                link.source, link.target
+            )));
+        }
+        let relation = Relation::parse(&link.relation).map_err(|e| link_err(link, e))?;
+        parsed_links.push(Link {
+            source,
+            target,
+            relation,
+        });
+    }
     if !merge {
         let incoming: std::collections::HashSet<&str> =
             memories.iter().map(|m| m.id.as_str()).collect();
@@ -714,7 +744,7 @@ async fn import_into<B: Backend>(
             )));
         }
     }
-    let report = state.backend.restore(ws, memories).await?;
+    let report = state.backend.restore(ws, memories, parsed_links).await?;
     Ok(Json(ImportReport {
         imported: report.imported,
         unchanged: report.unchanged,

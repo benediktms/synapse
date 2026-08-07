@@ -154,13 +154,14 @@ pub struct ContextArgs {
 #[derive(Debug, Args)]
 pub struct EditArgs {
     pub id: String,
-    /// New content, or retype a link instead with --relation/--type
+    /// New content (for a content edit); omit for a link retype with --relation/--type
+    #[arg(conflicts_with_all = ["relation", "type_"])]
     pub content: Option<String>,
-    /// New importance tier for the memory
-    #[arg(long, value_name = "TIER", value_parser = clap::builder::PossibleValuesParser::new(tiers()))]
+    /// New importance tier for the memory (only for a content edit)
+    #[arg(long, value_name = "TIER", value_parser = clap::builder::PossibleValuesParser::new(tiers()), conflicts_with_all = ["relation", "type_"])]
     pub importance: Option<String>,
     /// Other endpoint of the link to retype (requires --type)
-    #[arg(long)]
+    #[arg(long, requires = "type_", conflicts_with_all = ["content", "importance"])]
     pub relation: Option<String>,
     /// Retype an existing link (with --relation) to this type: relation/support/contradiction/supersession
     #[arg(long, value_name = "TYPE", value_parser = clap::builder::PossibleValuesParser::new(relation_types()))]

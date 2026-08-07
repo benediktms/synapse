@@ -15,6 +15,8 @@ pub enum Error {
     Conflict(MemoryId),
     /// A supersession edge would close a cycle in the supersession relation.
     Cycle(MemoryId, MemoryId),
+    /// Retyping an edge between two memories was ambiguous because several typed edges coexist.
+    Ambiguous(MemoryId, MemoryId),
     Store(String),
     Embed(String),
 }
@@ -34,6 +36,10 @@ impl fmt::Display for Error {
             Error::Cycle(source, target) => {
                 write!(f, "{source} supersedes {target} would create a cycle")
             }
+            Error::Ambiguous(a, b) => write!(
+                f,
+                "multiple links exist between {a} and {b}; unlink the one you mean or pick a pair with a single link"
+            ),
             Error::Store(msg) => write!(f, "store error: {msg}"),
             Error::Embed(msg) => write!(f, "embedding error: {msg}"),
         }

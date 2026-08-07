@@ -48,6 +48,8 @@ pub trait Store {
     /// direction is preserved only for directed edges, where `source` is the memory at the
     /// superseding end.
     async fn links_of(&self, id: &MemoryId) -> Result<Vec<Link>, Error>;
+    /// Every edge in the store, deduplicated, for export.
+    async fn links_all(&self) -> Result<Vec<Link>, Error>;
 }
 
 pub trait Embedder {

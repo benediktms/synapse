@@ -1,8 +1,9 @@
 use std::future::Future;
 
 use domain::{
-    ContextDigest, EditRequest, Error, GraphSubgraph, Memory, MemoryId, MoveOutcome, RecallHit,
-    RecallRequest, Relation, SaveOutcome, SaveRequest, Timestamp, Workspace, WorkspaceHits,
+    ContextDigest, EditRequest, Error, GraphEdge, GraphSubgraph, Link, Memory, MemoryId,
+    MoveOutcome, RecallHit, RecallRequest, Relation, SaveOutcome, SaveRequest, Timestamp,
+    Workspace, WorkspaceHits,
 };
 
 #[derive(Clone, Debug)]
@@ -84,6 +85,10 @@ pub trait Backend: Clone + Send + Sync + 'static {
         id: &MemoryId,
         depth: usize,
     ) -> impl Future<Output = Result<GraphSubgraph, BackendError>> + Send;
+    fn links_all(
+        &self,
+        ws: &Workspace,
+    ) -> impl Future<Output = Result<Vec<GraphEdge>, BackendError>> + Send;
     fn link(
         &self,
         ws: &Workspace,
@@ -108,5 +113,6 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         ws: &Workspace,
         memories: Vec<Memory>,
+        links: Vec<Link>,
     ) -> impl Future<Output = Result<RestoreReport, BackendError>> + Send;
 }

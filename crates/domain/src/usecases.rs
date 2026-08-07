@@ -209,8 +209,12 @@ pub async fn retype_link<S: Store>(
     if matched.is_empty() {
         return Err(Error::NotFound(a.clone()));
     }
-    // Validate before mutating: if this becomes a supersession that would close a cycle, reject
-    // with the original edge intact rather than deleting it and losing it on failure.
+    // Retyping names only the new type, not which existing edge to change. If several typed edges
+    // coexist between the pair, deleting them all would silently drop the siblings — reject rather
+    // than guess.
+    if matched.len() > 1 {
+        return Err(Error::Ambiguous(a.clone(), b.clone()));
+    }
     if relation == Relation::Supersession && supersession_would_cycle(store, a, b).await? {
         return Err(Error::Cycle(a.clone(), b.clone()));
     }
@@ -316,6 +320,11 @@ pub async fn list_memories<S: Store>(store: &S) -> Result<Vec<Memory>, Error> {
 }
 
 pub const MAX_GRAPH_DEPTH: usize = 10;
+/// Node cap for a single subgraph dump: a depth cap alone does not bound work when a hub memory
+/// links to thousands of others, so cap the collected nodes (and by extension edges) to keep one
+/// `syn links` call response-bounded. When hit, the dump reports `truncated`.
+pub const GRAPH_NODE_BUDGET: usize = 500;
+pub const GRAPH_EDGE_BUDGET: usize = 1000;
 
 /// A node of a bounded subgraph dump, for `syn links`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,6 +371,7 @@ pub async fn graph_subgraph<S: Store>(
     let mut queue: VecDeque<MemoryId> = VecDeque::new();
     levels.insert(root.clone(), 0);
     queue.push_back(root.clone());
+    let mut budget_exceeded = false;
     while let Some(id) = queue.pop_front() {
         let level = levels[&id];
         if level >= depth {
@@ -370,6 +380,10 @@ pub async fn graph_subgraph<S: Store>(
         for link in store.links_of(&id).await? {
             for other in [link.source.clone(), link.target.clone()] {
                 if !levels.contains_key(&other) {
+                    if levels.len() >= GRAPH_NODE_BUDGET {
+                        budget_exceeded = true;
+                        continue;
+                    }
                     levels.insert(other.clone(), level + 1);
                     queue.push_back(other);
                 }
@@ -384,7 +398,15 @@ pub async fn graph_subgraph<S: Store>(
     let mut edges: Vec<GraphEdge> = Vec::new();
     let mut seen_edges: HashSet<(MemoryId, MemoryId, Relation)> = HashSet::new();
     for id in &discovered {
+        if edges.len() >= GRAPH_EDGE_BUDGET {
+            budget_exceeded = true;
+            break;
+        }
         for link in store.links_of(id).await? {
+            if edges.len() >= GRAPH_EDGE_BUDGET {
+                budget_exceeded = true;
+                break;
+            }
             if !discovered.contains(&link.source) || !discovered.contains(&link.target) {
                 continue;
             }
@@ -434,7 +456,7 @@ pub async fn graph_subgraph<S: Store>(
     Ok(GraphSubgraph {
         root: root.clone(),
         depth,
-        truncated: nodes.iter().any(|n| n.truncated),
+        truncated: budget_exceeded || nodes.iter().any(|n| n.truncated),
         nodes,
         edges,
     })

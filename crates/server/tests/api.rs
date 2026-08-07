@@ -1031,11 +1031,23 @@ async fn export_import_round_trip_and_merge_idempotency() {
         Some(json!({ "pinned": true })),
     )
     .await;
+    req(
+        &router,
+        Method::POST,
+        &format!("/memories/{}/links?ws=work", mid(2)),
+        Some(json!({ "target": mid(1), "relation": "supersession" })),
+    )
+    .await;
 
     let (status, export) = req(&router, Method::GET, "/export?ws=work", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(export["version"], 1);
+    assert_eq!(export["version"], 2);
     assert_eq!(export["memories"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        export["links"].as_array().unwrap().len(),
+        1,
+        "export must carry the graph"
+    );
 
     let (status, report) = req(
         &router,
@@ -1053,6 +1065,18 @@ async fn export_import_round_trip_and_merge_idempotency() {
         export["memories"], restored["memories"],
         "round trip drifted"
     );
+    assert_eq!(
+        export["links"], restored["links"],
+        "links must round-trip through export/import"
+    );
+    let (_, graph) = req(
+        &router,
+        Method::GET,
+        &format!("/memories/{}/links?ws=restore", mid(2)),
+        None,
+    )
+    .await;
+    assert_eq!(graph["graph"]["edges"].as_array().unwrap().len(), 1);
 
     let (status, report) = req(
         &router,
@@ -1199,7 +1223,7 @@ async fn import_normalizes_timestamps_and_rejects_impossible_ones() {
 
     let dump = |created: &str, updated: &str| {
         json!({
-            "version": 1,
+            "version": 2,
             "origin": { "workspace": "restore" },
             "memories": [{
                 "id": mid(1),

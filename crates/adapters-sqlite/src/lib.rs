@@ -393,6 +393,17 @@ impl Store for SqliteStore {
         .map_err(store_err)?;
         rows.into_iter().map(Link::try_from).collect()
     }
+
+    async fn links_all(&self) -> Result<Vec<Link>, Error> {
+        let rows = sqlx::query_as!(
+            LinkRow,
+            "SELECT low_id AS \"low_id!\", high_id AS \"high_id!\", relation AS \"relation!\" FROM links"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        rows.into_iter().map(Link::try_from).collect()
+    }
 }
 
 struct LinkRow {
