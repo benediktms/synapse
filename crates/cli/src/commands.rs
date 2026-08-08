@@ -8,14 +8,16 @@ use api::{
     SearchResponse,
 };
 use api_client::SynapseApiClient;
+use daemon_client::{DaemonClient, DaemonConfig, ScopedOrg};
 use domain::MemoryId;
 
 use crate::args::{
     Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, LinkPairArgs,
     LinksArgs, ListArgs, MoveArgs, RecallArgs, RetiredArgs, SCOPE_EVERYWHERE, SaveArgs, StoreArgs,
-    SupersedeArgs, WorkspaceArgs, WorkspaceCommand,
+    SupersedeArgs, SyncArgs, WorkspaceArgs, WorkspaceCommand,
 };
-use crate::config::{Config, OrgRule, WorkspaceRule};
+use crate::client::Client;
+use crate::config::{Config, OrgRule, Transport, WorkspaceRule};
 use crate::git::GitFacts;
 use crate::outbox::{FlushReport, Outbox, PendingSave, SaveTarget, now_millis};
 use crate::output;
@@ -24,6 +26,9 @@ use crate::resolve;
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const BULK_TIMEOUT: Duration = Duration::from_secs(600);
+/// Must outlast the daemon's own 30s per-request deadline, so a forced sync reports the
+/// daemon's verdict instead of a client-side timeout.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(35);
 /// One total budget for the pre-read flush, so a backlog cannot push a read past the
 /// session hook's ten seconds however many items are queued.
 const FLUSH_BUDGET: Duration = Duration::from_secs(2);
@@ -59,6 +64,9 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Command::Export(args) => export(&ctx, args),
         Command::Import(args) => import(&ctx, args),
         Command::Config(command) => set_config(ctx.config, command),
+        Command::Setup => setup(),
+        Command::Sync(args) => sync(&ctx, args),
+        Command::Status => status(&ctx),
     }
 }
 
@@ -71,9 +79,26 @@ struct Context {
 }
 
 impl Context {
-    fn client(&self, timeout: Duration) -> Result<SynapseApiClient, String> {
+    fn client(&self, timeout: Duration) -> Result<Client, String> {
+        match self.config.transport() {
+            Transport::Http => Ok(Client::Http(self.http_client(timeout)?)),
+            Transport::Daemon => Ok(Client::Daemon(self.daemon_client(timeout, true)?)),
+        }
+    }
+
+    fn http_client(&self, timeout: Duration) -> Result<SynapseApiClient, String> {
         SynapseApiClient::new(self.config.url(), self.config.token()?, timeout)
             .map_err(|e| e.to_string())
+    }
+
+    /// Spawn-on-demand: a dead daemon is started detached and polled until it answers.
+    fn daemon_client(&self, timeout: Duration, spawn: bool) -> Result<DaemonClient, String> {
+        let dir = daemon_client::state_dir();
+        let client = DaemonClient::new(daemon_client::socket_path(&dir), timeout);
+        if spawn {
+            daemon_client::ensure_running(&client)?;
+        }
+        Ok(client)
     }
 
     fn facts(&self) -> Result<Option<&GitFacts>, String> {
@@ -103,12 +128,17 @@ impl Context {
 /// Read commands drain the outbox first so a queued save becomes recallable at the first
 /// opportunity; an outage here must not fail the read, but it must not pass unmentioned
 /// either — whatever stays queued is missing from what the read is about to print.
+/// The outbox belongs to the HTTP path; on the daemon transport the daemon's local-first
+/// writes make it unnecessary.
 fn flush_before_read(ctx: &Context) {
+    if ctx.config.transport() == Transport::Daemon {
+        return;
+    }
     let Ok(outbox) = Outbox::open() else {
         return;
     };
     let flushed = ctx
-        .client(FLUSH_SEND_TIMEOUT)
+        .http_client(FLUSH_SEND_TIMEOUT)
         .and_then(|client| outbox.flush(&client, Some(FLUSH_BUDGET)));
     let report = match flushed {
         Ok(report) => report,
@@ -146,34 +176,28 @@ fn backlog_note(report: &FlushReport) -> String {
 }
 
 fn save(ctx: &Context, args: SaveArgs) -> Result<(), String> {
-    let client = ctx.client(WRITE_TIMEOUT)?;
     let kind = wire_kind(&args.kind);
-    if args.scope.as_deref() == Some(SCOPE_EVERYWHERE) {
+    let target = if args.scope.as_deref() == Some(SCOPE_EVERYWHERE) {
         if args.workspace.is_some() {
             return Err(
                 "--scope everywhere applies in every workspace, so it cannot take --workspace"
                     .to_string(),
             );
         }
-        return queue_and_flush(
-            &client,
-            SaveTarget::Preference {
-                body: PutPreferenceBody {
-                    content: args.content,
-                    kind,
-                    tags: args.tags,
-                    importance: args.importance,
-                },
+        SaveTarget::Preference {
+            body: PutPreferenceBody {
+                content: args.content,
+                kind,
+                tags: args.tags,
+                importance: args.importance,
             },
-        );
-    }
-    let workspace = ctx.workspace(args.workspace.as_deref(), true)?;
-    let scope = ctx.scope(args.scope.as_deref())?;
-    if let Some(note) = &scope.note {
-        eprintln!("note: {note}");
-    }
-    queue_and_flush(
-        &client,
+        }
+    } else {
+        let workspace = ctx.workspace(args.workspace.as_deref(), true)?;
+        let scope = ctx.scope(args.scope.as_deref())?;
+        if let Some(note) = &scope.note {
+            eprintln!("note: {note}");
+        }
         SaveTarget::Memory {
             workspace,
             body: PutMemoryBody {
@@ -183,8 +207,25 @@ fn save(ctx: &Context, args: SaveArgs) -> Result<(), String> {
                 tags: args.tags,
                 importance: args.importance,
             },
-        },
-    )
+        }
+    };
+    match ctx.client(WRITE_TIMEOUT)? {
+        // The HTTP path queues first so an unreachable server cannot lose the save.
+        Client::Http(http) => queue_and_flush(&http, target),
+        // The daemon writes locally first by design, so the CLI outbox adds nothing.
+        client @ Client::Daemon(_) => save_direct(&client, target),
+    }
+}
+
+fn save_direct(client: &Client, target: SaveTarget) -> Result<(), String> {
+    let id = MemoryId::generate().to_string();
+    let where_to = target.label();
+    let memory = match target {
+        SaveTarget::Preference { body } => client.save_preference(&id, &body)?,
+        SaveTarget::Memory { workspace, body } => client.save(&workspace, &id, &body)?,
+    };
+    println!("saved {} ({where_to})", memory.id);
+    Ok(())
 }
 
 /// `decision` is the CLI's name for what the store calls a `project` memory: `--scope project`
@@ -260,16 +301,14 @@ fn recall(ctx: &Context, args: RecallArgs) -> Result<(), String> {
     let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
     let scope = ctx.scope(args.project.as_deref())?;
     let started = Instant::now();
-    let response = client
-        .search(
-            &workspace,
-            &args.query,
-            scope.project(),
-            args.limit,
-            args.all_workspaces,
-            args.links_in_scope,
-        )
-        .map_err(|e| e.to_string())?;
+    let response = client.search(
+        &workspace,
+        &args.query,
+        scope.project(),
+        args.limit,
+        args.all_workspaces,
+        args.links_in_scope,
+    )?;
     let elapsed = started.elapsed().as_millis();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -299,9 +338,7 @@ fn context(ctx: &Context, args: ContextArgs) -> Result<(), String> {
     flush_before_read(ctx);
     let workspace = ctx.workspace(args.workspace.as_deref(), false)?;
     let scope = ctx.scope(args.project.as_deref())?;
-    let digest = client
-        .context(&workspace, scope.project())
-        .map_err(|e| e.to_string())?;
+    let digest = client.context(&workspace, scope.project())?;
     if let Some(text) = output::digest(&digest) {
         println!("{text}");
     }
@@ -320,7 +357,7 @@ fn resolve_target(ctx: &Context, store: &StoreArgs) -> Result<Origin, String> {
 }
 
 fn patch(
-    client: &SynapseApiClient,
+    client: &Client,
     target: &Origin,
     id: &str,
     body: &PatchMemoryBody,
@@ -329,7 +366,6 @@ fn patch(
         Origin::Preference => client.edit_preference(id, body),
         Origin::Workspace(workspace) => client.edit(workspace, id, body),
     }
-    .map_err(|e| e.to_string())
 }
 
 fn edit(ctx: &Context, args: EditArgs) -> Result<(), String> {
@@ -347,9 +383,7 @@ fn edit(ctx: &Context, args: EditArgs) -> Result<(), String> {
             }
             Origin::Workspace(workspace) => workspace.to_string(),
         };
-        client
-            .retype_link(&workspace, &args.id, relation, ty)
-            .map_err(|e| e.to_string())?;
+        client.retype_link(&workspace, &args.id, relation, ty)?;
         println!("retyped {} ↔ {relation} ({ty})", args.id);
     }
 
@@ -381,9 +415,7 @@ fn link_pair(ctx: &Context, args: LinkPairArgs, relation: domain::Relation) -> R
         Origin::Preference => return Err("links act on workspace memories".into()),
         Origin::Workspace(workspace) => workspace.to_string(),
     };
-    client
-        .link(&workspace, &args.a, &args.b, relation.as_str())
-        .map_err(|e| e.to_string())?;
+    client.link(&workspace, &args.a, &args.b, relation.as_str())?;
     println!("linked {} ↔ {} ({})", args.a, args.b, relation);
     Ok(())
 }
@@ -396,9 +428,7 @@ fn supersede(ctx: &Context, args: SupersedeArgs) -> Result<(), String> {
         Origin::Preference => return Err("links act on workspace memories".into()),
         Origin::Workspace(workspace) => workspace.to_string(),
     };
-    client
-        .link(&workspace, &args.new, &args.old, "supersession")
-        .map_err(|e| e.to_string())?;
+    client.link(&workspace, &args.new, &args.old, "supersession")?;
     println!("superseded {} by {}", args.old, args.new);
     Ok(())
 }
@@ -411,9 +441,7 @@ fn unlink(ctx: &Context, args: LinkPairArgs) -> Result<(), String> {
         Origin::Preference => return Err("links act on workspace memories".into()),
         Origin::Workspace(workspace) => workspace.to_string(),
     };
-    client
-        .unlink(&workspace, &args.a, &args.b)
-        .map_err(|e| e.to_string())?;
+    client.unlink(&workspace, &args.a, &args.b)?;
     println!("unlinked {} ↔ {}", args.a, args.b);
     Ok(())
 }
@@ -424,8 +452,7 @@ fn forget(ctx: &Context, args: IdArgs) -> Result<(), String> {
     match &target {
         Origin::Preference => client.forget_preference(&args.id),
         Origin::Workspace(workspace) => client.forget(workspace, &args.id),
-    }
-    .map_err(|e| e.to_string())?;
+    }?;
     println!("forgot {} ({})", args.id, output::store_label(&target));
     Ok(())
 }
@@ -441,9 +468,7 @@ fn move_memory(ctx: &Context, args: MoveArgs) -> Result<(), String> {
         from: from.clone(),
         to: to.clone(),
     };
-    let response = client
-        .move_memory(&args.id, &body)
-        .map_err(|e| e.to_string())?;
+    let response = client.move_memory(&args.id, &body)?;
     let source = output::place(&from, &response.from_scope);
     if !response.moved {
         println!(
@@ -496,8 +521,7 @@ fn list(ctx: &Context, args: ListArgs) -> Result<(), String> {
     let memories = match &target {
         Origin::Preference => client.list_preferences(),
         Origin::Workspace(workspace) => client.list(workspace),
-    }
-    .map_err(|e| e.to_string())?;
+    }?;
     for memory in memories {
         println!("{}", output::list_line(&target, &memory));
     }
@@ -557,8 +581,7 @@ fn show(ctx: &Context, args: IdArgs) -> Result<(), String> {
     let memory = match &target {
         Origin::Preference => client.get_preference(&args.id),
         Origin::Workspace(workspace) => client.get(workspace, &args.id),
-    }
-    .map_err(|e| e.to_string())?;
+    }?;
     println!("{}", output::memory_line(&target, &memory));
     if !memory.tags.is_empty() {
         println!("tags: {}", memory.tags.join(", "));
@@ -580,9 +603,7 @@ fn links(ctx: &Context, args: LinksArgs) -> Result<(), String> {
         return Err("syn links acts on a workspace memory; drop --scope everywhere".into());
     }
     let workspace = ctx.workspace(args.store.workspace.as_deref(), false)?;
-    let graph = client
-        .links(&workspace, &args.id, args.depth)
-        .map_err(|e| e.to_string())?;
+    let graph = client.links(&workspace, &args.id, args.depth)?;
     let json = serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?;
     println!("{json}");
     Ok(())
@@ -593,7 +614,7 @@ fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
         WorkspaceCommand::List => {
             let client = ctx.client(READ_TIMEOUT)?;
             let default = ctx.config.default_workspace.as_deref();
-            for workspace in client.workspaces().map_err(|e| e.to_string())? {
+            for workspace in client.workspaces()? {
                 let marker = if Some(workspace.as_str()) == default {
                     " (default)"
                 } else {
@@ -613,8 +634,8 @@ fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
         WorkspaceCommand::Create { name } => {
             let name = resolve::validate_workspace(&name)?;
             let client = ctx.client(WRITE_TIMEOUT)?;
-            let created = client.create_workspace(&name).map_err(|e| e.to_string())?;
-            println!("workspace {} ready", created.workspace);
+            let created = client.create_workspace(&name)?;
+            println!("workspace {created} ready");
             Ok(())
         }
         WorkspaceCommand::Use { name } => {
@@ -665,13 +686,14 @@ fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
 
 fn export(ctx: &Context, args: WorkspaceArgs) -> Result<(), String> {
     let client = ctx.client(BULK_TIMEOUT)?;
-    drain_before_export(&client)?;
+    if let Client::Http(http) = &client {
+        drain_before_export(http)?;
+    }
     let target = resolve_target(ctx, &args.store)?;
     let doc = match &target {
         Origin::Preference => client.export_preferences(),
         Origin::Workspace(workspace) => client.export(workspace),
-    }
-    .map_err(|e| e.to_string())?;
+    }?;
     let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     println!("{json}");
     Ok(())
@@ -710,8 +732,7 @@ fn import(ctx: &Context, args: ImportArgs) -> Result<(), String> {
     let report = match &target {
         Origin::Preference => client.import_preferences(args.merge, &doc),
         Origin::Workspace(workspace) => client.import(workspace, args.merge, &doc),
-    }
-    .map_err(|e| e.to_string())?;
+    }?;
     println!(
         "imported {} memories into {} ({} unchanged)",
         report.imported,
@@ -737,6 +758,106 @@ fn set_config(mut config: Config, command: ConfigCommand) -> Result<(), String> 
                 crate::config::config_path().display()
             );
         }
+        ConfigCommand::SetTransport { transport } => {
+            config.transport = Some(match transport.as_str() {
+                "daemon" => Transport::Daemon,
+                _ => Transport::Http,
+            });
+            config.save()?;
+            println!("transport set to {transport}");
+        }
+    }
+    Ok(())
+}
+
+/// `syn setup` — write the daemon's config: the Turso orgs this machine replicates, one
+/// org-scoped token each. Per-machine scope is the security boundary: a personal machine
+/// simply never gets the work org's token.
+fn setup() -> Result<(), String> {
+    let dir = daemon_client::state_dir();
+    let path = daemon_client::config_path(&dir);
+    if path.exists() {
+        eprintln!("note: {} exists and will be replaced", path.display());
+    }
+    println!("Turso orgs this machine replicates. Finish with an empty org name.");
+    let mut orgs = Vec::new();
+    loop {
+        let name = prompt(&format!("org #{} slug: ", orgs.len() + 1))?;
+        if name.is_empty() {
+            break;
+        }
+        let token = prompt(&format!("platform API token for {name}: "))?;
+        if token.is_empty() {
+            return Err(format!("no token given for {name}; setup unchanged"));
+        }
+        orgs.push(ScopedOrg { name, token });
+    }
+    if orgs.is_empty() {
+        return Err("no orgs given; setup unchanged".to_string());
+    }
+    let config = DaemonConfig { scoped_orgs: orgs };
+    crate::config::private_dir(&dir)?;
+    crate::config::write_private(&path, config.to_toml()?.as_bytes())?;
+    println!("wrote {}", path.display());
+    println!("switch the CLI over with: syn config set-transport daemon");
+    Ok(())
+}
+
+fn prompt(label: &str) -> Result<String, String> {
+    eprint!("{label}");
+    std::io::stderr().flush().map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("cannot read stdin: {e}"))?;
+    Ok(line.trim().to_string())
+}
+
+fn require_daemon(client: Client, what: &str) -> Result<DaemonClient, String> {
+    match client {
+        Client::Daemon(daemon) => Ok(daemon),
+        Client::Http(_) => Err(format!(
+            "{what} acts on the replication daemon; run: syn config set-transport daemon"
+        )),
+    }
+}
+
+fn sync(ctx: &Context, args: SyncArgs) -> Result<(), String> {
+    let daemon = require_daemon(ctx.client(SYNC_TIMEOUT)?, "syn sync")?;
+    let origin = args
+        .workspace
+        .as_deref()
+        .map(resolve::validate_workspace)
+        .transpose()?
+        .map(Origin::Workspace);
+    daemon.sync(origin.clone()).map_err(|e| e.to_string())?;
+    match origin {
+        Some(Origin::Workspace(name)) => println!("synced {name}"),
+        _ => println!("synced all replicas"),
+    }
+    Ok(())
+}
+
+fn status(ctx: &Context) -> Result<(), String> {
+    let daemon = require_daemon(ctx.client(READ_TIMEOUT)?, "syn status")?;
+    let statuses = daemon.status().map_err(|e| e.to_string())?;
+    if statuses.is_empty() {
+        println!("no replicas open");
+        return Ok(());
+    }
+    let now = now_millis();
+    for ws in statuses {
+        let freshness = if ws.last_synced_at == 0 {
+            "never synced".to_string()
+        } else {
+            format!("synced {}", age(now, ws.last_synced_at * 1000))
+        };
+        let connectivity = if ws.online { "online" } else { "offline" };
+        let pending = match ws.pending_outbox {
+            0 => String::new(),
+            n => format!(", {n} pending"),
+        };
+        println!("{}: {connectivity}, {freshness}{pending}", ws.name);
     }
     Ok(())
 }

@@ -11,12 +11,24 @@ pub struct Config {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Which backend commands talk to: `http` (default, the axum server) or `daemon`
+    /// (the local replication daemon). The HTTP path is deleted at cutover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<Transport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_rules: Vec<WorkspaceRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub org_rules: Vec<OrgRule>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    #[default]
+    Http,
+    Daemon,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -67,6 +79,10 @@ impl Config {
             .as_deref()
             .filter(|token| !token.is_empty())
             .ok_or_else(|| "no token configured; run: syn config set-token <token>".to_string())
+    }
+
+    pub fn transport(&self) -> Transport {
+        self.transport.unwrap_or_default()
     }
 }
 
@@ -144,6 +160,7 @@ mod tests {
         let config = Config {
             url: Some("https://memory.example".into()),
             token: Some("secret".into()),
+            transport: Some(Transport::Daemon),
             default_workspace: Some("personal".into()),
             workspace_rules: vec![WorkspaceRule {
                 path: "/Users/x/work".into(),

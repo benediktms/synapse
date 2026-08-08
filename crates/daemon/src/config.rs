@@ -6,37 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use domain::Workspace;
 
-const CONFIG_FILENAME: &str = "daemon.toml";
 const MANIFEST_FILENAME: &str = "workspaces.json";
 
-/// One org this machine replicates, with its org-scoped Turso token. Per-machine scope decides
-/// which orgs appear: personal machines have `benediktms`; work machines also `freshaengineering`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ScopedOrg {
-    pub name: String,
-    pub token: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct Config {
-    pub scoped_orgs: Vec<ScopedOrg>,
-}
-
-impl Config {
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        let toml = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, toml).map_err(|e| e.to_string())
-    }
-
-    pub fn load(path: &Path) -> Result<Config, String> {
-        let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        toml::from_str(&raw).map_err(|e| e.to_string())
-    }
-}
-
-pub fn config_path(dir: &Path) -> PathBuf {
-    dir.join(CONFIG_FILENAME)
-}
+/// The daemon's config schema lives in daemon-client, so `syn setup` writes exactly what
+/// the daemon reads. Per-machine scope decides which orgs appear: personal machines have
+/// `benediktms`; work machines also `freshaengineering`.
+pub use daemon_client::{DaemonConfig as Config, ScopedOrg, config_path};
 
 fn manifest_path(dir: &Path) -> PathBuf {
     dir.join(MANIFEST_FILENAME)
