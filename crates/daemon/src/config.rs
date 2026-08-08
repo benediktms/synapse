@@ -117,12 +117,25 @@ pub async fn resolve_bindings(dir: &Path, config: &Config) -> (Vec<WorkspaceBind
     let mut manifest = Manifest::load(dir);
     let mut bindings: Vec<WorkspaceBinding> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
-    let mut online_org: Option<&ScopedOrg> = None;
+    let mut online_org: Option<(&ScopedOrg, String)> = None;
 
     for org in &config.scoped_orgs {
-        match platform.list_databases(&org.name, &org.token).await {
-            Ok(dbs) => {
-                online_org.get_or_insert(org);
+        let resolved = match platform.list_databases(&org.name, &org.token).await {
+            // Replicas authenticate with a database JWT, not the platform token.
+            Ok(dbs) => match platform.mint_db_token(&org.name, &org.token).await {
+                Ok(db_token) => Some((dbs, db_token)),
+                Err(e) => {
+                    problems.push(format!("mint db token for {}: {e}", org.name));
+                    None
+                }
+            },
+            Err(e) => {
+                problems.push(format!("enumerate {}: {e}", org.name));
+                None
+            }
+        };
+        match resolved {
+            Some((dbs, db_token)) => {
                 for db in dbs {
                     let Some(ws) = workspace_named(&db.name) else {
                         continue;
@@ -132,24 +145,19 @@ pub async fn resolve_bindings(dir: &Path, config: &Config) -> (Vec<WorkspaceBind
                         workspace: ws.clone(),
                         replica: replica_path(dir, &ws),
                         url: db.url,
-                        token: org.token.clone(),
+                        token: db_token.clone(),
                     });
                 }
+                online_org.get_or_insert((org, db_token));
             }
-            Err(e) => {
-                problems.push(format!(
-                    "enumerate {}: {e}; falling back to cached bindings",
-                    org.name
-                ));
-                bindings.extend(cached_bindings_for_org(dir, &manifest, org));
-            }
+            None => bindings.extend(cached_bindings_for_org(dir, &manifest, org)),
         }
     }
 
     // Provision the shared workspace in the first reachable org if no org hosts one yet.
     let shared = Workspace::shared();
     if !bindings.iter().any(|b| b.workspace == shared)
-        && let Some(org) = online_org
+        && let Some((org, db_token)) = &online_org
     {
         match platform
             .create_database(&org.name, &org.token, shared.as_str())
@@ -161,7 +169,7 @@ pub async fn resolve_bindings(dir: &Path, config: &Config) -> (Vec<WorkspaceBind
                     workspace: shared.clone(),
                     replica: replica_path(dir, &shared),
                     url: db.url,
-                    token: org.token.clone(),
+                    token: db_token.clone(),
                 });
             }
             Err(e) => problems.push(format!("create shared in {}: {e}", org.name)),

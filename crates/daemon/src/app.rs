@@ -141,6 +141,12 @@ impl DaemonApp {
             .create_database(&org.name, &org.token, ws.as_str())
             .await
             .map_err(BackendError::Domain)?;
+        let db_token = self
+            .inner
+            .platform
+            .mint_db_token(&org.name, &org.token)
+            .await
+            .map_err(BackendError::Domain)?;
         let mut manifest = Manifest::load(&self.inner.state_dir);
         manifest.set(ws, &db.url, &org.name);
         manifest.save(&self.inner.state_dir);
@@ -148,7 +154,7 @@ impl DaemonApp {
             workspace: ws.clone(),
             replica: replica_path(&self.inner.state_dir, ws),
             url: db.url,
-            token: org.token.clone(),
+            token: db_token,
         };
         bindings.insert(ws.clone(), binding.clone());
         Ok(binding)
@@ -203,28 +209,19 @@ impl RpcHost for DaemonApp {
         out
     }
 
+    /// A failed sync is not an error to the caller: the store records offline, and the
+    /// post-sync statuses are the report.
     async fn sync_replicas(&self, only: Option<&Workspace>) -> Result<(), BackendError> {
-        match only {
-            Some(ws) => {
-                let store = self.store(ws).await?;
-                store.sync().await.map_err(BackendError::Domain)
-            }
-            None => {
-                let stores: Vec<Arc<LibsqlStore>> =
-                    self.inner.stores.read().await.values().cloned().collect();
-                let mut failures = Vec::new();
-                for store in stores {
-                    if let Err(e) = store.sync().await {
-                        failures.push(e.to_string());
-                    }
-                }
-                if failures.is_empty() {
-                    Ok(())
-                } else {
-                    Err(BackendError::Domain(Error::Store(failures.join("; "))))
-                }
+        let stores: Vec<Arc<LibsqlStore>> = match only {
+            Some(ws) => vec![self.store(ws).await?],
+            None => self.inner.stores.read().await.values().cloned().collect(),
+        };
+        for store in stores {
+            if let Err(e) = store.sync().await {
+                tracing::debug!("sync failed open: {e}");
             }
         }
+        Ok(())
     }
 }
 

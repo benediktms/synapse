@@ -10,6 +10,8 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // Logs go to stderr: that is the stream the CLI's spawn captures into daemon.log.
+        .with_writer(std::io::stderr)
         .init();
 
     let dir = match state_dir() {
@@ -69,6 +71,16 @@ async fn main() {
         socket_path.display(),
         app.workspace_count().await
     );
+
+    // Warm sync in the background: walk in and the replicas are already fresh, without
+    // delaying the socket.
+    {
+        use daemon::rpc::RpcHost;
+        let warm = app.clone();
+        tokio::spawn(async move {
+            let _ = warm.sync_replicas(None).await;
+        });
+    }
 
     rpc::serve(listener, app).await;
 }

@@ -127,24 +127,29 @@ impl LibsqlStore {
     }
 
     /// Push local WAL frames (outbox) to the primary and pull remote frames down.
-    /// Fails open on network errors: an unreachable remote degrades to a no-op, so
-    /// offline reads/writes are never blocked by a failed sync.
+    /// On the synced-database path an unreachable remote surfaces as Err (verified
+    /// against Turso Cloud 2026-08-08; frame numbers are a remote-replica concept and
+    /// stay None here even on success), so Ok is the reached signal.
     pub async fn sync(&self) -> Result<(), Error> {
-        let rep = self.db.sync().await.map_err(store_err)?;
-        // On a failed-open HTTP dispatch, libsql returns Replicated { frame_no: None, .. }.
-        let reached = rep.frame_no().is_some();
-        self.connected
-            .store(reached, std::sync::atomic::Ordering::Relaxed);
-        if reached {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            self.last_sync_ok
-                .store(now, std::sync::atomic::Ordering::Relaxed);
-            self.dirty.store(0, std::sync::atomic::Ordering::Relaxed);
+        match self.db.sync().await {
+            Ok(_) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                self.connected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.last_sync_ok
+                    .store(now, std::sync::atomic::Ordering::Relaxed);
+                self.dirty.store(0, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.connected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                Err(store_err(e))
+            }
         }
-        Ok(())
     }
 
     fn mark_dirty(&self) {
@@ -616,26 +621,18 @@ pub struct TursoDb {
     pub url: String,
 }
 
-#[derive(serde::Deserialize)]
-struct RawDb {
-    #[serde(rename = "Name", alias = "name")]
-    name: String,
-    #[serde(rename = "Hostname", alias = "hostname")]
-    hostname: String,
-    #[serde(rename = "libsql_url", default)]
-    libsql_url: Option<String>,
-}
-
-impl RawDb {
-    fn into_db(self) -> TursoDb {
-        let url = self
-            .libsql_url
-            .unwrap_or_else(|| format!("libsql://{}", self.hostname));
-        TursoDb {
-            name: self.name,
-            url,
-        }
-    }
+/// The API duplicates fields in both casings ("Name" and "name"), which breaks serde's
+/// alias-based structs with a duplicate-field error; pick fields out of a Value instead.
+fn db_from_value(value: &serde_json::Value) -> Option<TursoDb> {
+    let field = |upper: &str, lower: &str| {
+        value
+            .get(upper)
+            .or_else(|| value.get(lower))
+            .and_then(serde_json::Value::as_str)
+    };
+    let name = field("Name", "name")?.to_string();
+    let url = field("Hostname", "hostname").map(|hostname| format!("libsql://{hostname}"))?;
+    Some(TursoDb { name, url })
 }
 
 impl Default for TursoPlatform {
@@ -655,7 +652,7 @@ impl TursoPlatform {
         #[derive(serde::Deserialize)]
         struct ListResp {
             #[serde(rename = "databases", default)]
-            databases: Vec<RawDb>,
+            databases: Vec<serde_json::Value>,
         }
         let resp = self
             .client
@@ -674,7 +671,7 @@ impl TursoPlatform {
             )));
         }
         let parsed: ListResp = serde_json::from_str(&body).map_err(store_err)?;
-        Ok(parsed.databases.into_iter().map(RawDb::into_db).collect())
+        Ok(parsed.databases.iter().filter_map(db_from_value).collect())
     }
 
     pub async fn create_database(
@@ -683,10 +680,27 @@ impl TursoPlatform {
         token: &str,
         name: &str,
     ) -> Result<TursoDb, Error> {
+        match self.try_create_database(org, token, name).await {
+            // A brand-new org has no groups yet, and the create endpoint requires one;
+            // bootstrap the default group once and retry.
+            Err(Error::Store(msg)) if msg.contains("group not found") => {
+                self.create_default_group(org, token).await?;
+                self.try_create_database(org, token, name).await
+            }
+            other => other,
+        }
+    }
+
+    async fn try_create_database(
+        &self,
+        org: &str,
+        token: &str,
+        name: &str,
+    ) -> Result<TursoDb, Error> {
         #[derive(serde::Deserialize)]
         struct CreateResp {
             #[serde(rename = "database")]
-            database: RawDb,
+            database: serde_json::Value,
         }
         let resp = self
             .client
@@ -694,7 +708,7 @@ impl TursoPlatform {
                 "https://api.turso.tech/v1/organizations/{org}/databases"
             ))
             .bearer_auth(token)
-            .json(&serde_json::json!({ "name": name }))
+            .json(&serde_json::json!({ "name": name, "group": "default" }))
             .send()
             .await
             .map_err(store_err)?;
@@ -706,7 +720,70 @@ impl TursoPlatform {
             )));
         }
         let parsed: CreateResp = serde_json::from_str(&body).map_err(store_err)?;
-        Ok(parsed.database.into_db())
+        db_from_value(&parsed.database)
+            .ok_or_else(|| Error::Store(format!("unreadable create response: {body}")))
+    }
+
+    /// A platform API token authorizes the management endpoints only; opening or syncing
+    /// a replica needs a database JWT, minted here for the default group (it covers every
+    /// database in the group).
+    pub async fn mint_db_token(&self, org: &str, token: &str) -> Result<String, Error> {
+        #[derive(serde::Deserialize)]
+        struct TokenResp {
+            jwt: String,
+        }
+        let resp = self
+            .client
+            .post(format!(
+                "https://api.turso.tech/v1/organizations/{org}/groups/default/auth/tokens?authorization=full-access"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(store_err)?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(store_err)?;
+        if !status.is_success() {
+            return Err(Error::Store(format!(
+                "turso mint db token failed ({status}): {body}"
+            )));
+        }
+        let parsed: TokenResp = serde_json::from_str(&body).map_err(store_err)?;
+        Ok(parsed.jwt)
+    }
+
+    async fn create_default_group(&self, org: &str, token: &str) -> Result<(), Error> {
+        #[derive(serde::Deserialize)]
+        struct Region {
+            server: String,
+        }
+        let region: Region = self
+            .client
+            .get("https://region.turso.io")
+            .send()
+            .await
+            .map_err(store_err)?
+            .json()
+            .await
+            .map_err(store_err)?;
+        let resp = self
+            .client
+            .post(format!(
+                "https://api.turso.tech/v1/organizations/{org}/groups"
+            ))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "name": "default", "location": region.server }))
+            .send()
+            .await
+            .map_err(store_err)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.map_err(store_err)?;
+            return Err(Error::Store(format!(
+                "turso create group failed ({status}): {body}"
+            )));
+        }
+        Ok(())
     }
 }
 
