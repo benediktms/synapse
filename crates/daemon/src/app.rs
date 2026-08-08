@@ -16,7 +16,9 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::{
     Config, Manifest, WorkspaceBinding, open_binding, replica_path, resolve_bindings,
 };
-use crate::rpc::{RpcHost, WorkspaceStatus};
+use api::rpc::WorkspaceStatus;
+
+use crate::rpc::RpcHost;
 
 /// Bound on the network-first sync attempted before freshness-sensitive reads and after
 /// writes. On timeout or failure the operation falls back to the local replica as-is.

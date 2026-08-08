@@ -1,5 +1,7 @@
 mod dto;
 
+pub mod rpc;
+
 #[cfg(feature = "server")]
 mod backend;
 #[cfg(feature = "server")]

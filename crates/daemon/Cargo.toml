@@ -15,8 +15,8 @@ path = "src/main.rs"
 adapters-fastembed = { path = "../adapters-fastembed" }
 adapters-libsql = { path = "../adapters-libsql" }
 api = { path = "../api", features = ["server"] }
+daemon-client = { path = "../daemon-client" }
 domain = { path = "../domain" }
-toml = "0.9"
 humantime = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
