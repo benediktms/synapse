@@ -240,11 +240,6 @@ pub struct ReadyResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SyncResponse {
-    pub synced: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceCreatedResponse {
     pub workspace: String,
     pub created: bool,

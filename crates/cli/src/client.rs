@@ -6,6 +6,8 @@ use api_client::SynapseApiClient;
 use daemon_client::DaemonClient;
 use domain::Scope;
 
+use crate::outbox::{SaveTarget, SendFailure};
+
 /// The backend a command talks to. Both transports expose the HTTP client's method
 /// surface, so commands stay transport-blind; only the outbox paths branch.
 pub enum Client {
@@ -28,6 +30,33 @@ fn preference_body(body: PutPreferenceBody) -> PutMemoryBody {
 }
 
 impl Client {
+    /// The outbox's send hook: every transport classifies its own failures, so the
+    /// queue's keep-or-dead-letter call survives the transport switch.
+    pub fn send_save(&self, id: &str, target: &SaveTarget) -> Result<(), SendFailure> {
+        match self {
+            Self::Http(c) => match target {
+                SaveTarget::Memory { workspace, body } => c.save(workspace, id, body).map(drop),
+                SaveTarget::Preference { body } => c.save_preference(id, body).map(drop),
+            }
+            .map_err(|e| SendFailure {
+                retryable: e.is_retryable(),
+                message: e.to_string(),
+            }),
+            Self::Daemon(d) => match target {
+                SaveTarget::Memory { workspace, body } => d
+                    .save(Origin::Workspace(workspace.clone()), id, body.clone())
+                    .map(drop),
+                SaveTarget::Preference { body } => d
+                    .save(Origin::Preference, id, preference_body(body.clone()))
+                    .map(drop),
+            }
+            .map_err(|e| SendFailure {
+                retryable: e.is_retryable(),
+                message: e.to_string(),
+            }),
+        }
+    }
+
     pub fn create_workspace(&self, name: &str) -> Result<String, String> {
         match self {
             Self::Http(c) => Ok(c.create_workspace(name).map_err(err)?.workspace),

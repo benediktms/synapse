@@ -15,8 +15,8 @@ use serde_json::Value;
 use api::rpc::{
     ContextParams, EditParams, GraphParams, IdParams, ImportParams, JSONRPC_VERSION, LinkMethod,
     LinkParams, MemoryMethod, Method, MoveParams, OriginParams, ReadyResponse, Request, Response,
-    SaveParams, SaveResponse, SearchParams, SyncParams, SyncResponse, UnlinkParams,
-    WorkspaceCreatedResponse, WorkspaceMethod, WorkspaceParams, WorkspaceStatus,
+    SaveParams, SaveResponse, SearchParams, SyncParams, UnlinkParams, WorkspaceCreatedResponse,
+    WorkspaceMethod, WorkspaceParams, WorkspaceStatus,
 };
 use api::{
     ContextResponse, ExportDoc, GraphDto, ImportReport, ListResponse, MemoryDto, MoveBody,
@@ -24,19 +24,21 @@ use api::{
 };
 
 /// The daemon's state directory: `$SYNAPSE_STATE_DIR/daemon`, or the XDG state home.
-/// The daemon binary and every client must derive the same path.
-pub fn state_dir() -> PathBuf {
+/// The daemon binary and every client must derive the same path, and a cwd-relative
+/// fallback would scatter state wherever the process happened to start.
+pub fn state_dir() -> Result<PathBuf, String> {
     let base = if let Some(dir) = env_path("SYNAPSE_STATE_DIR") {
         dir
     } else if let Some(dir) = env_path("XDG_STATE_HOME") {
         dir.join("synapse")
+    } else if let Some(home) = env_path("HOME") {
+        home.join(".local/state").join("synapse")
     } else {
-        env_path("HOME")
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".local/state")
-            .join("synapse")
+        return Err(
+            "cannot locate the daemon state directory: set HOME or SYNAPSE_STATE_DIR".to_string(),
+        );
     };
-    base.join("daemon")
+    Ok(base.join("daemon"))
 }
 
 fn env_path(var: &str) -> Option<PathBuf> {
@@ -82,6 +84,17 @@ pub enum DaemonError {
     Transport(String),
     Rpc { code: i64, message: String },
     Decode(String),
+}
+
+impl DaemonError {
+    /// Mirrors the HTTP client's split: only a definitive rejection is safe to give up
+    /// on. -32000 covers internal errors and timeouts; -32003 is the not-ready gate.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport(_) | Self::Decode(_) => true,
+            Self::Rpc { code, .. } => matches!(code, -32000 | -32003),
+        }
+    }
 }
 
 impl fmt::Display for DaemonError {
@@ -163,7 +176,9 @@ impl DaemonClient {
         self.call(Method::Status, Value::Null)
     }
 
-    pub fn sync(&self, origin: Option<Origin>) -> Result<SyncResponse, DaemonError> {
+    /// Forces a sync and returns the post-sync per-replica status: an unreachable
+    /// primary fails open, so `online` is the field that says whether anything moved.
+    pub fn sync(&self, origin: Option<Origin>) -> Result<Vec<WorkspaceStatus>, DaemonError> {
         self.call(Method::Sync, Self::params(&SyncParams { origin })?)
     }
 
@@ -375,16 +390,30 @@ impl DaemonClient {
 const SPAWN_POLL: Duration = Duration::from_millis(200);
 const SPAWN_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Probe the socket; when no daemon answers, spawn `synd` detached and poll until it does.
-pub fn ensure_running(client: &DaemonClient) -> Result<(), String> {
+pub fn log_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("daemon.log")
+}
+
+/// Probe the socket; when no daemon answers, spawn `synd` detached with its stderr
+/// appended to `<state>/daemon.log`, then poll until it answers. A child that exits
+/// during the poll fails immediately with the log tail instead of running out the clock.
+pub fn ensure_running(client: &DaemonClient, state_dir: &Path) -> Result<(), String> {
     if client.ping().is_ok() {
         return Ok(());
     }
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| format!("cannot create {}: {e}", state_dir.display()))?;
+    let log_path = log_path(state_dir);
+    let log = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("cannot open {}: {e}", log_path.display()))?;
     let program = synd_program();
-    std::process::Command::new(&program)
+    let mut child = std::process::Command::new(&program)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(log)
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", program.display()))?;
     let started = Instant::now();
@@ -392,12 +421,37 @@ pub fn ensure_running(client: &DaemonClient) -> Result<(), String> {
         if client.ping().is_ok() {
             return Ok(());
         }
+        match child.try_wait() {
+            Ok(Some(status)) if !status.success() => {
+                return Err(format!(
+                    "{} exited at startup ({status}): {}",
+                    program.display(),
+                    log_tail(&log_path)
+                ));
+            }
+            // Exit 0 means another daemon already holds the single-instance lock;
+            // keep polling its socket.
+            _ => {}
+        }
         std::thread::sleep(SPAWN_POLL);
     }
     Err(format!(
-        "the daemon did not answer within {}s of being started; check `synd` logs",
-        SPAWN_DEADLINE.as_secs()
+        "the daemon did not answer within {}s of being started; see {}",
+        SPAWN_DEADLINE.as_secs(),
+        log_path.display()
     ))
+}
+
+fn log_tail(path: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return format!("no log at {}", path.display());
+    };
+    let tail: Vec<&str> = text.lines().rev().take(5).collect();
+    let mut lines: Vec<&str> = tail.into_iter().rev().collect();
+    if lines.is_empty() {
+        lines.push("(log is empty)");
+    }
+    lines.join("; ")
 }
 
 /// Prefer the synd next to the running syn binary, so an installed pair stays in step.

@@ -11,7 +11,7 @@ use api::ops::{self, SearchArgs};
 use api::rpc::{
     ContextParams, EditParams, ErrorObj, GraphParams, IdParams, ImportParams, JSONRPC_VERSION,
     LinkMethod, LinkParams, MemoryMethod, Method, MoveParams, OriginParams, ReadyResponse, Request,
-    Response, SaveParams, SearchParams, SyncParams, SyncResponse, UnlinkParams, UnlinkResponse,
+    Response, SaveParams, SearchParams, SyncParams, UnlinkParams, UnlinkResponse,
     WorkspaceCreatedResponse, WorkspaceMethod, WorkspaceParams, WorkspaceStatus,
 };
 use api::{ApiError, Backend, BackendError, Origin};
@@ -172,7 +172,9 @@ async fn call<H: RpcHost>(method: Method, params: Value, host: &H) -> Result<Val
             let p: SyncParams = parse(params)?;
             let ws = p.origin.as_ref().map(ops::workspace_of).transpose()?;
             host.sync_replicas(ws.as_ref()).await?;
-            encode(&SyncResponse { synced: true })
+            // A sync fails open when the primary is unreachable, so the verdict is the
+            // post-sync per-replica status, not a bare success flag.
+            encode(&host.statuses().await)
         }
         Method::Workspace(WorkspaceMethod::Create) => {
             let p: WorkspaceParams = parse(params)?;

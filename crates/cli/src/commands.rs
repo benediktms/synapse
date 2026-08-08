@@ -26,9 +26,11 @@ use crate::resolve;
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const BULK_TIMEOUT: Duration = Duration::from_secs(600);
-/// Must outlast the daemon's own 30s per-request deadline, so a forced sync reports the
-/// daemon's verdict instead of a client-side timeout.
-const SYNC_TIMEOUT: Duration = Duration::from_secs(35);
+/// Socket timeouts on the daemon transport sit above the daemon's own per-request
+/// deadlines (30s, 600s for import), so the client always receives the daemon's verdict
+/// instead of timing out first on an operation that then succeeds.
+const DAEMON_RPC_TIMEOUT: Duration = Duration::from_secs(35);
+const DAEMON_BULK_TIMEOUT: Duration = Duration::from_secs(610);
 /// One total budget for the pre-read flush, so a backlog cannot push a read past the
 /// session hook's ten seconds however many items are queued.
 const FLUSH_BUDGET: Duration = Duration::from_secs(2);
@@ -93,10 +95,15 @@ impl Context {
 
     /// Spawn-on-demand: a dead daemon is started detached and polled until it answers.
     fn daemon_client(&self, timeout: Duration, spawn: bool) -> Result<DaemonClient, String> {
-        let dir = daemon_client::state_dir();
+        let dir = daemon_client::state_dir()?;
+        let timeout = if timeout >= BULK_TIMEOUT {
+            DAEMON_BULK_TIMEOUT
+        } else {
+            DAEMON_RPC_TIMEOUT
+        };
         let client = DaemonClient::new(daemon_client::socket_path(&dir), timeout);
         if spawn {
-            daemon_client::ensure_running(&client)?;
+            daemon_client::ensure_running(&client, &dir)?;
         }
         Ok(client)
     }
@@ -128,17 +135,14 @@ impl Context {
 /// Read commands drain the outbox first so a queued save becomes recallable at the first
 /// opportunity; an outage here must not fail the read, but it must not pass unmentioned
 /// either — whatever stays queued is missing from what the read is about to print.
-/// The outbox belongs to the HTTP path; on the daemon transport the daemon's local-first
-/// writes make it unnecessary.
+/// The flush targets whichever transport is active, so saves queued under one transport
+/// still land after a switch.
 fn flush_before_read(ctx: &Context) {
-    if ctx.config.transport() == Transport::Daemon {
-        return;
-    }
     let Ok(outbox) = Outbox::open() else {
         return;
     };
     let flushed = ctx
-        .http_client(FLUSH_SEND_TIMEOUT)
+        .client(FLUSH_SEND_TIMEOUT)
         .and_then(|client| outbox.flush(&client, Some(FLUSH_BUDGET)));
     let report = match flushed {
         Ok(report) => report,
@@ -209,23 +213,7 @@ fn save(ctx: &Context, args: SaveArgs) -> Result<(), String> {
             },
         }
     };
-    match ctx.client(WRITE_TIMEOUT)? {
-        // The HTTP path queues first so an unreachable server cannot lose the save.
-        Client::Http(http) => queue_and_flush(&http, target),
-        // The daemon writes locally first by design, so the CLI outbox adds nothing.
-        client @ Client::Daemon(_) => save_direct(&client, target),
-    }
-}
-
-fn save_direct(client: &Client, target: SaveTarget) -> Result<(), String> {
-    let id = MemoryId::generate().to_string();
-    let where_to = target.label();
-    let memory = match target {
-        SaveTarget::Preference { body } => client.save_preference(&id, &body)?,
-        SaveTarget::Memory { workspace, body } => client.save(&workspace, &id, &body)?,
-    };
-    println!("saved {} ({where_to})", memory.id);
-    Ok(())
+    queue_and_flush(ctx, target)
 }
 
 /// `decision` is the CLI's name for what the store calls a `project` memory: `--scope project`
@@ -262,7 +250,7 @@ fn retired_remember(args: RetiredArgs) -> Result<(), String> {
 
 /// The outbox is written before the first send, so a reply lost in flight replays
 /// against the same id and the idempotent PUT collapses it.
-fn queue_and_flush(client: &SynapseApiClient, target: SaveTarget) -> Result<(), String> {
+fn queue_and_flush(ctx: &Context, target: SaveTarget) -> Result<(), String> {
     let id = MemoryId::generate().to_string();
     let where_to = target.label();
     let item = PendingSave {
@@ -273,7 +261,17 @@ fn queue_and_flush(client: &SynapseApiClient, target: SaveTarget) -> Result<(), 
     };
     let outbox = Outbox::open()?;
     outbox.enqueue(&item)?;
-    let report = outbox.flush(client, None)?;
+    // The item is durable before the client exists: a backend that cannot even be
+    // constructed (daemon spawn failure, missing token) leaves it queued, not lost.
+    let client = match ctx.client(WRITE_TIMEOUT) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("note: {e}");
+            println!("queued {id} ({where_to}) — queued locally, not yet recallable");
+            return Ok(());
+        }
+    };
+    let report = outbox.flush(&client, None)?;
     if report.sent.contains(&id) {
         println!("saved {id} ({where_to})");
         return Ok(());
@@ -686,9 +684,7 @@ fn workspace(ctx: &Context, command: WorkspaceCommand) -> Result<(), String> {
 
 fn export(ctx: &Context, args: WorkspaceArgs) -> Result<(), String> {
     let client = ctx.client(BULK_TIMEOUT)?;
-    if let Client::Http(http) = &client {
-        drain_before_export(http)?;
-    }
+    drain_before_export(&client)?;
     let target = resolve_target(ctx, &args.store)?;
     let doc = match &target {
         Origin::Preference => client.export_preferences(),
@@ -701,7 +697,7 @@ fn export(ctx: &Context, args: WorkspaceArgs) -> Result<(), String> {
 
 /// A dump is only a backup once this machine's queue is on the server, so an unflushable
 /// backlog fails the export rather than writing a quietly incomplete file.
-fn drain_before_export(client: &SynapseApiClient) -> Result<(), String> {
+fn drain_before_export(client: &Client) -> Result<(), String> {
     let outbox = Outbox::open()?;
     let report = outbox.flush(client, None)?;
     report_backlog(&report);
@@ -774,7 +770,7 @@ fn set_config(mut config: Config, command: ConfigCommand) -> Result<(), String> 
 /// org-scoped token each. Per-machine scope is the security boundary: a personal machine
 /// simply never gets the work org's token.
 fn setup() -> Result<(), String> {
-    let dir = daemon_client::state_dir();
+    let dir = daemon_client::state_dir()?;
     let path = daemon_client::config_path(&dir);
     if path.exists() {
         eprintln!("note: {} exists and will be replaced", path.display());
@@ -786,7 +782,7 @@ fn setup() -> Result<(), String> {
         if name.is_empty() {
             break;
         }
-        let token = prompt(&format!("platform API token for {name}: "))?;
+        let token = prompt_secret(&format!("platform API token for {name}: "))?;
         if token.is_empty() {
             return Err(format!("no token given for {name}; setup unchanged"));
         }
@@ -799,6 +795,14 @@ fn setup() -> Result<(), String> {
     crate::config::private_dir(&dir)?;
     crate::config::write_private(&path, config.to_toml()?.as_bytes())?;
     println!("wrote {}", path.display());
+    // The daemon reads its config once at boot; a live one keeps serving the old orgs.
+    let probe = DaemonClient::new(daemon_client::socket_path(&dir), Duration::from_secs(1));
+    if probe.ping().is_ok() {
+        println!(
+            "a daemon is running with the previous config; restart it to pick this up: \
+             pkill synd (the next syn command starts it again)"
+        );
+    }
     println!("switch the CLI over with: syn config set-transport daemon");
     Ok(())
 }
@@ -813,38 +817,77 @@ fn prompt(label: &str) -> Result<String, String> {
     Ok(line.trim().to_string())
 }
 
-fn require_daemon(client: Client, what: &str) -> Result<DaemonClient, String> {
-    match client {
-        Client::Daemon(daemon) => Ok(daemon),
-        Client::Http(_) => Err(format!(
-            "{what} acts on the replication daemon; run: syn config set-transport daemon"
-        )),
+/// Like `prompt`, but with terminal echo off so the secret stays out of the scrollback.
+/// A non-tty stdin (piped setup) falls back to a plain read.
+fn prompt_secret(label: &str) -> Result<String, String> {
+    let stdin_fd = 0;
+    if unsafe { libc::isatty(stdin_fd) } == 0 {
+        return prompt(label);
     }
+    eprint!("{label}");
+    std::io::stderr().flush().map_err(|e| e.to_string())?;
+    let mut term = std::mem::MaybeUninit::uninit();
+    if unsafe { libc::tcgetattr(stdin_fd, term.as_mut_ptr()) } != 0 {
+        return prompt("");
+    }
+    let saved = unsafe { term.assume_init() };
+    let mut silent = saved;
+    silent.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &silent) } != 0 {
+        return prompt("");
+    }
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &saved) };
+    eprintln!();
+    read.map_err(|e| format!("cannot read stdin: {e}"))?;
+    Ok(line.trim().to_string())
+}
+
+/// The transport check comes before any client is built, so a missing HTTP token can
+/// never hijack the error with a set-token hint for a transport the user is not on.
+fn require_daemon(ctx: &Context, what: &str) -> Result<DaemonClient, String> {
+    if ctx.config.transport() != Transport::Daemon {
+        return Err(format!(
+            "{what} acts on the replication daemon; run: syn config set-transport daemon"
+        ));
+    }
+    ctx.daemon_client(WRITE_TIMEOUT, true)
 }
 
 fn sync(ctx: &Context, args: SyncArgs) -> Result<(), String> {
-    let daemon = require_daemon(ctx.client(SYNC_TIMEOUT)?, "syn sync")?;
-    let origin = args
+    let daemon = require_daemon(ctx, "syn sync")?;
+    let only = args
         .workspace
         .as_deref()
         .map(resolve::validate_workspace)
-        .transpose()?
-        .map(Origin::Workspace);
-    daemon.sync(origin.clone()).map_err(|e| e.to_string())?;
-    match origin {
-        Some(Origin::Workspace(name)) => println!("synced {name}"),
-        _ => println!("synced all replicas"),
+        .transpose()?;
+    let origin = only.clone().map(Origin::Workspace);
+    let statuses = daemon.sync(origin).map_err(|e| e.to_string())?;
+    let statuses: Vec<_> = statuses
+        .into_iter()
+        .filter(|ws| only.as_deref().is_none_or(|name| ws.name == name))
+        .collect();
+    if statuses.is_empty() {
+        println!("no replicas open");
+        return Ok(());
     }
+    print_statuses(statuses);
     Ok(())
 }
 
 fn status(ctx: &Context) -> Result<(), String> {
-    let daemon = require_daemon(ctx.client(READ_TIMEOUT)?, "syn status")?;
+    let daemon = require_daemon(ctx, "syn status")?;
     let statuses = daemon.status().map_err(|e| e.to_string())?;
     if statuses.is_empty() {
         println!("no replicas open");
         return Ok(());
     }
+    print_statuses(statuses);
+    Ok(())
+}
+
+fn print_statuses(statuses: Vec<api::rpc::WorkspaceStatus>) {
     let now = now_millis();
     for ws in statuses {
         let freshness = if ws.last_synced_at == 0 {
@@ -859,7 +902,6 @@ fn status(ctx: &Context) -> Result<(), String> {
         };
         println!("{}: {connectivity}, {freshness}{pending}", ws.name);
     }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -5,10 +5,17 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{PutMemoryBody, PutPreferenceBody};
-use api_client::SynapseApiClient;
 use serde::{Deserialize, Serialize};
 
+use crate::client::Client;
 use crate::config::{private_dir, state_dir, sync_parent, write_private};
+
+/// A failed send, classified by the transport: only a definitive rejection dead-letters
+/// an item; anything that may succeed on replay stays queued.
+pub struct SendFailure {
+    pub message: String,
+    pub retryable: bool,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "target", rename_all = "lowercase")]
@@ -91,11 +98,7 @@ impl Outbox {
     /// ordering survives an outage. `budget` bounds the whole call — lock wait included —
     /// for callers that must return within a deadline; `None` waits for the lock and
     /// drains the queue. `still_queued` always reports what remains unsent.
-    pub fn flush(
-        &self,
-        client: &SynapseApiClient,
-        budget: Option<Duration>,
-    ) -> Result<FlushReport, String> {
+    pub fn flush(&self, client: &Client, budget: Option<Duration>) -> Result<FlushReport, String> {
         let mut report = FlushReport::default();
         let deadline = budget.map(|budget| Instant::now() + budget);
         let held = match deadline {
@@ -112,30 +115,23 @@ impl Outbox {
                 report.deferred = Some("flush budget spent before the queue drained".to_string());
                 break;
             }
-            let sent = match &item.target {
-                SaveTarget::Memory { workspace, body } => {
-                    client.save(workspace, &item.id, body).map(drop)
-                }
-                SaveTarget::Preference { body } => client.save_preference(&item.id, body).map(drop),
-            };
-            match sent {
+            match client.send_save(&item.id, &item.target) {
                 Ok(()) => {
                     remove(&path)?;
                     report.sent.push(item.id);
                 }
-                Err(err) if err.is_retryable() => {
-                    report.deferred = Some(err.to_string());
+                Err(err) if err.retryable => {
+                    report.deferred = Some(err.message);
                     break;
                 }
                 Err(err) => {
-                    let failure = err.to_string();
                     let dead = PendingSave {
-                        failure: Some(failure.clone()),
+                        failure: Some(err.message.clone()),
                         ..item.clone()
                     };
                     self.write_item(&self.dead_dir(), &dead)?;
                     remove(&path)?;
-                    report.dead_lettered.push((item.id, failure));
+                    report.dead_lettered.push((item.id, err.message));
                 }
             }
         }

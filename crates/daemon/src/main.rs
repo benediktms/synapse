@@ -12,7 +12,13 @@ async fn main() {
         )
         .init();
 
-    let dir = state_dir();
+    let dir = match state_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
     std::fs::create_dir_all(&dir).expect("create state dir");
     {
         use std::os::unix::fs::PermissionsExt;
