@@ -1,0 +1,29 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "synd"
+path = "src/main.rs"
+
+[dependencies]
+adapters-fastembed = { path = "../adapters-fastembed" }
+adapters-libsql = { path = "../adapters-libsql" }
+api = { path = "../api", features = ["server"] }
+domain = { path = "../domain" }
+toml = "0.9"
+humantime = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "io-util", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+libsql = "0.9"
+tempfile = "3"

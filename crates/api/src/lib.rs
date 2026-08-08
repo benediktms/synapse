@@ -5,6 +5,8 @@ mod backend;
 #[cfg(feature = "server")]
 mod error;
 #[cfg(feature = "server")]
+pub mod ops;
+#[cfg(feature = "server")]
 mod routes;
 #[cfg(feature = "server")]
 mod validate;
