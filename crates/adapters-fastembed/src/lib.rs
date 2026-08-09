@@ -17,8 +17,20 @@ pub struct FastEmbedder {
 
 impl FastEmbedder {
     pub fn new() -> Result<Self, Error> {
-        let options =
-            TextInitOptions::new(EmbeddingModel::BGESmallENV15).with_show_download_progress(false);
+        Self::build(Self::options())
+    }
+
+    /// The default cache dir is relative to the process cwd, which under launchd is `/`;
+    /// long-lived processes must pin an absolute one.
+    pub fn with_cache_dir(dir: std::path::PathBuf) -> Result<Self, Error> {
+        Self::build(Self::options().with_cache_dir(dir))
+    }
+
+    fn options() -> TextInitOptions {
+        TextInitOptions::new(EmbeddingModel::BGESmallENV15).with_show_download_progress(false)
+    }
+
+    fn build(options: TextInitOptions) -> Result<Self, Error> {
         let model = TextEmbedding::try_new(options).map_err(|e| Error::Embed(e.to_string()))?;
         // The model's own tokenizer truncates at the window, hiding overflow;
         // an untruncated clone lets callers count real token lengths.
