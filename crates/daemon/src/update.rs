@@ -10,6 +10,7 @@ const FIRST_CHECK_DELAY: Duration = Duration::from_secs(60 * 60);
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const BINARIES: [&str; 2] = ["synd", "syn"];
+const EXE_SUFFIX: &str = if cfg!(windows) { ".exe" } else { "" };
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -66,6 +67,10 @@ fn target_triple() -> Option<&'static str> {
         Some("x86_64-unknown-linux-gnu")
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
         Some("aarch64-unknown-linux-gnu")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("x86_64-pc-windows-msvc")
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some("aarch64-pc-windows-msvc")
     } else {
         None
     }
@@ -90,7 +95,7 @@ async fn check_once(install_dir: &Path) -> Result<Option<String>, String> {
 
     let mut staged = Vec::new();
     for bin in BINARIES {
-        let asset = format!("{bin}-{triple}");
+        let asset = format!("{bin}-{triple}{EXE_SUFFIX}");
         let expected = manifest
             .assets
             .get(&asset)
@@ -161,17 +166,20 @@ fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
 /// Write the verified bytes next to the final destination so the rename in [`swap`]
 /// stays on one filesystem and is atomic.
 fn stage(install_dir: &Path, bin: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt;
     let path = install_dir.join(format!(".{bin}.update"));
     std::fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
     Ok(path)
 }
 
 fn swap(install_dir: &Path, bin: &str, staged: &Path) -> Result<(), String> {
-    let current = install_dir.join(bin);
-    let backup = install_dir.join(format!("{bin}.bak"));
+    let current = install_dir.join(format!("{bin}{EXE_SUFFIX}"));
+    let backup = install_dir.join(format!("{bin}{EXE_SUFFIX}.bak"));
     if current.exists() {
         std::fs::rename(&current, &backup)
             .map_err(|e| format!("backup {}: {e}", current.display()))?;
@@ -220,27 +228,35 @@ mod tests {
 
     #[test]
     fn swap_replaces_the_binary_and_keeps_a_backup() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("synd"), "old").unwrap();
+        let current = format!("synd{EXE_SUFFIX}");
+        std::fs::write(dir.path().join(&current), "old").unwrap();
         let staged = stage(dir.path(), "synd", b"new").unwrap();
         swap(dir.path(), "synd", &staged).unwrap();
-        assert_eq!(std::fs::read(dir.path().join("synd")).unwrap(), b"new");
-        assert_eq!(std::fs::read(dir.path().join("synd.bak")).unwrap(), b"old");
-        let mode = std::fs::metadata(dir.path().join("synd"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o755);
+        assert_eq!(std::fs::read(dir.path().join(&current)).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("{current}.bak"))).unwrap(),
+            b"old"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(&current))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755);
+        }
     }
 
     #[test]
     fn swap_restores_the_backup_when_install_fails() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("synd"), "old").unwrap();
+        let current = format!("synd{EXE_SUFFIX}");
+        std::fs::write(dir.path().join(&current), "old").unwrap();
         let missing = dir.path().join("absent-staged-file");
         assert!(swap(dir.path(), "synd", &missing).is_err());
-        assert_eq!(std::fs::read(dir.path().join("synd")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dir.path().join(&current)).unwrap(), b"old");
     }
 }

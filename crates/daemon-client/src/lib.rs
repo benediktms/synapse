@@ -1,10 +1,10 @@
 //! Blocking JSON-RPC client for the synapse daemon: newline-framed requests over the
-//! daemon's unix socket, one short connection per command, plus the daemon's on-disk
-//! config schema and spawn-on-demand lifecycle.
+//! daemon's local socket (a unix domain socket, or a named pipe on Windows), one short
+//! connection per command, plus the daemon's on-disk config schema and spawn-on-demand
+//! lifecycle.
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,10 @@ pub fn state_dir() -> Result<PathBuf, String> {
         dir
     } else if let Some(dir) = env_path("XDG_STATE_HOME") {
         dir.join("synapse")
+    } else if cfg!(windows)
+        && let Some(dir) = env_path("LOCALAPPDATA")
+    {
+        dir.join("synapse")
     } else if let Some(home) = env_path("HOME") {
         home.join(".local/state").join("synapse")
     } else {
@@ -47,8 +51,21 @@ fn env_path(var: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+#[cfg(unix)]
 pub fn socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join("daemon.sock")
+}
+
+/// The pipe namespace is machine-global, so the name carries a hash of the state dir:
+/// distinct SYNAPSE_STATE_DIRs (tests, parallel setups) get distinct daemons.
+#[cfg(windows)]
+pub fn socket_path(state_dir: &Path) -> PathBuf {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in state_dir.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    PathBuf::from(format!(r"\\.\pipe\synapse-{hash:016x}"))
 }
 
 pub fn config_path(state_dir: &Path) -> PathBuf {
@@ -127,12 +144,6 @@ impl DaemonClient {
 
     /// Connect, send one request line, read one response line, close.
     fn call<R: DeserializeOwned>(&self, method: Method, params: Value) -> Result<R, DaemonError> {
-        let stream = UnixStream::connect(&self.socket)
-            .map_err(|e| DaemonError::Transport(format!("{} ({e})", self.socket.display())))?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
-            .map_err(|e| DaemonError::Transport(e.to_string()))?;
         let request = Request {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: 1,
@@ -142,6 +153,27 @@ impl DaemonClient {
         let mut line =
             serde_json::to_string(&request).map_err(|e| DaemonError::Decode(e.to_string()))?;
         line.push('\n');
+        let reply = self.exchange(line)?;
+        let response: Response =
+            serde_json::from_str(&reply).map_err(|e| DaemonError::Decode(e.to_string()))?;
+        if let Some(error) = response.error {
+            return Err(DaemonError::Rpc {
+                code: error.code,
+                message: error.message,
+            });
+        }
+        let result = response.result.unwrap_or(Value::Null);
+        serde_json::from_value(result).map_err(|e| DaemonError::Decode(e.to_string()))
+    }
+
+    #[cfg(unix)]
+    fn exchange(&self, line: String) -> Result<String, DaemonError> {
+        let stream = std::os::unix::net::UnixStream::connect(&self.socket)
+            .map_err(|e| DaemonError::Transport(format!("{} ({e})", self.socket.display())))?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
+            .map_err(|e| DaemonError::Transport(e.to_string()))?;
         let mut writer = stream
             .try_clone()
             .map_err(|e| DaemonError::Transport(e.to_string()))?;
@@ -153,16 +185,59 @@ impl DaemonClient {
         BufReader::new(stream)
             .read_line(&mut reply)
             .map_err(|e| DaemonError::Transport(e.to_string()))?;
-        let response: Response =
-            serde_json::from_str(&reply).map_err(|e| DaemonError::Decode(e.to_string()))?;
-        if let Some(error) = response.error {
-            return Err(DaemonError::Rpc {
-                code: error.code,
-                message: error.message,
-            });
+        Ok(reply)
+    }
+
+    /// A pipe handle has no read timeout, so the response is read on a helper thread
+    /// bounded by `recv_timeout`; on timeout the thread is abandoned and dies with the
+    /// short-lived CLI process.
+    #[cfg(windows)]
+    fn exchange(&self, line: String) -> Result<String, DaemonError> {
+        let deadline = Instant::now() + self.timeout;
+        let file = loop {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.socket)
+            {
+                Ok(file) => break file,
+                // ERROR_PIPE_BUSY: every instance is taken; the daemon creates the next
+                // one as soon as it accepts, so retry briefly instead of failing.
+                Err(e) if e.raw_os_error() == Some(231) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => {
+                    return Err(DaemonError::Transport(format!(
+                        "{} ({e})",
+                        self.socket.display()
+                    )));
+                }
+            }
+        };
+        let mut writer = file
+            .try_clone()
+            .map_err(|e| DaemonError::Transport(e.to_string()))?;
+        writer
+            .write_all(line.as_bytes())
+            .and_then(|()| writer.flush())
+            .map_err(|e| DaemonError::Transport(e.to_string()))?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reply = String::new();
+            let result = BufReader::new(file)
+                .read_line(&mut reply)
+                .map(|_| reply)
+                .map_err(|e| e.to_string());
+            let _ = sender.send(result);
+        });
+        match receiver.recv_timeout(self.timeout) {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(e)) => Err(DaemonError::Transport(e)),
+            Err(_) => Err(DaemonError::Transport(format!(
+                "no response within {}s",
+                self.timeout.as_secs()
+            ))),
         }
-        let result = response.result.unwrap_or(Value::Null);
-        serde_json::from_value(result).map_err(|e| DaemonError::Decode(e.to_string()))
     }
 
     fn params<P: Serialize>(params: &P) -> Result<Value, DaemonError> {
@@ -416,10 +491,18 @@ pub fn ensure_running(client: &DaemonClient, state_dir: &Path) -> Result<(), Str
         .open(&log_path)
         .map_err(|e| format!("cannot open {}: {e}", log_path.display()))?;
     let program = synd_program();
-    let mut child = std::process::Command::new(&program)
+    let mut command = std::process::Command::new(&program);
+    command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(log)
+        .stderr(log);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", program.display()))?;
     let started = Instant::now();
@@ -460,22 +543,24 @@ fn log_tail(path: &Path) -> String {
     lines.join("; ")
 }
 
+pub const SYND_FILE_NAME: &str = if cfg!(windows) { "synd.exe" } else { "synd" };
+
 /// Prefer the synd next to the running syn binary, so an installed pair stays in step.
 fn synd_program() -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("synd")))
+        .and_then(|exe| exe.parent().map(|dir| dir.join(SYND_FILE_NAME)))
         .filter(|candidate| candidate.exists())
-        .unwrap_or_else(|| PathBuf::from("synd"))
+        .unwrap_or_else(|| PathBuf::from(SYND_FILE_NAME))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
 
+    #[cfg(unix)]
     fn serve_once(socket: &Path, reply: &'static str) -> std::thread::JoinHandle<String> {
-        let listener = UnixListener::bind(socket).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut line = String::new();
@@ -487,6 +572,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn call_frames_one_request_line_and_reads_one_reply() {
         let dir = tempfile::tempdir().unwrap();
@@ -503,6 +589,7 @@ mod tests {
         assert!(request_line.ends_with('\n'));
     }
 
+    #[cfg(unix)]
     #[test]
     fn rpc_errors_surface_code_and_message() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,5 +1,7 @@
-bin_dir := env('HOME') / '.local/bin'
+bin_dir := env('HOME', env('USERPROFILE', '')) / '.local/bin'
 syn := justfile_directory() / 'target/release/syn'
+
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
 _default:
     @just --list
@@ -9,6 +11,7 @@ build:
     cargo build --release
 
 # symlink syn + synd into ~/.local/bin and load the daemon unit (rebuilds first)
+[unix]
 install: build
     mkdir -p {{ bin_dir }}
     ln -sf {{ syn }} {{ bin_dir }}/syn
@@ -16,11 +19,28 @@ install: build
     @{{ bin_dir }}/syn --version
     {{ bin_dir }}/syn daemon install
 
+# copy syn + synd into ~/.local/bin and register the task; the stop must precede
+# the copy because Windows refuses to overwrite a running executable image
+[windows]
+install: build
+    New-Item -ItemType Directory -Force -ErrorAction Stop "{{ bin_dir }}" | Out-Null
+    $installed = "{{ bin_dir }}\synd.exe"; if (Test-Path -LiteralPath $installed) { & "{{ syn }}.exe" daemon stop }
+    Copy-Item -Force -ErrorAction Stop "{{ syn }}.exe" "{{ bin_dir }}\syn.exe"
+    Copy-Item -Force -ErrorAction Stop "{{ syn }}d.exe" "{{ bin_dir }}\synd.exe"
+    & "{{ bin_dir }}\syn.exe" daemon install
+
 # unload the daemon unit and remove the ~/.local/bin symlinks
+[unix]
 uninstall:
     if [ -x {{ bin_dir }}/syn ]; then {{ bin_dir }}/syn daemon uninstall; \
     else echo "syn not installed; skipping daemon uninstall"; fi
     rm -f {{ bin_dir }}/syn {{ bin_dir }}/synd
+
+# unregister the task, then remove the installed executables
+[windows]
+uninstall:
+    $syn = "{{ bin_dir }}\syn.exe"; if (Test-Path -LiteralPath $syn) { & $syn daemon uninstall } else { Write-Host "syn not installed; skipping daemon uninstall" }
+    @("{{ bin_dir }}\syn.exe", "{{ bin_dir }}\synd.exe") | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force -ErrorAction Stop
 
 test:
     cargo test --workspace
