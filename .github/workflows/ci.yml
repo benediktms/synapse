@@ -12,29 +12,59 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # One model cache for every crate's tests; without it each crate that embeds
+  # downloads its own 128MB copy into a cwd-relative .fastembed_cache.
+  FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
 
+# Windows is deliberately absent: the daemon speaks unix domain sockets and the
+# CLI leans on unix permissions and termios. The job joins the matrix with the
+# Windows port (named pipes), not before.
 jobs:
-  check:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      # The embedding model is a ~128MB download that every test run of
-      # adapters-fastembed would otherwise repeat.
-      - uses: actions/cache@v4
-        with:
-          path: crates/adapters-fastembed/.fastembed_cache
-          key: fastembed-${{ runner.os }}-${{ hashFiles('crates/adapters-fastembed/src/lib.rs') }}
-          restore-keys: fastembed-${{ runner.os }}-
+          components: rustfmt
 
       - run: cargo fmt --all --check
 
+  clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/cache@v4
+        with:
+          path: .fastembed_cache
+          key: fastembed-${{ runner.os }}-${{ hashFiles('crates/adapters-fastembed/src/lib.rs') }}
+          restore-keys: fastembed-${{ runner.os }}-
 
       - run: cargo test --workspace

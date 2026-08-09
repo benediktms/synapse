@@ -49,6 +49,10 @@ async fn main() {
         }
     };
 
+    if config.auto_update() {
+        daemon::update::spawn();
+    }
+
     let app = match DaemonApp::boot(dir.clone(), config).await {
         Ok(app) => app,
         Err(e) => {

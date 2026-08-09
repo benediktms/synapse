@@ -66,9 +66,15 @@ pub struct ScopedOrg {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct DaemonConfig {
     pub scoped_orgs: Vec<ScopedOrg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<bool>,
 }
 
 impl DaemonConfig {
+    pub fn auto_update(&self) -> bool {
+        self.auto_update.unwrap_or(true)
+    }
+
     pub fn load(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         toml::from_str(&raw).map_err(|e| e.to_string())
@@ -522,6 +528,7 @@ mod tests {
                 name: "benediktms".into(),
                 token: "tok".into(),
             }],
+            auto_update: None,
         };
         let text = config.to_toml().unwrap();
         assert!(text.contains("[[scoped_orgs]]"), "{text}");
