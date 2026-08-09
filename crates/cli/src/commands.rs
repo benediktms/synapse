@@ -787,6 +787,7 @@ fn setup() -> Result<(), String> {
         if token.is_empty() {
             return Err(format!("no token given for {name}; setup unchanged"));
         }
+        let token = maybe_mint_machine_token(&name, token)?;
         orgs.push(ScopedOrg { name, token });
     }
     if orgs.is_empty() {
@@ -809,6 +810,22 @@ fn setup() -> Result<(), String> {
     }
     println!("switch the CLI over with: syn config set-transport daemon");
     Ok(())
+}
+
+/// Offer to trade the pasted token for a fresh machine-scoped one, so the long-lived
+/// token the user keeps in their password manager never lands on disk. Defaults to
+/// no: piped setups and users who pasted a per-machine token already keep what they gave.
+fn maybe_mint_machine_token(org: &str, pasted: String) -> Result<String, String> {
+    let answer = prompt("mint a fresh per-machine token from it and store that instead? [y/N]: ")?;
+    if !matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(pasted);
+    }
+    let default_name = crate::turso::machine_token_name();
+    let name = prompt(&format!("token name [{default_name}]: "))?;
+    let name = if name.is_empty() { default_name } else { name };
+    let minted = crate::turso::mint_token(&pasted, &name)?;
+    println!("minted token {name} for {org}; the pasted token was not stored");
+    Ok(minted)
 }
 
 fn prompt(label: &str) -> Result<String, String> {

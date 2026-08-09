@@ -564,6 +564,7 @@ dependencies = [
  "daemon-client",
  "domain",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
