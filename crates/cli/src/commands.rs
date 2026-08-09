@@ -792,7 +792,10 @@ fn setup() -> Result<(), String> {
     if orgs.is_empty() {
         return Err("no orgs given; setup unchanged".to_string());
     }
-    let config = DaemonConfig { scoped_orgs: orgs };
+    let config = DaemonConfig {
+        scoped_orgs: orgs,
+        auto_update: None,
+    };
     crate::config::private_dir(&dir)?;
     crate::config::write_private(&path, config.to_toml()?.as_bytes())?;
     println!("wrote {}", path.display());

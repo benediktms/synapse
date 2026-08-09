@@ -2,6 +2,7 @@ pub mod app;
 pub mod config;
 pub mod rpc;
 pub mod single_instance;
+pub mod update;
 
 pub use app::DaemonApp;
 pub use config::{

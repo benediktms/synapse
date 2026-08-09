@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag must match the workspace version
+        shell: bash
+        run: |
+          ver=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "cli") | .version')
+          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match workspace version $ver" >&2
+            exit 1
+          fi
+
+      - name: Build release binaries
+        run: cargo build --release -p cli -p daemon
+
+      - name: Stage per-target assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/syn  "dist/syn-${{ matrix.target }}"
+          cp target/release/synd "dist/synd-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bins-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: bins
+          merge-multiple: true
+
+      - name: Write the update manifest
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          jq -n --arg version "$ver" '{version: $version, assets: {}}' > manifest.json
+          for f in bins/*; do
+            n=$(basename "$f")
+            s=$(sha256sum "$f" | awk '{print $1}')
+            jq --arg n "$n" --arg s "$s" '.assets[$n] = $s' manifest.json > m.json && mv m.json manifest.json
+          done
+          cat manifest.json
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" bins/* manifest.json \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
