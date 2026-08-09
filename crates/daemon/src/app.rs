@@ -46,7 +46,10 @@ impl DaemonApp {
     pub async fn boot(state_dir: PathBuf, config: Config) -> Result<Self, String> {
         std::fs::create_dir_all(&state_dir)
             .map_err(|e| format!("cannot create state dir {}: {e}", state_dir.display()))?;
-        let embedder = Arc::new(FastEmbedder::new().map_err(|e| format!("embedder: {e}"))?);
+        let embedder = Arc::new(
+            FastEmbedder::with_cache_dir(state_dir.join("models"))
+                .map_err(|e| format!("embedder: {e}"))?,
+        );
 
         let mut stores = HashMap::new();
         let mut bindings = HashMap::new();
