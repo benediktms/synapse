@@ -69,6 +69,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Command::Setup => setup(),
         Command::Sync(args) => sync(&ctx, args),
         Command::Status => status(&ctx),
+        Command::Daemon(command) => crate::daemon::run(command),
     }
 }
 

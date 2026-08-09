@@ -2,6 +2,7 @@ pub mod args;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod daemon;
 pub mod git;
 pub mod outbox;
 pub mod output;

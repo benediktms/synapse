@@ -8,11 +8,19 @@ _default:
 build:
     cargo build --release
 
-# symlink syn into ~/.local/bin (rebuilds first)
+# symlink syn + synd into ~/.local/bin and load the daemon unit (rebuilds first)
 install: build
     mkdir -p {{ bin_dir }}
     ln -sf {{ syn }} {{ bin_dir }}/syn
+    ln -sf {{ syn }}d {{ bin_dir }}/synd
     @{{ bin_dir }}/syn --version
+    {{ bin_dir }}/syn daemon install
+
+# unload the daemon unit and remove the ~/.local/bin symlinks
+uninstall:
+    if [ -x {{ bin_dir }}/syn ]; then {{ bin_dir }}/syn daemon uninstall; \
+    else echo "syn not installed; skipping daemon uninstall"; fi
+    rm -f {{ bin_dir }}/syn {{ bin_dir }}/synd
 
 test:
     cargo test --workspace

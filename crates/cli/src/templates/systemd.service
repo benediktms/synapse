@@ -1,0 +1,13 @@
+[Unit]
+Description=Synapse replication daemon
+After=network-online.target
+
+[Service]
+ExecStart="{{BINARY_PATH}}"
+{{ENV_BLOCK}}StandardOutput=null
+StandardError=append:{{LOG_PATH}}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -62,6 +62,32 @@ pub enum Command {
     /// Manage local CLI configuration
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Manage the daemon's login-autostart unit (launchd on macOS, systemd --user on Linux)
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    /// Write the platform unit file and load it (idempotent)
+    Install,
+    /// Unload the unit and remove its file (idempotent)
+    Uninstall,
+    /// Load the unit and mark it persistent
+    Start,
+    /// Unload the unit and clear the persistent bit
+    Stop,
+    /// Stop, then start the unit
+    Restart,
+    /// Print recent daemon log lines
+    Logs {
+        /// Keep streaming new lines until interrupted
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of existing lines to print
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
 }
 
 #[derive(Debug, Args)]
