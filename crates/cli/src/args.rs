@@ -53,9 +53,22 @@ pub enum Command {
     Export(WorkspaceArgs),
     /// Restore a workspace dump from stdin
     Import(ImportArgs),
+    /// Configure the replication daemon: the Turso orgs this machine replicates
+    Setup,
+    /// Force a replica sync (daemon transport)
+    Sync(SyncArgs),
+    /// Per-workspace replication status (daemon transport)
+    Status,
     /// Manage local CLI configuration
     #[command(subcommand)]
     Config(ConfigCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    /// Sync only this workspace (default: every replica)
+    #[arg(long)]
+    pub workspace: Option<String>,
 }
 
 pub const SCOPE_EVERYWHERE: &str = "everywhere";
@@ -286,6 +299,11 @@ pub enum ConfigCommand {
     SetToken { token: String },
     /// Store the server base URL
     SetUrl { url: String },
+    /// Choose the backend: `http` (the axum server) or `daemon` (the replication daemon)
+    SetTransport {
+        #[arg(value_parser = ["http", "daemon"])]
+        transport: String,
+    },
 }
 
 #[cfg(test)]

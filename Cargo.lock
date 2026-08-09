@@ -561,6 +561,7 @@ dependencies = [
  "api",
  "api-client",
  "clap",
+ "daemon-client",
  "domain",
  "libc",
  "serde",
@@ -756,6 +757,7 @@ dependencies = [
  "adapters-fastembed",
  "adapters-libsql",
  "api",
+ "daemon-client",
  "domain",
  "humantime",
  "libsql",
@@ -763,9 +765,19 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "daemon-client"
+version = "0.1.0"
+dependencies = [
+ "api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

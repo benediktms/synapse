@@ -1,20 +1,7 @@
-use std::path::PathBuf;
-
 use daemon::DaemonApp;
 use daemon::config::{Config, config_path};
 use daemon::{rpc, single_instance};
-
-const DEFAULT_STATE_SUBDIR: &str = "synapse/daemon";
-
-fn state_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SYNAPSE_STATE_DIR") {
-        return PathBuf::from(dir);
-    }
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::home_dir().expect("home dir").join(".local/state"));
-    base.join(DEFAULT_STATE_SUBDIR)
-}
+use daemon_client::state_dir;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -23,9 +10,17 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // Logs go to stderr: that is the stream the CLI's spawn captures into daemon.log.
+        .with_writer(std::io::stderr)
         .init();
 
-    let dir = state_dir();
+    let dir = match state_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
     std::fs::create_dir_all(&dir).expect("create state dir");
     {
         use std::os::unix::fs::PermissionsExt;
@@ -76,6 +71,16 @@ async fn main() {
         socket_path.display(),
         app.workspace_count().await
     );
+
+    // Warm sync in the background: walk in and the replicas are already fresh, without
+    // delaying the socket.
+    {
+        use daemon::rpc::RpcHost;
+        let warm = app.clone();
+        tokio::spawn(async move {
+            let _ = warm.sync_replicas(None).await;
+        });
+    }
 
     rpc::serve(listener, app).await;
 }

@@ -2,15 +2,19 @@ use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use api::ops::{self, SearchArgs};
-use api::{
-    ApiError, Backend, BackendError, ExportDoc, MoveBody, Origin, PatchMemoryBody, PutMemoryBody,
+use api::rpc::{
+    ContextParams, EditParams, ErrorObj, GraphParams, IdParams, ImportParams, JSONRPC_VERSION,
+    LinkMethod, LinkParams, MemoryMethod, Method, MoveParams, OriginParams, ReadyResponse, Request,
+    Response, SaveParams, SearchParams, SyncParams, UnlinkParams, UnlinkResponse,
+    WorkspaceCreatedResponse, WorkspaceMethod, WorkspaceParams, WorkspaceStatus,
 };
+use api::{ApiError, Backend, BackendError, Origin};
 use domain::Workspace;
 
 /// What the daemon adds on top of the transport-neutral `Backend` surface: replica
@@ -22,135 +26,6 @@ pub trait RpcHost: Backend {
         &self,
         only: Option<&Workspace>,
     ) -> impl Future<Output = Result<(), BackendError>> + Send;
-}
-
-#[derive(Serialize)]
-pub struct WorkspaceStatus {
-    pub name: String,
-    pub online: bool,
-    pub last_synced_at: u64,
-    pub pending_outbox: usize,
-}
-
-#[derive(Serialize)]
-struct ReadyResponse {
-    ready: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    problems: Option<String>,
-}
-
-#[derive(Serialize)]
-struct SyncResponse {
-    synced: bool,
-}
-
-#[derive(Serialize)]
-struct WorkspaceCreatedResponse {
-    workspace: String,
-    created: bool,
-}
-
-#[derive(Serialize)]
-struct UnlinkResponse {
-    removed: usize,
-}
-
-#[derive(Deserialize)]
-struct Request {
-    id: u64,
-    method: String,
-    #[serde(default)]
-    params: Value,
-}
-
-/// The wire method, parsed from its `namespace.verb` string form.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Method {
-    Ping,
-    Ready,
-    Status,
-    Sync,
-    Search,
-    Context,
-    Export,
-    Import,
-    Workspace(WorkspaceMethod),
-    Memory(MemoryMethod),
-    Link(LinkMethod),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkspaceMethod {
-    Create,
-    List,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MemoryMethod {
-    Save,
-    Edit,
-    Forget,
-    Move,
-    Get,
-    List,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LinkMethod {
-    Graph,
-    Create,
-    Retype,
-    Delete,
-}
-
-impl Method {
-    fn parse(raw: &str) -> Option<Self> {
-        Some(match raw {
-            "ping" => Self::Ping,
-            "ready" => Self::Ready,
-            "status" => Self::Status,
-            "sync" => Self::Sync,
-            "search" => Self::Search,
-            "context" => Self::Context,
-            "export" => Self::Export,
-            "import" => Self::Import,
-            _ => match raw.split_once('.')? {
-                ("workspace", "create") => Self::Workspace(WorkspaceMethod::Create),
-                ("workspace", "list") => Self::Workspace(WorkspaceMethod::List),
-                ("memory", "save") => Self::Memory(MemoryMethod::Save),
-                ("memory", "edit") => Self::Memory(MemoryMethod::Edit),
-                ("memory", "forget") => Self::Memory(MemoryMethod::Forget),
-                ("memory", "move") => Self::Memory(MemoryMethod::Move),
-                ("memory", "get") => Self::Memory(MemoryMethod::Get),
-                ("memory", "list") => Self::Memory(MemoryMethod::List),
-                ("link", "graph") => Self::Link(LinkMethod::Graph),
-                ("link", "create") => Self::Link(LinkMethod::Create),
-                ("link", "retype") => Self::Link(LinkMethod::Retype),
-                ("link", "delete") => Self::Link(LinkMethod::Delete),
-                _ => return None,
-            },
-        })
-    }
-}
-
-#[derive(Serialize)]
-struct Success {
-    jsonrpc: &'static str,
-    id: u64,
-    result: Value,
-}
-
-#[derive(Serialize)]
-struct Failure {
-    jsonrpc: &'static str,
-    id: u64,
-    error: ErrorObj,
-}
-
-#[derive(Serialize)]
-struct ErrorObj {
-    code: i64,
-    message: String,
 }
 
 struct RpcError {
@@ -244,98 +119,6 @@ async fn handle_conn<H: RpcHost>(stream: UnixStream, host: H) -> std::io::Result
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct OriginParams {
-    origin: Origin,
-}
-
-#[derive(Deserialize)]
-struct IdParams {
-    origin: Origin,
-    id: String,
-}
-
-#[derive(Deserialize)]
-struct SaveParams {
-    origin: Origin,
-    id: String,
-    #[serde(flatten)]
-    body: PutMemoryBody,
-}
-
-#[derive(Deserialize)]
-struct EditParams {
-    origin: Origin,
-    id: String,
-    #[serde(flatten)]
-    body: PatchMemoryBody,
-}
-
-#[derive(Deserialize)]
-struct MoveParams {
-    id: String,
-    #[serde(flatten)]
-    body: MoveBody,
-}
-
-#[derive(Deserialize)]
-struct SearchParams {
-    ws: Option<String>,
-    q: String,
-    scope: Option<String>,
-    limit: Option<usize>,
-    #[serde(default)]
-    all: bool,
-    #[serde(default)]
-    links_scope: bool,
-}
-
-#[derive(Deserialize)]
-struct ContextParams {
-    origin: Origin,
-    project: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GraphParams {
-    origin: Origin,
-    id: String,
-    depth: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct LinkParams {
-    origin: Origin,
-    id: String,
-    target: String,
-    relation: String,
-}
-
-#[derive(Deserialize)]
-struct UnlinkParams {
-    origin: Origin,
-    id: String,
-    target: String,
-}
-
-#[derive(Deserialize)]
-struct ImportParams {
-    origin: Origin,
-    mode: Option<String>,
-    doc: ExportDoc,
-}
-
-#[derive(Deserialize)]
-struct WorkspaceParams {
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct SyncParams {
-    #[serde(default)]
-    origin: Option<Origin>,
-}
-
 pub async fn dispatch<H: RpcHost>(line: &str, host: &H) -> String {
     let req: Request = match serde_json::from_str(line) {
         Ok(r) => r,
@@ -350,10 +133,11 @@ pub async fn dispatch<H: RpcHost>(line: &str, host: &H) -> String {
         REQUEST_TIMEOUT
     };
     match tokio::time::timeout(deadline, call(method, req.params, host)).await {
-        Ok(Ok(result)) => serde_json::to_string(&Success {
-            jsonrpc: "2.0",
+        Ok(Ok(result)) => serde_json::to_string(&Response {
+            jsonrpc: JSONRPC_VERSION.to_string(),
             id: req.id,
-            result,
+            result: Some(result),
+            error: None,
         })
         .unwrap_or_default(),
         Ok(Err(e)) => fail(req.id, e.code, &e.message),
@@ -388,7 +172,9 @@ async fn call<H: RpcHost>(method: Method, params: Value, host: &H) -> Result<Val
             let p: SyncParams = parse(params)?;
             let ws = p.origin.as_ref().map(ops::workspace_of).transpose()?;
             host.sync_replicas(ws.as_ref()).await?;
-            encode(&SyncResponse { synced: true })
+            // A sync fails open when the primary is unreachable, so the verdict is the
+            // post-sync per-replica status, not a bare success flag.
+            encode(&host.statuses().await)
         }
         Method::Workspace(WorkspaceMethod::Create) => {
             let p: WorkspaceParams = parse(params)?;
@@ -504,13 +290,14 @@ fn internal(err: impl std::fmt::Display) -> RpcError {
 }
 
 fn fail(id: u64, code: i64, message: &str) -> String {
-    serde_json::to_string(&Failure {
-        jsonrpc: "2.0",
+    serde_json::to_string(&Response {
+        jsonrpc: JSONRPC_VERSION.to_string(),
         id,
-        error: ErrorObj {
+        result: None,
+        error: Some(ErrorObj {
             code,
             message: message.to_string(),
-        },
+        }),
     })
     .unwrap_or_default()
 }
