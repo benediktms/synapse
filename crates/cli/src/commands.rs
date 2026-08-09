@@ -900,7 +900,11 @@ fn print_statuses(statuses: Vec<api::rpc::WorkspaceStatus>) {
             0 => String::new(),
             n => format!(", {n} pending"),
         };
-        println!("{}: {connectivity}, {freshness}{pending}", ws.name);
+        let error = ws
+            .error
+            .map(|error| format!(" ({error})"))
+            .unwrap_or_default();
+        println!("{}: {connectivity}, {freshness}{pending}{error}", ws.name);
     }
 }
 

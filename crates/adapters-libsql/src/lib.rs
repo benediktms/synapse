@@ -61,6 +61,9 @@ pub struct LibsqlStore {
     connected: std::sync::atomic::AtomicBool,
     /// Local writes since the last successful sync (offline outbox backlog proxy).
     dirty: std::sync::atomic::AtomicU64,
+    /// What the last failed sync said, so status can name an auth failure instead of
+    /// letting it masquerade as a network outage.
+    last_error: std::sync::Mutex<Option<String>>,
 }
 
 impl LibsqlStore {
@@ -123,6 +126,7 @@ impl LibsqlStore {
             last_sync_ok: std::sync::atomic::AtomicU64::new(0),
             connected: std::sync::atomic::AtomicBool::new(false),
             dirty: std::sync::atomic::AtomicU64::new(0),
+            last_error: std::sync::Mutex::new(None),
         })
     }
 
@@ -142,12 +146,15 @@ impl LibsqlStore {
                 self.last_sync_ok
                     .store(now, std::sync::atomic::Ordering::Relaxed);
                 self.dirty.store(0, std::sync::atomic::Ordering::Relaxed);
+                *self.last_error.lock().expect("last_error lock") = None;
                 Ok(())
             }
             Err(e) => {
                 self.connected
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                Err(store_err(e))
+                let err = store_err(e);
+                *self.last_error.lock().expect("last_error lock") = Some(err.to_string());
+                Err(err)
             }
         }
     }
@@ -170,6 +177,11 @@ impl LibsqlStore {
     /// Local writes not yet pushed to the primary (offline outbox backlog proxy).
     pub fn pending_outbox(&self) -> usize {
         self.dirty.load(std::sync::atomic::Ordering::Relaxed) as usize
+    }
+
+    /// What the last failed sync said; None after a successful sync.
+    pub fn last_sync_error(&self) -> Option<String> {
+        self.last_error.lock().expect("last_error lock").clone()
     }
 
     fn conn(&self) -> Result<Connection, Error> {
@@ -623,15 +635,20 @@ pub struct TursoDb {
 
 /// The API duplicates fields in both casings ("Name" and "name"), which breaks serde's
 /// alias-based structs with a duplicate-field error; pick fields out of a Value instead.
+fn json_field<'a>(value: &'a serde_json::Value, upper: &str, lower: &str) -> Option<&'a str> {
+    value
+        .get(upper)
+        .or_else(|| value.get(lower))
+        .and_then(serde_json::Value::as_str)
+}
+
 fn db_from_value(value: &serde_json::Value) -> Option<TursoDb> {
-    let field = |upper: &str, lower: &str| {
-        value
-            .get(upper)
-            .or_else(|| value.get(lower))
-            .and_then(serde_json::Value::as_str)
-    };
-    let name = field("Name", "name")?.to_string();
-    let url = field("Hostname", "hostname").map(|hostname| format!("libsql://{hostname}"))?;
+    let name = json_field(value, "Name", "name")?.to_string();
+    let url = json_field(value, "LibsqlUrl", "libsql_url")
+        .map(str::to_string)
+        .or_else(|| {
+            json_field(value, "Hostname", "hostname").map(|hostname| format!("libsql://{hostname}"))
+        })?;
     Some(TursoDb { name, url })
 }
 
@@ -648,111 +665,63 @@ impl TursoPlatform {
         }
     }
 
-    pub async fn list_databases(&self, org: &str, token: &str) -> Result<Vec<TursoDb>, Error> {
+    /// Returns the readable databases plus the count of entries the API returned that
+    /// could not be parsed; the caller surfaces that count instead of silently thinning
+    /// the workspace list.
+    pub async fn list_databases(
+        &self,
+        org: &str,
+        token: &str,
+    ) -> Result<(Vec<TursoDb>, usize), Error> {
         #[derive(serde::Deserialize)]
         struct ListResp {
             #[serde(rename = "databases", default)]
             databases: Vec<serde_json::Value>,
         }
-        let resp = self
-            .client
-            .get(format!(
-                "https://api.turso.tech/v1/organizations/{org}/databases"
-            ))
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(store_err)?;
-        let status = resp.status();
-        let body = resp.text().await.map_err(store_err)?;
-        if !status.is_success() {
-            return Err(Error::Store(format!(
-                "turso list databases failed ({status}): {body}"
-            )));
-        }
+        let body = self
+            .request(
+                self.client
+                    .get(format!(
+                        "https://api.turso.tech/v1/organizations/{org}/databases"
+                    ))
+                    .bearer_auth(token),
+                "list databases",
+            )
+            .await?;
         let parsed: ListResp = serde_json::from_str(&body).map_err(store_err)?;
-        Ok(parsed.databases.iter().filter_map(db_from_value).collect())
+        let total = parsed.databases.len();
+        let dbs: Vec<TursoDb> = parsed.databases.iter().filter_map(db_from_value).collect();
+        let skipped = total - dbs.len();
+        Ok((dbs, skipped))
     }
 
-    pub async fn create_database(
-        &self,
-        org: &str,
-        token: &str,
-        name: &str,
-    ) -> Result<TursoDb, Error> {
-        match self.try_create_database(org, token, name).await {
-            // A brand-new org has no groups yet, and the create endpoint requires one;
-            // bootstrap the default group once and retry.
-            Err(Error::Store(msg)) if msg.contains("group not found") => {
-                self.create_default_group(org, token).await?;
-                self.try_create_database(org, token, name).await
-            }
-            other => other,
-        }
-    }
-
-    async fn try_create_database(
-        &self,
-        org: &str,
-        token: &str,
-        name: &str,
-    ) -> Result<TursoDb, Error> {
+    /// The group every database operation targets: the org's first existing group, or a
+    /// freshly created "default" group in the closest region when the org has none yet.
+    pub async fn ensure_group(&self, org: &str, token: &str) -> Result<String, Error> {
         #[derive(serde::Deserialize)]
-        struct CreateResp {
-            #[serde(rename = "database")]
-            database: serde_json::Value,
+        struct GroupsResp {
+            #[serde(rename = "groups", default)]
+            groups: Vec<serde_json::Value>,
         }
-        let resp = self
-            .client
-            .post(format!(
-                "https://api.turso.tech/v1/organizations/{org}/databases"
-            ))
-            .bearer_auth(token)
-            .json(&serde_json::json!({ "name": name, "group": "default" }))
-            .send()
-            .await
-            .map_err(store_err)?;
-        let status = resp.status();
-        let body = resp.text().await.map_err(store_err)?;
-        if !status.is_success() {
-            return Err(Error::Store(format!(
-                "turso create database failed ({status}): {body}"
-            )));
+        let body = self
+            .request(
+                self.client
+                    .get(format!(
+                        "https://api.turso.tech/v1/organizations/{org}/groups"
+                    ))
+                    .bearer_auth(token),
+                "list groups",
+            )
+            .await?;
+        let parsed: GroupsResp = serde_json::from_str(&body).map_err(store_err)?;
+        if let Some(name) = parsed
+            .groups
+            .iter()
+            .find_map(|group| json_field(group, "Name", "name"))
+        {
+            return Ok(name.to_string());
         }
-        let parsed: CreateResp = serde_json::from_str(&body).map_err(store_err)?;
-        db_from_value(&parsed.database)
-            .ok_or_else(|| Error::Store(format!("unreadable create response: {body}")))
-    }
 
-    /// A platform API token authorizes the management endpoints only; opening or syncing
-    /// a replica needs a database JWT, minted here for the default group (it covers every
-    /// database in the group).
-    pub async fn mint_db_token(&self, org: &str, token: &str) -> Result<String, Error> {
-        #[derive(serde::Deserialize)]
-        struct TokenResp {
-            jwt: String,
-        }
-        let resp = self
-            .client
-            .post(format!(
-                "https://api.turso.tech/v1/organizations/{org}/groups/default/auth/tokens?authorization=full-access"
-            ))
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(store_err)?;
-        let status = resp.status();
-        let body = resp.text().await.map_err(store_err)?;
-        if !status.is_success() {
-            return Err(Error::Store(format!(
-                "turso mint db token failed ({status}): {body}"
-            )));
-        }
-        let parsed: TokenResp = serde_json::from_str(&body).map_err(store_err)?;
-        Ok(parsed.jwt)
-    }
-
-    async fn create_default_group(&self, org: &str, token: &str) -> Result<(), Error> {
         #[derive(serde::Deserialize)]
         struct Region {
             server: String,
@@ -766,24 +735,100 @@ impl TursoPlatform {
             .json()
             .await
             .map_err(store_err)?;
+        self.request(
+            self.client
+                .post(format!(
+                    "https://api.turso.tech/v1/organizations/{org}/groups"
+                ))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "name": "default", "location": region.server })),
+            "create group",
+        )
+        .await?;
+        Ok("default".to_string())
+    }
+
+    /// Idempotent: a 409 for an already-existing database resolves to that database, so
+    /// a crashed earlier attempt cannot strand a name forever.
+    pub async fn create_database(
+        &self,
+        org: &str,
+        token: &str,
+        group: &str,
+        name: &str,
+    ) -> Result<TursoDb, Error> {
+        #[derive(serde::Deserialize)]
+        struct CreateResp {
+            #[serde(rename = "database")]
+            database: serde_json::Value,
+        }
         let resp = self
             .client
             .post(format!(
-                "https://api.turso.tech/v1/organizations/{org}/groups"
+                "https://api.turso.tech/v1/organizations/{org}/databases"
             ))
             .bearer_auth(token)
-            .json(&serde_json::json!({ "name": "default", "location": region.server }))
+            .json(&serde_json::json!({ "name": name, "group": group }))
             .send()
             .await
             .map_err(store_err)?;
         let status = resp.status();
+        let body = resp.text().await.map_err(store_err)?;
+        if status == reqwest::StatusCode::CONFLICT {
+            let (dbs, _) = self.list_databases(org, token).await?;
+            return dbs.into_iter().find(|db| db.name == name).ok_or_else(|| {
+                Error::Store(format!(
+                    "turso reports database {name} exists but the listing does not show it"
+                ))
+            });
+        }
         if !status.is_success() {
-            let body = resp.text().await.map_err(store_err)?;
             return Err(Error::Store(format!(
-                "turso create group failed ({status}): {body}"
+                "turso create database failed ({status}): {body}"
             )));
         }
-        Ok(())
+        let parsed: CreateResp = serde_json::from_str(&body).map_err(store_err)?;
+        db_from_value(&parsed.database)
+            .ok_or_else(|| Error::Store(format!("unreadable create response: {body}")))
+    }
+
+    /// A platform API token authorizes the management endpoints only; opening or syncing
+    /// a replica needs a database JWT, minted for the group (it covers every database in
+    /// the group).
+    pub async fn mint_db_token(
+        &self,
+        org: &str,
+        token: &str,
+        group: &str,
+    ) -> Result<String, Error> {
+        #[derive(serde::Deserialize)]
+        struct TokenResp {
+            jwt: String,
+        }
+        let body = self
+            .request(
+                self.client
+                    .post(format!(
+                        "https://api.turso.tech/v1/organizations/{org}/groups/{group}/auth/tokens?authorization=full-access"
+                    ))
+                    .bearer_auth(token),
+                "mint db token",
+            )
+            .await?;
+        let parsed: TokenResp = serde_json::from_str(&body).map_err(store_err)?;
+        Ok(parsed.jwt)
+    }
+
+    async fn request(&self, request: reqwest::RequestBuilder, what: &str) -> Result<String, Error> {
+        let resp = request.send().await.map_err(store_err)?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(store_err)?;
+        if !status.is_success() {
+            return Err(Error::Store(format!(
+                "turso {what} failed ({status}): {body}"
+            )));
+        }
+        Ok(body)
     }
 }
 

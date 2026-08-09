@@ -31,11 +31,13 @@ pub struct WorkspaceBinding {
     pub token: String,
 }
 
-/// Local cache of workspace -> {url, org} so the daemon can open already-synced replicas while
-/// offline (tokens stay in config; the URL and owning org cannot be re-derived offline).
+/// Local cache of workspace -> {url, org} plus the minted per-org database JWTs, so the
+/// daemon can open and sync already-known replicas while the platform API is unreachable.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Manifest {
     entries: HashMap<String, Entry>,
+    #[serde(default)]
+    db_tokens: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,10 +54,22 @@ impl Manifest {
             .unwrap_or_default()
     }
 
+    /// The manifest carries database JWTs, so it is written 0600 like the config.
     pub fn save(&self, dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = manifest_path(dir);
         if let Ok(raw) = serde_json::to_string_pretty(&self) {
-            let _ = std::fs::write(manifest_path(dir), raw);
+            let _ = std::fs::write(&path, raw);
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
+    }
+
+    pub fn db_token(&self, org: &str) -> Option<&str> {
+        self.db_tokens.get(org).map(String::as_str)
+    }
+
+    pub fn set_db_token(&mut self, org: &str, token: &str) {
+        self.db_tokens.insert(org.to_string(), token.to_string());
     }
 
     pub fn entry(&self, ws: &Workspace) -> Option<(&str, &str)> {
@@ -87,11 +101,18 @@ fn workspace_named(name: &str) -> Option<Workspace> {
     }
 }
 
+/// Offline bindings authenticate with the database JWT cached from the last online boot;
+/// without one the replica still opens for local reads and writes, and syncs start
+/// failing-open until a boot that can mint.
 fn cached_bindings_for_org(
     dir: &Path,
     manifest: &Manifest,
     org: &ScopedOrg,
 ) -> Vec<WorkspaceBinding> {
+    let token = manifest
+        .db_token(&org.name)
+        .unwrap_or(org.token.as_str())
+        .to_string();
     manifest
         .entries
         .iter()
@@ -102,7 +123,7 @@ fn cached_bindings_for_org(
                 workspace: ws.clone(),
                 replica: replica_path(dir, &ws),
                 url: e.url.clone(),
-                token: org.token.clone(),
+                token: token.clone(),
             })
         })
         .collect()
@@ -117,25 +138,28 @@ pub async fn resolve_bindings(dir: &Path, config: &Config) -> (Vec<WorkspaceBind
     let mut manifest = Manifest::load(dir);
     let mut bindings: Vec<WorkspaceBinding> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
-    let mut online_org: Option<(&ScopedOrg, String)> = None;
+    let mut online_org: Option<(&ScopedOrg, String, String)> = None;
 
     for org in &config.scoped_orgs {
-        let resolved = match platform.list_databases(&org.name, &org.token).await {
-            // Replicas authenticate with a database JWT, not the platform token.
-            Ok(dbs) => match platform.mint_db_token(&org.name, &org.token).await {
-                Ok(db_token) => Some((dbs, db_token)),
-                Err(e) => {
-                    problems.push(format!("mint db token for {}: {e}", org.name));
-                    None
-                }
-            },
-            Err(e) => {
-                problems.push(format!("enumerate {}: {e}", org.name));
-                None
-            }
-        };
+        // Group first (creating it on a fresh org), then the database JWT replicas
+        // authenticate with, then the listing; each failure degrades to cached bindings.
+        let resolved = async {
+            let group = platform.ensure_group(&org.name, &org.token).await?;
+            let db_token = platform
+                .mint_db_token(&org.name, &org.token, &group)
+                .await?;
+            let (dbs, skipped) = platform.list_databases(&org.name, &org.token).await?;
+            Ok::<_, domain::Error>((group, db_token, dbs, skipped))
+        }
+        .await;
         match resolved {
-            Some((dbs, db_token)) => {
+            Ok((group, db_token, dbs, skipped)) => {
+                if skipped > 0 {
+                    problems.push(format!(
+                        "{skipped} database entr(ies) in {} were unreadable and were skipped",
+                        org.name
+                    ));
+                }
                 for db in dbs {
                     let Some(ws) = workspace_named(&db.name) else {
                         continue;
@@ -148,19 +172,26 @@ pub async fn resolve_bindings(dir: &Path, config: &Config) -> (Vec<WorkspaceBind
                         token: db_token.clone(),
                     });
                 }
-                online_org.get_or_insert((org, db_token));
+                manifest.set_db_token(&org.name, &db_token);
+                online_org.get_or_insert((org, group, db_token));
             }
-            None => bindings.extend(cached_bindings_for_org(dir, &manifest, org)),
+            Err(e) => {
+                problems.push(format!(
+                    "resolve {}: {e}; falling back to cached bindings",
+                    org.name
+                ));
+                bindings.extend(cached_bindings_for_org(dir, &manifest, org));
+            }
         }
     }
 
     // Provision the shared workspace in the first reachable org if no org hosts one yet.
     let shared = Workspace::shared();
     if !bindings.iter().any(|b| b.workspace == shared)
-        && let Some((org, db_token)) = &online_org
+        && let Some((org, group, db_token)) = &online_org
     {
         match platform
-            .create_database(&org.name, &org.token, shared.as_str())
+            .create_database(&org.name, &org.token, group, shared.as_str())
             .await
         {
             Ok(db) => {

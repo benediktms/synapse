@@ -262,6 +262,10 @@ pub struct WorkspaceStatus {
     pub online: bool,
     pub last_synced_at: u64,
     pub pending_outbox: usize,
+    /// What the last failed sync said (None after a successful sync), so an auth
+    /// failure is distinguishable from a network outage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]

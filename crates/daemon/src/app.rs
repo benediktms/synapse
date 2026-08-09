@@ -135,16 +135,24 @@ impl DaemonApp {
             .scoped_orgs
             .first()
             .ok_or_else(|| BackendError::UnknownWorkspace(ws.clone()))?;
-        let db = self
+        // Group and token before creation: a mint failure then leaves nothing behind,
+        // and the create itself is idempotent on retry.
+        let group = self
             .inner
             .platform
-            .create_database(&org.name, &org.token, ws.as_str())
+            .ensure_group(&org.name, &org.token)
             .await
             .map_err(BackendError::Domain)?;
         let db_token = self
             .inner
             .platform
-            .mint_db_token(&org.name, &org.token)
+            .mint_db_token(&org.name, &org.token, &group)
+            .await
+            .map_err(BackendError::Domain)?;
+        let db = self
+            .inner
+            .platform
+            .create_database(&org.name, &org.token, &group, ws.as_str())
             .await
             .map_err(BackendError::Domain)?;
         let mut manifest = Manifest::load(&self.inner.state_dir);
@@ -203,24 +211,33 @@ impl RpcHost for DaemonApp {
                 online: store.online(),
                 last_synced_at: store.last_synced_at(),
                 pending_outbox: store.pending_outbox(),
+                error: store.last_sync_error(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
-    /// A failed sync is not an error to the caller: the store records offline, and the
-    /// post-sync statuses are the report.
+    /// A failed sync is not an error to the caller: the store records offline plus the
+    /// error text, and the post-sync statuses are the report. Syncs run concurrently and
+    /// each is bounded, so one black-holed replica cannot stall the rest.
     async fn sync_replicas(&self, only: Option<&Workspace>) -> Result<(), BackendError> {
+        const FORCED_SYNC_BOUND: Duration = Duration::from_secs(25);
         let stores: Vec<Arc<LibsqlStore>> = match only {
             Some(ws) => vec![self.store(ws).await?],
             None => self.inner.stores.read().await.values().cloned().collect(),
         };
+        let mut tasks = tokio::task::JoinSet::new();
         for store in stores {
-            if let Err(e) = store.sync().await {
-                tracing::debug!("sync failed open: {e}");
-            }
+            tasks.spawn(async move {
+                match tokio::time::timeout(FORCED_SYNC_BOUND, store.sync()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!("sync failed open: {e}"),
+                    Err(_) => tracing::debug!("sync timed out"),
+                }
+            });
         }
+        while tasks.join_next().await.is_some() {}
         Ok(())
     }
 }
