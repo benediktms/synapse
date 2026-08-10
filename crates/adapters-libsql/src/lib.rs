@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use domain::{
     EditRequest, Error, Link, Memory, MemoryId, MemoryKind, Relation, Scope, ScopeFilter, Store,
@@ -68,6 +68,10 @@ pub struct LibsqlStore {
 
 impl LibsqlStore {
     /// Open (or create) an offline-writable embedded replica of a Turso primary.
+    ///
+    /// Syncs before the first local write: schema frames written first would read as
+    /// a divergent push into a primary that already has history, wedging the replica.
+    /// A wedged replica with no user data is rebuilt from the primary instead.
     pub async fn open(
         path: impl AsRef<Path>,
         url: String,
@@ -75,10 +79,20 @@ impl LibsqlStore {
         embedding_model: &str,
         embedding_dim: usize,
     ) -> Result<Self, Error> {
-        let db = Builder::new_synced_database(path.as_ref(), url, auth_token)
+        let path = path.as_ref();
+        let db = Builder::new_synced_database(path, url.clone(), auth_token.clone())
             .build()
             .await
             .map_err(store_err)?;
+        let db = match db.sync().await {
+            Ok(_) => db,
+            Err(e) if is_divergent_push(&e) && replica_holds_no_memories(&db).await => {
+                drop(db);
+                rebuild_and_pull(path, &url, &auth_token).await?
+            }
+            // Fail open: the background sync retries, and `syn status` reports the error.
+            Err(_) => db,
+        };
         Self::init(db, embedding_model, embedding_dim).await
     }
 
@@ -579,6 +593,55 @@ async fn scalar(conn: &Connection, sql: &str) -> Result<i64, Error> {
         .map_err(store_err)?
         .ok_or_else(|| Error::Store("scalar query returned no rows".into()))?;
     row.get::<i64>(0).map_err(store_err)
+}
+
+/// True when the primary rejected the replica's frames, rather than being unreachable.
+/// libsql hides the error variant, so this matches the message text (libsql 0.9.30 pinned).
+fn is_divergent_push(err: &libsql::Error) -> bool {
+    if let libsql::Error::Sync(inner) = err {
+        let msg = inner.to_string();
+        // SyncError::InvalidPushFrameNoHigh / InvalidPushFrameConflict.
+        msg.contains("server returned a higher frame_no")
+            || msg.contains("server returned a conflict")
+    } else {
+        false
+    }
+}
+
+/// True when the replica holds no memories, so a rebuild cannot lose data.
+async fn replica_holds_no_memories(db: &Database) -> bool {
+    let conn = match db.connect() {
+        Ok(conn) => conn,
+        Err(_) => return true,
+    };
+    matches!(scalar(&conn, "SELECT COUNT(*) FROM memories").await, Ok(0))
+}
+
+/// Delete a replica's files and pull a fresh copy from the primary.
+async fn rebuild_and_pull(path: &Path, url: &str, auth_token: &str) -> Result<Database, Error> {
+    for suffix in ["", "-wal", "-shm", "-journal", "-info"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let file = PathBuf::from(name);
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(store_err(format!(
+                    "cannot remove wedged replica {}: {e}",
+                    file.display()
+                )));
+            }
+        }
+    }
+    let db = Builder::new_synced_database(path, url.to_string(), auth_token.to_string())
+        .build()
+        .await
+        .map_err(store_err)?;
+    db.sync()
+        .await
+        .map_err(|e| store_err(format!("pulling rebuilt replica {}: {e}", path.display())))?;
+    Ok(db)
 }
 
 fn encode_embedding(embedding: &[f32], dim: usize) -> Result<Vec<u8>, Error> {
