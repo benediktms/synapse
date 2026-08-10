@@ -1002,7 +1002,7 @@ mod tests {
             "m_0000000000000000000001",
             "a memory that only exists locally",
         );
-        store.insert(&memory, &vec![0.0f32; 4]).await.unwrap();
+        store.insert(&memory, &[0.0f32; 4]).await.unwrap();
         assert!(
             !replica_holds_no_memories(&store.db).await,
             "a local memory must veto the rebuild"
@@ -1080,9 +1080,7 @@ mod tests {
         // the empty primary cleanly; the memory then reaches the primary on sync.
         let store_a = open("a.db").await?;
         let memory = test_memory("m_0000000000000000000001", "turso replication smoke test");
-        store_a
-            .insert(&memory, &vec![0.1f32, 0.2, 0.3, 0.4])
-            .await?;
+        store_a.insert(&memory, &[0.1f32, 0.2, 0.3, 0.4]).await?;
         store_a.sync().await?;
         assert!(store_a.online(), "write side reached the primary");
 
@@ -1126,7 +1124,7 @@ mod tests {
         .await
         .map_err(store_err)?;
         let store_d = LibsqlStore::init(wedged, "test-model", 4).await?;
-        store_d.insert(&local, &vec![0.0f32; 4]).await?;
+        store_d.insert(&local, &[0.0f32; 4]).await?;
         let store_d = open("d.db").await?;
         let got = store_d.get(&local.id).await?.expect("local write survives");
         assert_eq!(got.content, local.content);
