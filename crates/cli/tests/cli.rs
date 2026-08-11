@@ -768,12 +768,10 @@ fn context_prints_a_digest_and_stays_silent_when_empty() {
     stub.with(|state| {
         state.context = Some(
             serde_json::json!({
-                "pinned": [{"origin": "preference", "id": "m_0000000000000000000002",
+                "entries": [{"origin": "preference", "id": "m_0000000000000000000002",
                     "content": "Prefers Datadog links", "kind": "user", "scope": "workspace",
                     "tags": [], "pinned": true, "created_at": "2026-06-02T09:00:00Z",
-                    "updated_at": "2026-06-02T09:00:00Z"}],
-                "recent_project": [],
-                "preferences": []
+                    "updated_at": "2026-06-02T09:00:00Z"}]
             })
             .to_string(),
         );
@@ -795,14 +793,12 @@ fn the_digest_shortens_a_long_untitled_memory_to_its_first_sentence() {
     stub.with(|state| {
         state.context = Some(
             serde_json::json!({
-                "pinned": [{"origin": "preference", "id": "m_0000000000000000000002",
+                "entries": [{"origin": "preference", "id": "m_0000000000000000000002",
                     "content": "Never push unsigned commits. Benedikt said so after three \
                                 landed unsigned on a PR branch, and re-signing is a rebase.",
                     "kind": "user", "scope": "workspace",
                     "tags": [], "pinned": true, "created_at": "2026-06-02T09:00:00Z",
-                    "updated_at": "2026-06-02T09:00:00Z"}],
-                "recent_project": [],
-                "preferences": []
+                    "updated_at": "2026-06-02T09:00:00Z"}]
             })
             .to_string(),
         );

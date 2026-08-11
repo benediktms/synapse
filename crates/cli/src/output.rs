@@ -77,12 +77,7 @@ fn date(timestamp: &str) -> &str {
 pub fn digest(context: &ContextResponse) -> Option<String> {
     let mut seen = Vec::new();
     let mut lines = Vec::new();
-    let ordered = context
-        .pinned
-        .iter()
-        .chain(&context.preferences)
-        .chain(&context.recent_project);
-    for entry in ordered {
+    for entry in &context.entries {
         if seen.contains(&entry.memory.id) {
             continue;
         }
@@ -213,12 +208,15 @@ mod tests {
     #[test]
     fn digest_dedups_and_collapses_multiline_content() {
         let context = ContextResponse {
-            pinned: vec![entry("m_1", "pinned  fact\nsecond line")],
-            preferences: vec![DigestEntryDto {
-                origin: Origin::Preference,
-                memory: memory("m_2", "workspace", "a preference"),
-            }],
-            recent_project: vec![entry("m_1", "pinned fact"), entry("m_3", "c")],
+            entries: vec![
+                entry("m_1", "pinned  fact\nsecond line"),
+                DigestEntryDto {
+                    origin: Origin::Preference,
+                    memory: memory("m_2", "workspace", "a preference"),
+                },
+                entry("m_1", "pinned fact"),
+                entry("m_3", "c"),
+            ],
         };
         assert_eq!(
             digest(&context).unwrap(),
@@ -235,15 +233,16 @@ mod tests {
         let mut titled = memory("m_1", "workspace", "A long fact with plenty of detail.");
         titled.title = "Deploys use ArgoCD".into();
         let context = ContextResponse {
-            pinned: vec![DigestEntryDto {
-                origin: Origin::Workspace("work".into()),
-                memory: titled,
-            }],
-            preferences: vec![],
-            recent_project: vec![entry(
-                "m_2",
-                "The queue drains on flush. Everything after this is dropped from the digest.",
-            )],
+            entries: vec![
+                DigestEntryDto {
+                    origin: Origin::Workspace("work".into()),
+                    memory: titled,
+                },
+                entry(
+                    "m_2",
+                    "The queue drains on flush. Everything after this is dropped from the digest.",
+                ),
+            ],
         };
         assert_eq!(
             digest(&context).unwrap(),
@@ -281,11 +280,7 @@ mod tests {
 
     #[test]
     fn an_empty_digest_prints_nothing() {
-        let context = ContextResponse {
-            pinned: vec![],
-            preferences: vec![],
-            recent_project: vec![],
-        };
+        let context = ContextResponse { entries: vec![] };
         assert_eq!(digest(&context), None);
     }
 }

@@ -547,7 +547,7 @@ async fn preferences_are_reachable_from_any_workspace_and_project() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn context_digest_sections() {
+async fn context_digest_leads_with_the_pinned_memory() {
     let dir = TempDir::new().unwrap();
     let (router, _) = boot(dir.path()).await;
     req(&router, Method::PUT, "/workspaces/work", None).await;
@@ -581,17 +581,16 @@ async fn context_digest_sections() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let ids = |section: &str| -> Vec<String> {
-        body[section]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|e| e["id"].as_str().unwrap().to_string())
-            .collect()
-    };
-    assert_eq!(ids("pinned"), vec![mid(1)]);
-    assert_eq!(ids("recent_project"), vec![mid(2)]);
-    assert_eq!(ids("preferences"), vec![mid(4)]);
+    let ids: Vec<String> = body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids[0], mid(1));
+    let mut rest_in_any_order = ids[1..].to_vec();
+    rest_in_any_order.sort();
+    assert_eq!(rest_in_any_order, vec![mid(2), mid(3), mid(4)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
