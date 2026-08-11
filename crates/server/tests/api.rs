@@ -173,7 +173,7 @@ async fn validation_limits_reject_clearly() {
 
     let uri = format!("/memories/{}?ws=work", mid(1));
     let cases = [
-        put_body(&"x".repeat(8 * 1024 + 1)),
+        put_body(&"x".repeat(api::CONTENT_MAX_BYTES + 1)),
         put_body(&"ab ".repeat(2000)),
         put_body(""),
         json!({ "content": "ok", "title": "T", "kind": "note", "scope": "workspace", "tags": [] }),

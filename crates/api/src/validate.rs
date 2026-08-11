@@ -1,23 +1,11 @@
-use domain::{TITLE_MAX_CHARS, Timestamp};
+use domain::Timestamp;
 
 use crate::backend::Backend;
 use crate::error::ApiError;
-
-pub const CONTENT_MAX_BYTES: usize = 8 * 1024;
-pub const QUERY_MAX_BYTES: usize = 1024;
-pub const MAX_TAGS: usize = 16;
-pub const TAG_MAX_BYTES: usize = 64;
+use crate::limits::{self, QUERY_MAX_BYTES};
 
 pub(crate) fn validate_content<B: Backend>(backend: &B, content: &str) -> Result<(), ApiError> {
-    if content.is_empty() {
-        return Err(ApiError::BadRequest("content must not be empty".into()));
-    }
-    if content.len() > CONTENT_MAX_BYTES {
-        return Err(ApiError::BadRequest(format!(
-            "content is {} bytes, limit is {CONTENT_MAX_BYTES}",
-            content.len()
-        )));
-    }
+    limits::content(content).map_err(ApiError::BadRequest)?;
     check_token_window(backend, content, "content")
 }
 
@@ -34,51 +22,12 @@ pub(crate) fn validate_query<B: Backend>(backend: &B, query: &str) -> Result<(),
     check_token_window(backend, query, "query")
 }
 
-/// An empty title is only ever valid on the way in from a dump: memories written before titles
-/// existed keep deriving one. `allow_empty` is false everywhere a title is being authored.
 pub(crate) fn validate_title(title: &str, allow_empty: bool) -> Result<(), ApiError> {
-    if title.is_empty() && !allow_empty {
-        return Err(ApiError::BadRequest(
-            "title must not be empty: state the fact in one line".into(),
-        ));
-    }
-    if title.chars().count() > TITLE_MAX_CHARS {
-        return Err(ApiError::BadRequest(format!(
-            "title is {} characters, limit is {TITLE_MAX_CHARS}",
-            title.chars().count()
-        )));
-    }
-    if title.chars().any(char::is_control) {
-        return Err(ApiError::BadRequest(
-            "title must be a single line without control characters".into(),
-        ));
-    }
-    if title.trim() != title {
-        return Err(ApiError::BadRequest(
-            "title must not have leading or trailing whitespace".into(),
-        ));
-    }
-    Ok(())
+    limits::title(title, allow_empty).map_err(ApiError::BadRequest)
 }
 
 pub(crate) fn validate_tags(tags: &[String]) -> Result<(), ApiError> {
-    if tags.len() > MAX_TAGS {
-        return Err(ApiError::BadRequest(format!(
-            "{} tags given, limit is {MAX_TAGS}",
-            tags.len()
-        )));
-    }
-    for tag in tags {
-        let valid = !tag.is_empty()
-            && tag.len() <= TAG_MAX_BYTES
-            && !tag.chars().any(|c| c.is_whitespace() || c.is_control());
-        if !valid {
-            return Err(ApiError::BadRequest(format!(
-                "invalid tag {tag:?}: tags must be 1-{TAG_MAX_BYTES} bytes without whitespace"
-            )));
-        }
-    }
-    Ok(())
+    limits::tags(tags).map_err(ApiError::BadRequest)
 }
 
 pub(crate) fn normalize_timestamp(value: &str) -> Result<Timestamp, ApiError> {

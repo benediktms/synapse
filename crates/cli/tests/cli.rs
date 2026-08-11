@@ -403,6 +403,32 @@ fn a_non_retryable_rejection_dead_letters_the_save() {
 }
 
 #[test]
+fn an_over_long_body_is_refused_before_it_reaches_the_outbox() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let output = machine.run(&[
+        "save",
+        "--body",
+        &"x".repeat(api::CONTENT_MAX_BYTES + 1),
+        "--title",
+        "A title",
+        "--type",
+        "project",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("syn relate"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(json_files(&machine.outbox()).is_empty());
+    assert!(json_files(&machine.outbox().join("dead-letter")).is_empty());
+    stub.with(|state| assert!(state.recorded.is_empty()));
+}
+
+#[test]
 fn a_5xx_defers_the_queue_instead_of_dead_lettering_it() {
     let stub = Stub::start();
     stub.script(vec![Behavior::Status(503, "unready".into())]);

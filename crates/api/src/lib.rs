@@ -1,5 +1,6 @@
 mod dto;
 
+pub mod limits;
 pub mod rpc;
 
 #[cfg(feature = "server")]
@@ -24,7 +25,6 @@ pub use dto::{
 pub use backend::{Backend, BackendError, RestoreReport};
 #[cfg(feature = "server")]
 pub use error::ApiError;
+pub use limits::{CONTENT_MAX_BYTES, MAX_TAGS, QUERY_MAX_BYTES, TAG_MAX_BYTES};
 #[cfg(feature = "server")]
 pub use routes::router;
-#[cfg(feature = "server")]
-pub use validate::{CONTENT_MAX_BYTES, MAX_TAGS, QUERY_MAX_BYTES, TAG_MAX_BYTES};

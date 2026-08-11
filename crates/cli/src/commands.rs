@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use api::{
     ExportDoc, MemoryDto, MoveBody, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody,
-    SearchResponse,
+    SearchResponse, limits,
 };
 use api_client::SynapseApiClient;
 use daemon_client::{DaemonClient, DaemonConfig, ScopedOrg};
@@ -254,6 +254,7 @@ fn retired_remember(args: RetiredArgs) -> Result<(), String> {
 /// The outbox is written before the first send, so a reply lost in flight replays
 /// against the same id and the idempotent PUT collapses it.
 fn queue_and_flush(ctx: &Context, target: SaveTarget) -> Result<(), String> {
+    check_before_queueing(&target)?;
     let id = MemoryId::generate().to_string();
     let where_to = target.label();
     let item = PendingSave {
@@ -285,6 +286,20 @@ fn queue_and_flush(ctx: &Context, target: SaveTarget) -> Result<(), String> {
     report_backlog(&report);
     println!("queued {id} ({where_to}) — queued locally, not yet recallable");
     Ok(())
+}
+
+/// Rejected here, a bad draft never reaches the outbox, so it cannot dead-letter. The daemon
+/// still checks the token window, which needs a tokenizer this crate does not link.
+fn check_before_queueing(target: &SaveTarget) -> Result<(), String> {
+    let (content, title, tags) = match target {
+        SaveTarget::Memory { body, .. } => (&body.content, &body.title, &body.tags),
+        SaveTarget::Preference { body } => (&body.content, &body.title, &body.tags),
+    };
+    limits::content(content)?;
+    if let Some(title) = title {
+        limits::title(title, false)?;
+    }
+    limits::tags(tags)
 }
 
 fn report_backlog(report: &FlushReport) {
