@@ -10,6 +10,8 @@ const LABEL: &str = "com.benediktms.synapse";
 const UNIT_NAME: &str = "synapse.service";
 const PLIST_TEMPLATE: &str = include_str!("templates/launchd.plist");
 const UNIT_TEMPLATE: &str = include_str!("templates/systemd.service");
+const TASK_TEMPLATE: &str = include_str!("templates/schtasks.xml");
+const RUNNING: &str = "Running";
 
 pub fn run(cmd: DaemonCommand) -> Result<(), String> {
     match cmd {
@@ -78,6 +80,16 @@ fn install() -> Result<(), String> {
             run_tool(&["systemctl", "--user", "enable", "--now", UNIT_NAME])?,
         )?;
         report_install(&path, changed)
+    } else if cfg!(target_os = "windows") {
+        let path = task_xml_path(&state);
+        let changed = write_if_changed(&path, &render_task(&binary)?)?;
+        let path_str = path_str(&path)?;
+        require_success(
+            "schtasks /Create",
+            run_tool(&["schtasks", "/Create", "/TN", LABEL, "/XML", &path_str, "/F"])?,
+        )?;
+        run_task_unless_running()?;
+        report_install(&path, changed)
     } else {
         Err(unsupported())
     }
@@ -110,6 +122,14 @@ fn uninstall() -> Result<(), String> {
         remove_unit_file(&path)?;
         let _ = run_tool(&["systemctl", "--user", "daemon-reload"]);
         Ok(())
+    } else if cfg!(target_os = "windows") {
+        end_task()?;
+        tolerate_missing(
+            "schtasks /Delete",
+            tolerate_missing_task(run_tool(&["schtasks", "/Delete", "/TN", LABEL, "/F"])?),
+        )?;
+        let state = daemon_client::state_dir()?;
+        remove_unit_file(&task_xml_path(&state))
     } else {
         Err(unsupported())
     }
@@ -139,7 +159,7 @@ fn start() -> Result<(), String> {
         let target = format!("{domain}/{LABEL}");
         let path_str = path_str(&path)?;
         let loaded = match run_tool(&["launchctl", "print", &target])? {
-            Outcome::Success => true,
+            Outcome::Success { .. } => true,
             Outcome::NotFound => false,
             Outcome::Failed { code, stderr } => {
                 return Err(format!("launchctl print failed (exit {code}): {stderr}"));
@@ -160,6 +180,12 @@ fn start() -> Result<(), String> {
             "systemctl --user enable --now",
             run_tool(&["systemctl", "--user", "enable", "--now", UNIT_NAME])?,
         )?;
+    } else if cfg!(target_os = "windows") {
+        require_success(
+            "schtasks /Change /ENABLE",
+            run_tool(&["schtasks", "/Change", "/TN", LABEL, "/ENABLE"])?,
+        )?;
+        run_task_unless_running()?;
     } else {
         return Err(unsupported());
     }
@@ -185,12 +211,74 @@ fn stop() -> Result<(), String> {
             "systemctl --user disable --now",
             run_tool(&["systemctl", "--user", "disable", "--now", UNIT_NAME])?,
         )?;
+    } else if cfg!(target_os = "windows") {
+        end_task()?;
+        tolerate_missing(
+            "schtasks /Change /DISABLE",
+            tolerate_missing_task(run_tool(&[
+                "schtasks", "/Change", "/TN", LABEL, "/DISABLE",
+            ])?),
+        )?;
     } else {
         return Err(unsupported());
     }
     println!("daemon unit stopped");
     warn_if_socket_still_answers();
     Ok(())
+}
+
+/// `schtasks /Delete` unregisters without stopping a live instance, and `/End` fails
+/// identically for "idle task" and "kill refused" — so a failed `/End` is re-checked
+/// against the run state before it may pass as a no-op.
+fn end_task() -> Result<(), String> {
+    let end = tolerate_missing_task(run_tool(&["schtasks", "/End", "/TN", LABEL])?);
+    let Outcome::Failed { code, stderr } = end else {
+        return Ok(());
+    };
+    if task_status()?.as_deref() == Some(RUNNING) {
+        return Err(format!(
+            "schtasks /End failed and the task is still running (exit {code}): {stderr}"
+        ));
+    }
+    Ok(())
+}
+
+/// `MultipleInstancesPolicy=IgnoreNew` rejects a start request against a running task,
+/// so an unguarded `/Run` would fail on exactly the healthy case.
+fn run_task_unless_running() -> Result<(), String> {
+    if task_status()?.as_deref() == Some(RUNNING) {
+        return Ok(());
+    }
+    require_success(
+        "schtasks /Run",
+        run_tool(&["schtasks", "/Run", "/TN", LABEL])?,
+    )
+}
+
+fn task_status() -> Result<Option<String>, String> {
+    match tolerate_missing_task(run_tool(&[
+        "schtasks", "/Query", "/TN", LABEL, "/FO", "LIST",
+    ])?) {
+        Outcome::Success { stdout } => Ok(stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("Status:"))
+            .map(|value| value.trim().to_string())),
+        Outcome::NotFound => Ok(None),
+        Outcome::Failed { code, stderr } => {
+            Err(format!("schtasks /Query failed (exit {code}): {stderr}"))
+        }
+    }
+}
+
+/// schtasks reports an unregistered task with the same message as a missing file, so
+/// this reading is applied per verb — never to `/Create`, where it means the XML path.
+fn tolerate_missing_task(outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Failed { ref stderr, .. } if stderr.contains("cannot find the file specified") => {
+            Outcome::NotFound
+        }
+        other => other,
+    }
 }
 
 /// A daemon spawned on demand by the CLI is not under the unit's control, so a
@@ -255,7 +343,7 @@ fn logs(follow: bool, lines: usize) -> Result<(), String> {
 }
 
 enum Outcome {
-    Success,
+    Success { stdout: String },
     NotFound,
     Failed { code: i32, stderr: String },
 }
@@ -267,7 +355,9 @@ fn run_tool(argv: &[&str]) -> Result<Outcome, String> {
         .output()
         .map_err(|e| format!("cannot run {program}: {e}"))?;
     if out.status.success() {
-        return Ok(Outcome::Success);
+        return Ok(Outcome::Success {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        });
     }
     let code = out.status.code().unwrap_or(-1);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -288,7 +378,7 @@ fn run_tool(argv: &[&str]) -> Result<Outcome, String> {
 
 fn require_success(action: &str, outcome: Outcome) -> Result<(), String> {
     match outcome {
-        Outcome::Success => Ok(()),
+        Outcome::Success { .. } => Ok(()),
         Outcome::NotFound => Err(format!("{action}: the unit is not registered")),
         Outcome::Failed { code, stderr } => Err(format!("{action} failed (exit {code}): {stderr}")),
     }
@@ -296,24 +386,32 @@ fn require_success(action: &str, outcome: Outcome) -> Result<(), String> {
 
 fn tolerate_missing(action: &str, outcome: Outcome) -> Result<(), String> {
     match outcome {
-        Outcome::Success | Outcome::NotFound => Ok(()),
+        Outcome::Success { .. } | Outcome::NotFound => Ok(()),
         Outcome::Failed { code, stderr } => Err(format!("{action} failed (exit {code}): {stderr}")),
     }
 }
 
 fn unsupported() -> String {
-    "syn daemon supports macOS (launchd) and Linux (systemd --user) only".to_string()
+    "syn daemon supports macOS (launchd), Linux (systemd --user), and Windows (Task Scheduler)"
+        .to_string()
 }
 
+#[cfg(unix)]
 fn gui_domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
+#[cfg(windows)]
+fn gui_domain() -> String {
+    String::new()
+}
+
 fn home() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| "HOME is not set".to_string())
+        .ok_or_else(|| format!("{var} is not set"))
 }
 
 fn plist_path() -> Result<PathBuf, String> {
@@ -333,13 +431,19 @@ fn unit_path() -> Result<PathBuf, String> {
 /// The unit must point at a path that survives rebuilds, so the `~/.local/bin`
 /// symlink wins over the synd sitting next to the running syn.
 fn installed_synd() -> Result<PathBuf, String> {
-    let canonical = home()?.join(".local/bin/synd");
+    let canonical = home()?
+        .join(".local")
+        .join("bin")
+        .join(daemon_client::SYND_FILE_NAME);
     if canonical.exists() {
         return Ok(canonical);
     }
     let sibling = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("synd")))
+        .and_then(|exe| {
+            exe.parent()
+                .map(|dir| dir.join(daemon_client::SYND_FILE_NAME))
+        })
         .filter(|candidate| candidate.exists());
     sibling.ok_or_else(|| {
         format!(
@@ -347,6 +451,48 @@ fn installed_synd() -> Result<PathBuf, String> {
             canonical.display()
         )
     })
+}
+
+fn task_xml_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("synapse.task.xml")
+}
+
+fn render_task(binary: &Path) -> Result<String, String> {
+    let user = current_windows_user()?;
+    Ok(TASK_TEMPLATE
+        .replace("{{LABEL}}", LABEL)
+        .replace("{{USER_ID}}", &xml_escape_ascii(&user))
+        .replace(
+            "{{BINARY_PATH}}",
+            &xml_escape_ascii(&binary.to_string_lossy()),
+        ))
+}
+
+fn current_windows_user() -> Result<String, String> {
+    let name = std::env::var("USERNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "USERNAME is not set".to_string())?;
+    Ok(match std::env::var("USERDOMAIN") {
+        Ok(domain) if !domain.is_empty() => format!("{domain}\\{name}"),
+        _ => name,
+    })
+}
+
+/// `schtasks /Create /XML` wants ANSI or UTF-16 LE, not the UTF-8 this file is written
+/// as; ASCII-only bytes are identical under all three, so non-ASCII folds to numeric
+/// character references.
+fn xml_escape_ascii(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len());
+    for c in xml_escape(text).chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let _ = write!(out, "&#x{:X};", c as u32);
+        }
+    }
+    out
 }
 
 fn state_dir_override() -> Option<String> {

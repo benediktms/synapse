@@ -1,5 +1,7 @@
 //! Own test binary: it replaces `git` on `PATH` for the whole process.
 
+#![cfg(unix)]
+
 use cli::git::GitFacts;
 
 #[test]

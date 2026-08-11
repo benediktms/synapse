@@ -92,6 +92,7 @@ pub fn machine_token_name() -> String {
     sanitize(&format!("synapse-{host}"))
 }
 
+#[cfg(unix)]
 fn hostname() -> Option<String> {
     let mut buf = [0u8; 256];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
@@ -100,6 +101,13 @@ fn hostname() -> Option<String> {
     }
     let end = buf.iter().position(|b| *b == 0)?;
     String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+#[cfg(windows)]
+fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|name| !name.is_empty())
 }
 
 fn sanitize(raw: &str) -> String {

@@ -975,28 +975,16 @@ fn prompt(label: &str) -> Result<String, String> {
 /// Like `prompt`, but with terminal echo off so the secret stays out of the scrollback.
 /// A non-tty stdin (piped setup) falls back to a plain read.
 fn prompt_secret(label: &str) -> Result<String, String> {
-    let stdin_fd = 0;
-    if unsafe { libc::isatty(stdin_fd) } == 0 {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
         return prompt(label);
     }
     eprint!("{label}");
     std::io::stderr().flush().map_err(|e| e.to_string())?;
-    let mut term = std::mem::MaybeUninit::uninit();
-    if unsafe { libc::tcgetattr(stdin_fd, term.as_mut_ptr()) } != 0 {
-        return prompt("");
+    match rpassword::read_password() {
+        Ok(secret) => Ok(secret.trim().to_string()),
+        Err(_) => prompt(""),
     }
-    let saved = unsafe { term.assume_init() };
-    let mut silent = saved;
-    silent.c_lflag &= !libc::ECHO;
-    if unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &silent) } != 0 {
-        return prompt("");
-    }
-    let mut line = String::new();
-    let read = std::io::stdin().read_line(&mut line);
-    unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &saved) };
-    eprintln!();
-    read.map_err(|e| format!("cannot read stdin: {e}"))?;
-    Ok(line.trim().to_string())
 }
 
 /// The transport check comes before any client is built, so a missing HTTP token can

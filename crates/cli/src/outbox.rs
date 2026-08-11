@@ -1,6 +1,4 @@
 use std::fs;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -230,27 +228,27 @@ pub fn now_millis() -> u64 {
         .unwrap_or_default()
 }
 
-/// Dropping the returned file closes the descriptor, which releases the flock.
+/// Dropping the returned file closes the handle, which releases the lock.
 fn lock(path: &Path, block: bool) -> Result<Option<fs::File>, String> {
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
         .open(path)
         .map_err(|e| format!("cannot open lock {}: {e}", path.display()))?;
-    let operation = if block {
-        libc::LOCK_EX
-    } else {
-        libc::LOCK_EX | libc::LOCK_NB
-    };
-    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+    if block {
+        file.lock()
+            .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
         return Ok(Some(file));
     }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EWOULDBLOCK) if !block => Ok(None),
-        _ => Err(format!("cannot lock {}: {err}", path.display())),
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(e)) => Err(format!("cannot lock {}: {e}", path.display())),
     }
 }
 
@@ -269,7 +267,6 @@ fn lock_until(path: &Path, deadline: Instant) -> Result<Option<fs::File>, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn item(id: &str, queued_at: u64) -> PendingSave {
         PendingSave {
@@ -321,16 +318,20 @@ mod tests {
             .collect();
         assert_eq!(ids, ["m_aaa", "m_ccc", "m_bbb"]);
 
-        for (path, _) in outbox.pending().unwrap() {
-            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "{}", path.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for (path, _) in outbox.pending().unwrap() {
+                let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{}", path.display());
+            }
+            let dir_mode = fs::metadata(dir.path().join("outbox").join("dead-letter"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
         }
-        let dir_mode = fs::metadata(dir.path().join("outbox").join("dead-letter"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(dir_mode, 0o700);
     }
 
     #[test]

@@ -56,11 +56,14 @@ impl Manifest {
 
     /// The manifest carries database JWTs, so it is written 0600 like the config.
     pub fn save(&self, dir: &Path) {
-        use std::os::unix::fs::PermissionsExt;
         let path = manifest_path(dir);
         if let Ok(raw) = serde_json::to_string_pretty(&self) {
             let _ = std::fs::write(&path, raw);
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
         }
     }
 

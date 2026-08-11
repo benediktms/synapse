@@ -5,23 +5,16 @@ use daemon_client::state_dir;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        // Logs go to stderr: that is the stream the CLI's spawn captures into daemon.log.
-        .with_writer(std::io::stderr)
-        .init();
-
     let dir = match state_dir() {
         Ok(dir) => dir,
         Err(e) => {
-            tracing::error!("{e}");
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
     std::fs::create_dir_all(&dir).expect("create state dir");
+    init_tracing(&dir);
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
@@ -87,4 +80,35 @@ async fn main() {
     }
 
     rpc::serve(listener, app).await;
+}
+
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// Logs go to stderr: that is the stream the CLI's spawn captures into daemon.log.
+#[cfg(unix)]
+fn init_tracing(_dir: &std::path::Path) {
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter())
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// Task Scheduler discards stdout/stderr, so on Windows the daemon appends to
+/// daemon.log itself — the same file `syn daemon logs` reads on every platform.
+#[cfg(windows)]
+fn init_tracing(dir: &std::path::Path) {
+    let path = daemon_client::log_path(dir);
+    let file = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("cannot open {}: {e}", path.display()));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter())
+        .with_writer(std::sync::Arc::new(file))
+        .with_ansi(false)
+        .init();
 }

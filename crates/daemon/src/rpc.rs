@@ -4,8 +4,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use api::ops::{self, SearchArgs};
 use api::rpc::{
@@ -68,20 +67,22 @@ const MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(600);
 
-pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
+#[cfg(unix)]
+pub fn bind_listener(path: &Path) -> std::io::Result<tokio::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
     if path.exists() {
         // Tolerate a stale socket left behind by a killed daemon; the flock gate above ensures we
         // only reach here when no live daemon holds the lock.
         let _ = std::fs::remove_file(path);
     }
-    let listener = UnixListener::bind(path)?;
+    let listener = tokio::net::UnixListener::bind(path)?;
     // The socket is the auth boundary; never leave its mode to the process umask.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
 
-pub async fn serve<H: RpcHost>(listener: UnixListener, host: H) {
+#[cfg(unix)]
+pub async fn serve<H: RpcHost>(listener: tokio::net::UnixListener, host: H) {
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -98,7 +99,57 @@ pub async fn serve<H: RpcHost>(listener: UnixListener, host: H) {
     }
 }
 
-async fn handle_conn<H: RpcHost>(stream: UnixStream, host: H) -> std::io::Result<()> {
+/// A named-pipe "listener": the pipe name plus the pre-created next instance.
+/// `first_pipe_instance` makes a second daemon fail at bind, mirroring a taken socket.
+#[cfg(windows)]
+pub struct PipeListener {
+    name: String,
+    next: tokio::net::windows::named_pipe::NamedPipeServer,
+}
+
+#[cfg(windows)]
+pub fn bind_listener(path: &Path) -> std::io::Result<PipeListener> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let name = path
+        .to_str()
+        .ok_or_else(|| std::io::Error::other(format!("pipe name is not UTF-8: {path:?}")))?
+        .to_string();
+    let next = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&name)?;
+    Ok(PipeListener { name, next })
+}
+
+#[cfg(windows)]
+pub async fn serve<H: RpcHost>(mut listener: PipeListener, host: H) {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    loop {
+        if let Err(e) = listener.next.connect().await {
+            tracing::warn!("pipe connect failed: {e}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        let replacement = loop {
+            match ServerOptions::new().create(&listener.name) {
+                Ok(server) => break server,
+                Err(e) => {
+                    tracing::warn!("cannot create the next pipe instance: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+        let stream = std::mem::replace(&mut listener.next, replacement);
+        let host = host.clone();
+        tokio::spawn(async move {
+            let _ = handle_conn(stream, host).await;
+        });
+    }
+}
+
+async fn handle_conn<H: RpcHost, S>(stream: S, host: H) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut reader = BufReader::new(stream).take(MAX_REQUEST_BYTES);
     let mut line = String::new();
     // Newline-framed, per-command short connection: read one request, reply, close.

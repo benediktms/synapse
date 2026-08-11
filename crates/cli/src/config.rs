@@ -1,6 +1,5 @@
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -87,18 +86,34 @@ impl Config {
 }
 
 pub fn config_path() -> PathBuf {
-    base_dir("SYNAPSE_CONFIG_DIR", "XDG_CONFIG_HOME", ".config").join("config.toml")
+    base_dir(
+        "SYNAPSE_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "APPDATA",
+        ".config",
+    )
+    .join("config.toml")
 }
 
 pub fn state_dir() -> PathBuf {
-    base_dir("SYNAPSE_STATE_DIR", "XDG_STATE_HOME", ".local/state")
+    base_dir(
+        "SYNAPSE_STATE_DIR",
+        "XDG_STATE_HOME",
+        "LOCALAPPDATA",
+        ".local/state",
+    )
 }
 
-fn base_dir(override_var: &str, xdg_var: &str, home_suffix: &str) -> PathBuf {
+fn base_dir(override_var: &str, xdg_var: &str, windows_var: &str, home_suffix: &str) -> PathBuf {
     if let Some(dir) = env_path(override_var) {
         return dir;
     }
     if let Some(dir) = env_path(xdg_var) {
+        return dir.join("synapse");
+    }
+    if cfg!(windows)
+        && let Some(dir) = env_path(windows_var)
+    {
         return dir.join("synapse");
     }
     let home = env_path("HOME").unwrap_or_else(|| PathBuf::from("."));
@@ -111,10 +126,17 @@ fn env_path(var: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// On Windows the user-profile ACLs already restrict the directory; there is no
+/// mode to set.
 pub fn private_dir(dir: &Path) -> Result<(), String> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
         .create(dir)
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     sync_parent(dir)
@@ -122,11 +144,14 @@ pub fn private_dir(dir: &Path) -> Result<(), String> {
 
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&tmp)
         .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     file.write_all(bytes)
@@ -138,6 +163,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// A rename or unlink only survives power loss once the directory entry itself is on disk.
+#[cfg(unix)]
 pub fn sync_parent(path: &Path) -> Result<(), String> {
     let dir = path
         .parent()
@@ -148,10 +174,16 @@ pub fn sync_parent(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot sync {}: {e}", dir.display()))
 }
 
+/// Windows cannot open a directory as a plain file (that needs backup semantics),
+/// and NTFS journals metadata anyway.
+#[cfg(windows)]
+pub fn sync_parent(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn roundtrips_through_toml_with_0600_perms() {
@@ -173,14 +205,18 @@ mod tests {
         };
         config.save_to(&path).unwrap();
 
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        let dir_mode = fs::metadata(path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(dir_mode, 0o700);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            let dir_mode = fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+        }
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[[org_rules]]"), "{text}");

@@ -1065,21 +1065,21 @@ mod tests {
         assert_eq!(
             files
                 .iter()
-                .map(|(p, _)| p.to_string_lossy().into_owned())
+                .map(|(p, _)| p.components().collect::<PathBuf>())
                 .collect::<Vec<_>>(),
             vec![
                 sandbox
                     .homes
                     .omp
                     .join("extensions/synapse.ts")
-                    .display()
-                    .to_string(),
+                    .components()
+                    .collect::<PathBuf>(),
                 sandbox
                     .homes
                     .omp
                     .join("skills/synapse/SKILL.md")
-                    .display()
-                    .to_string(),
+                    .components()
+                    .collect::<PathBuf>(),
             ]
         );
     }

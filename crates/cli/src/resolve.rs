@@ -321,6 +321,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_rule_paths_resolve_to_the_same_workspace() {
         let root = tempfile::tempdir().unwrap();
@@ -336,6 +337,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn equal_depth_rules_naming_different_workspaces_are_ambiguous() {
         let root = tempfile::tempdir().unwrap();
