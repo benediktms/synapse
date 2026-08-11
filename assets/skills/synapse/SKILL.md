@@ -32,11 +32,13 @@ drift, and the scopeless copy is the one that goes wrong.
 syn recall "<topic>"            # active workspace + everything global
 syn recall "<topic>" -n 5       # cap results (default 10)
 syn recall "<topic>" --all-workspaces
+syn recall "<topic>" --detail short   # titles only, when scanning for which one
 ```
 
 **The digest is not the store.** A session-start hook injects `syn context` —
 four or five lines, pinned and recent, chosen before anyone knew what this session
-would be about. It tells you synapses exist; it does not tell you what they say.
+would be about. It prints titles only, never the facts themselves: it tells you
+synapses exist; it does not tell you what they say.
 Having seen the digest is the most common reason recall gets skipped, and it is
 not a reason.
 
@@ -125,10 +127,10 @@ belong in two different places.
 One flag carries it. `--scope` is the whole axis, widest to narrowest:
 
 ```
-syn save "<fact>" --kind feedback --scope everywhere   # every workspace, every project
-syn save "<fact>" --kind decision --scope workspace    # every repo in this workspace
-syn save "<fact>" --kind decision                      # this repo (inferred from git origin)
-syn save "<fact>" --kind reference --scope owner/repo  # a repo you are not standing in
+syn save --body "<fact>" --title "<claim>" --kind feedback --scope everywhere   # every workspace, every project
+syn save --body "<fact>" --title "<claim>" --kind decision --scope workspace    # every repo in this workspace
+syn save --body "<fact>" --title "<claim>" --kind decision                      # this repo (inferred from git origin)
+syn save --body "<fact>" --title "<claim>" --kind reference --scope owner/repo  # a repo you are not standing in
 ```
 
 The question that picks the line: **would this still be true, and still worth
@@ -178,7 +180,7 @@ in that slice of the user's life while staying out of the others.
 ## 4. Write
 
 ```
-syn save "<fact>" --kind user|feedback|decision|reference [--scope …] [--tags a,b]
+syn save --body "<fact>" --title "<claim>" --kind user|feedback|decision|reference [--scope …] [--tags a,b]
 ```
 
 `--kind` records what kind of fact it is: `feedback` for a correction or a stated
@@ -186,6 +188,22 @@ way of working, `user` for something about the person, `decision` for a call the
 code will not record, `reference` for a URL, dashboard, ticket or runbook. It is a
 separate axis from `--scope`: a `feedback` fact can be one repo's business, and a
 `decision` can hold everywhere.
+
+`--body` is the fact in full. `--title` is the one line that stands for it, and
+**both are required** — a save without a title is refused rather than guessing one
+from the body. The session-start digest prints only titles, never bodies, so the
+title is the whole of what a future session sees before it decides whether to read
+further. That makes it worth a moment's thought, not a copy of the first sentence.
+
+Write the title as a claim, not a topic: "Commits must be SSH-signed", not "Commit
+signing". A reader who sees only that line should already know what the fact says.
+Keep it under 120 characters.
+
+A title is embedded along with the fact, so recall finds a memory by the words in
+its title even when the body never repeats them. Keyword matching still reads the
+body alone, so do not rely on an exact-phrase search for a word that appears only
+in a title.
+
 
 Write in the same turn it happens. A decision is durable the moment it is reached;
 deferring to a tidier moment is how it gets lost. Do not ask permission — a write
@@ -227,12 +245,13 @@ the conversation that produced it.
 ## Reference
 
 ```
-syn edit <id> --content "<corrected fact>"
+syn edit <id> --body "<corrected fact>"
+syn edit <id> --title "<one-line claim>"
 syn forget <id>
 syn move <id> --to <workspace>   # filed in the wrong workspace
 syn move <id> --to everywhere    # should hold in every workspace
 syn pin <id> / syn unpin <id>    # keep it in the session-start digest
-syn show <id> / syn list
+syn show <id> / syn list          # add --detail short to print titles instead of bodies
 syn relate <A> <B>               # generic relationship (default)
 syn support <A> <B>              # one backs the other
 syn contradict <A> <B>           # they disagree

@@ -249,6 +249,7 @@ async fn put_preference<B: Backend>(
 ) -> Result<(StatusCode, Json<MemoryDto>), ApiError> {
     let body = PutMemoryBody {
         content: body.content,
+        title: body.title,
         kind: body.kind,
         scope: Scope::Workspace.as_str().to_string(),
         tags: body.tags,

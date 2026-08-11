@@ -13,8 +13,8 @@ use domain::MemoryId;
 
 use crate::args::{
     Cli, Command, ConfigCommand, ContextArgs, EditArgs, IdArgs, ImportArgs, LinkPairArgs,
-    LinksArgs, ListArgs, MoveArgs, RecallArgs, RetiredArgs, SCOPE_EVERYWHERE, SaveArgs, StoreArgs,
-    SupersedeArgs, SyncArgs, WorkspaceArgs, WorkspaceCommand,
+    LinksArgs, ListArgs, MoveArgs, RecallArgs, RetiredArgs, SCOPE_EVERYWHERE, SaveArgs, ShowArgs,
+    StoreArgs, SupersedeArgs, SyncArgs, WorkspaceArgs, WorkspaceCommand,
 };
 use crate::client::Client;
 use crate::config::{Config, OrgRule, Transport, WorkspaceRule};
@@ -191,7 +191,8 @@ fn save(ctx: &Context, args: SaveArgs) -> Result<(), String> {
         }
         SaveTarget::Preference {
             body: PutPreferenceBody {
-                content: args.content,
+                content: args.body,
+                title: Some(args.title.clone()),
                 kind,
                 tags: args.tags,
                 importance: args.importance,
@@ -206,7 +207,8 @@ fn save(ctx: &Context, args: SaveArgs) -> Result<(), String> {
         SaveTarget::Memory {
             workspace,
             body: PutMemoryBody {
-                content: args.content,
+                content: args.body,
+                title: Some(args.title),
                 kind,
                 scope: scope.scope,
                 tags: args.tags,
@@ -314,7 +316,7 @@ fn recall(ctx: &Context, args: RecallArgs) -> Result<(), String> {
     let count = match &response {
         SearchResponse::Flat { hits } => {
             for hit in hits {
-                let _ = writeln!(out, "{}", output::hit_line(hit));
+                let _ = writeln!(out, "{}", output::hit_line(hit, args.detail.detail));
             }
             hits.len()
         }
@@ -322,7 +324,7 @@ fn recall(ctx: &Context, args: RecallArgs) -> Result<(), String> {
             for group in groups {
                 let _ = writeln!(out, "## {}", output::store_label(&group.origin));
                 for hit in &group.hits {
-                    let _ = writeln!(out, "{}", output::hit_line(hit));
+                    let _ = writeln!(out, "{}", output::hit_line(hit, args.detail.detail));
                 }
             }
             groups.iter().map(|group| group.hits.len()).sum()
@@ -386,10 +388,12 @@ fn edit(ctx: &Context, args: EditArgs) -> Result<(), String> {
         println!("retyped {} ↔ {relation} ({ty})", args.id);
     }
 
-    let wants_memory_edit = args.content.is_some() || args.importance.is_some();
+    let wants_memory_edit =
+        args.body.is_some() || args.importance.is_some() || args.title.is_some();
     if wants_memory_edit {
         let body = PatchMemoryBody {
-            content: args.content,
+            content: args.body,
+            title: args.title,
             importance: args.importance,
             ..PatchMemoryBody::default()
         };
@@ -399,7 +403,7 @@ fn edit(ctx: &Context, args: EditArgs) -> Result<(), String> {
 
     if args.relation.is_none() && !wants_memory_edit {
         return Err(
-            "syn edit needs --content (or --importance), or --relation/--type to retype a link"
+            "syn edit needs --content (or --title/--importance), or --relation/--type to retype a link"
                 .into(),
         );
     }
@@ -522,7 +526,10 @@ fn list(ctx: &Context, args: ListArgs) -> Result<(), String> {
         Origin::Workspace(workspace) => client.list(workspace),
     }?;
     for memory in memories {
-        println!("{}", output::list_line(&target, &memory));
+        println!(
+            "{}",
+            output::list_line(&target, &memory, args.detail.detail)
+        );
     }
     Ok(())
 }
@@ -573,7 +580,7 @@ fn age(now: u64, queued_at: u64) -> String {
     }
 }
 
-fn show(ctx: &Context, args: IdArgs) -> Result<(), String> {
+fn show(ctx: &Context, args: ShowArgs) -> Result<(), String> {
     let client = ctx.client(READ_TIMEOUT)?;
     flush_before_read(ctx);
     let target = resolve_target(ctx, &args.store)?;
@@ -581,7 +588,10 @@ fn show(ctx: &Context, args: IdArgs) -> Result<(), String> {
         Origin::Preference => client.get_preference(&args.id),
         Origin::Workspace(workspace) => client.get(workspace, &args.id),
     }?;
-    println!("{}", output::memory_line(&target, &memory));
+    println!(
+        "{}",
+        output::memory_line(&target, &memory, args.detail.detail)
+    );
     if !memory.tags.is_empty() {
         println!("tags: {}", memory.tags.join(", "));
     }

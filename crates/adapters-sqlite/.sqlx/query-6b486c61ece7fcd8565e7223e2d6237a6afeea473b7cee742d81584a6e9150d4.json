@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id, content FROM memories",
+  "query": "SELECT id, content, title FROM memories",
   "describe": {
     "columns": [
       {
@@ -12,6 +12,11 @@
         "name": "content",
         "ordinal": 1,
         "type_info": "Text"
+      },
+      {
+        "name": "title",
+        "ordinal": 2,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -19,8 +24,9 @@
     },
     "nullable": [
       false,
+      false,
       false
     ]
   },
-  "hash": "4d8cc9f4c6338f2547b8c500133465067b85f911d4aad65240f34611471bcece"
+  "hash": "6b486c61ece7fcd8565e7223e2d6237a6afeea473b7cee742d81584a6e9150d4"
 }

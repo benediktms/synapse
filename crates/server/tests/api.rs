@@ -81,7 +81,7 @@ fn mid(n: u32) -> String {
 }
 
 fn put_body(content: &str) -> Value {
-    json!({ "content": content, "kind": "project", "scope": "workspace", "tags": [] })
+    json!({ "content": content, "title": "A stated fact", "kind": "project", "scope": "workspace", "tags": [] })
 }
 
 async fn put_memory(router: &Router, ws: &str, n: u32, content: &str) -> (StatusCode, Value) {
@@ -99,7 +99,7 @@ async fn put_preference(router: &Router, n: u32, content: &str) -> (StatusCode, 
         router,
         Method::PUT,
         &format!("/preferences/{}", mid(n)),
-        Some(json!({ "content": content, "kind": "user", "tags": [] })),
+        Some(json!({ "content": content, "title": "A stated fact", "kind": "user", "tags": [] })),
     )
     .await
 }
@@ -176,11 +176,11 @@ async fn validation_limits_reject_clearly() {
         put_body(&"x".repeat(8 * 1024 + 1)),
         put_body(&"ab ".repeat(2000)),
         put_body(""),
-        json!({ "content": "ok", "kind": "note", "scope": "workspace", "tags": [] }),
-        json!({ "content": "ok", "kind": "project", "scope": "has space", "tags": [] }),
-        json!({ "content": "ok", "kind": "project", "scope": "workspace",
+        json!({ "content": "ok", "title": "T", "kind": "note", "scope": "workspace", "tags": [] }),
+        json!({ "content": "ok", "title": "T", "kind": "project", "scope": "has space", "tags": [] }),
+        json!({ "content": "ok", "title": "T", "kind": "project", "scope": "workspace",
                 "tags": (0..17).map(|i| i.to_string()).collect::<Vec<_>>() }),
-        json!({ "content": "ok", "kind": "project", "scope": "workspace", "tags": ["bad tag"] }),
+        json!({ "content": "ok", "title": "T", "kind": "project", "scope": "workspace", "tags": ["bad tag"] }),
     ];
     for (i, body) in cases.into_iter().enumerate() {
         let (status, response) = req(&router, Method::PUT, &uri, Some(body)).await;
@@ -565,7 +565,7 @@ async fn context_digest_sections() {
         Method::PUT,
         &format!("/memories/{}?ws=work", mid(2)),
         Some(
-            json!({ "content": "offers uses the outbox pattern", "kind": "project",
+            json!({ "content": "offers uses the outbox pattern", "title": "A stated fact", "kind": "project",
                      "scope": "fresha/offers", "tags": [] }),
         ),
     )
@@ -690,7 +690,7 @@ async fn put_scoped(
         router,
         Method::PUT,
         &format!("/memories/{}?ws={ws}", mid(n)),
-        Some(json!({ "content": content, "kind": "project", "scope": scope, "tags": ["alpha"] })),
+        Some(json!({ "content": content, "title": "A stated fact", "kind": "project", "scope": scope, "tags": ["alpha"] })),
     )
     .await
 }
@@ -952,8 +952,10 @@ async fn importance_tier_surfaces_on_save_edit_and_get() {
         &router,
         Method::PUT,
         &format!("/memories/{}?ws=work", mid(1)),
-        Some(json!({ "content": "deploy runbook", "kind": "project",
-                     "scope": "workspace", "tags": [], "importance": "high" })),
+        Some(
+            json!({ "content": "deploy runbook", "title": "A stated fact", "kind": "project",
+                     "scope": "workspace", "tags": [], "importance": "high" }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -983,8 +985,10 @@ async fn importance_tier_surfaces_on_save_edit_and_get() {
         &router,
         Method::PUT,
         &format!("/memories/{}?ws=work", mid(2)),
-        Some(json!({ "content": "plain fact", "kind": "project",
-                     "scope": "workspace", "tags": [] })),
+        Some(
+            json!({ "content": "plain fact", "title": "A stated fact", "kind": "project",
+                     "scope": "workspace", "tags": [] }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -996,8 +1000,10 @@ async fn importance_tier_surfaces_on_save_edit_and_get() {
         &router,
         Method::PUT,
         &format!("/memories/{}?ws=work", mid(1)),
-        Some(json!({ "content": "deploy runbook", "kind": "project",
-                     "scope": "workspace", "tags": [] })),
+        Some(
+            json!({ "content": "deploy runbook", "title": "A stated fact", "kind": "project",
+                     "scope": "workspace", "tags": [] }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1494,6 +1500,7 @@ fn memory(n: u32, content: &str) -> Memory {
     Memory {
         id: MemoryId::parse(&mid(n)).unwrap(),
         content: content.to_string(),
+        title: String::new(),
         kind: MemoryKind::Project,
         scope: Scope::Workspace,
         tags: Vec::new(),

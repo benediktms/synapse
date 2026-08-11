@@ -124,7 +124,15 @@ fn a_reachable_server_saves_immediately_and_reports_the_workspace() {
     let stub = Stub::start();
     let machine = Machine::new(&stub.url());
 
-    let output = machine.run(&["save", "proto fields are additive", "--type", "feedback"]);
+    let output = machine.run(&[
+        "save",
+        "--body",
+        "proto fields are additive",
+        "--title",
+        "A title",
+        "--type",
+        "feedback",
+    ]);
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
@@ -153,7 +161,10 @@ fn save_with_importance_sends_the_tier_to_the_server() {
 
     let output = machine.run(&[
         "save",
+        "--body",
         "architectural decision",
+        "--title",
+        "A title",
         "--type",
         "project",
         "--importance",
@@ -175,7 +186,10 @@ fn everywhere_save_forwards_importance_to_the_preference() {
 
     let output = machine.run(&[
         "save",
+        "--body",
         "prefers live demo by default",
+        "--title",
+        "A title",
         "--type",
         "user",
         "--scope",
@@ -193,11 +207,36 @@ fn everywhere_save_forwards_importance_to_the_preference() {
 }
 
 #[test]
+fn save_sends_the_title_to_the_server() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    let output = machine.run(&[
+        "save",
+        "--body",
+        "Deploys go through ArgoCD, with a staging lane in front of production.",
+        "--type",
+        "project",
+        "--title",
+        "ArgoCD owns deploys",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    stub.with(|state| {
+        let body: serde_json::Value =
+            serde_json::from_str(state.memories.values().next().unwrap()).unwrap();
+        assert_eq!(body["title"], "ArgoCD owns deploys");
+    });
+}
+
+#[test]
 fn save_rejects_an_unknown_importance_tier() {
     let machine = Machine::new("http://127.0.0.1:1");
     let output = machine.run(&[
         "save",
+        "--body",
         "fact",
+        "--title",
+        "A title",
         "--type",
         "project",
         "--importance",
@@ -215,7 +254,15 @@ fn save_rejects_an_unknown_importance_tier() {
 fn an_unreachable_server_queues_the_save_and_says_it_is_not_recallable() {
     let machine = Machine::new(&format!("http://127.0.0.1:{}", dead_port()));
 
-    let output = machine.run(&["save", "queued fact", "--type", "project"]);
+    let output = machine.run(&[
+        "save",
+        "--body",
+        "queued fact",
+        "--title",
+        "A title",
+        "--type",
+        "project",
+    ]);
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
@@ -239,7 +286,15 @@ fn a_connection_dropped_after_the_server_commits_retries_without_duplicating() {
     stub.script(vec![Behavior::DropAfterCommit]);
     let machine = Machine::new(&stub.url());
 
-    let first = machine.run(&["save", "committed but unanswered", "--type", "project"]);
+    let first = machine.run(&[
+        "save",
+        "--body",
+        "committed but unanswered",
+        "--title",
+        "A title",
+        "--type",
+        "project",
+    ]);
     assert!(
         stdout(&first).contains("queued locally"),
         "{} / {}",
@@ -269,7 +324,9 @@ fn queued_saves_flush_oldest_first_once_the_server_returns() {
     let port = dead_port();
     let machine = Machine::new(&format!("http://127.0.0.1:{port}"));
     for content in ["first", "second", "third"] {
-        let output = machine.run(&["save", content, "--type", "project"]);
+        let output = machine.run(&[
+            "save", "--body", content, "--title", "A title", "--type", "project",
+        ]);
         assert!(
             stdout(&output).contains("queued locally"),
             "{}",
@@ -307,7 +364,9 @@ fn a_non_retryable_rejection_dead_letters_the_save() {
     )]);
     let machine = Machine::new(&stub.url());
 
-    let output = machine.run(&["save", "too big", "--type", "project"]);
+    let output = machine.run(&[
+        "save", "--body", "too big", "--title", "A title", "--type", "project",
+    ]);
 
     assert!(!output.status.success());
     assert!(
@@ -349,7 +408,15 @@ fn a_5xx_defers_the_queue_instead_of_dead_lettering_it() {
     stub.script(vec![Behavior::Status(503, "unready".into())]);
     let machine = Machine::new(&stub.url());
 
-    let output = machine.run(&["save", "server is booting", "--type", "project"]);
+    let output = machine.run(&[
+        "save",
+        "--body",
+        "server is booting",
+        "--title",
+        "A title",
+        "--type",
+        "project",
+    ]);
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
@@ -365,7 +432,15 @@ fn a_5xx_defers_the_queue_instead_of_dead_lettering_it() {
 fn export_refuses_an_incomplete_dump_and_flushes_the_queue_once_the_server_returns() {
     let port = dead_port();
     let machine = Machine::new(&format!("http://127.0.0.1:{port}"));
-    let queued = machine.run(&["save", "saved during the outage", "--type", "project"]);
+    let queued = machine.run(&[
+        "save",
+        "--body",
+        "saved during the outage",
+        "--title",
+        "A title",
+        "--type",
+        "project",
+    ]);
     assert!(
         stdout(&queued).contains("queued locally"),
         "{}",
@@ -405,7 +480,15 @@ fn a_read_says_so_when_it_may_predate_a_queued_save() {
     let machine = Machine::new(&format!("http://127.0.0.1:{port}"));
     assert!(
         machine
-            .run(&["save", "unsendable", "--type", "project"])
+            .run(&[
+                "save",
+                "--body",
+                "unsendable",
+                "--title",
+                "A title",
+                "--type",
+                "project"
+            ])
             .status
             .success()
     );
@@ -456,7 +539,15 @@ fn a_read_stays_within_its_flush_budget_when_another_process_holds_the_lock() {
     let machine = Machine::new(&format!("http://127.0.0.1:{port}"));
     assert!(
         machine
-            .run(&["save", "held back", "--type", "project"])
+            .run(&[
+                "save",
+                "--body",
+                "held back",
+                "--title",
+                "A title",
+                "--type",
+                "project"
+            ])
             .status
             .success()
     );
@@ -487,7 +578,15 @@ fn an_unreadable_success_is_retried_under_the_same_id_rather_than_dead_lettered(
     stub.script(vec![Behavior::UndecodableSuccess]);
     let machine = Machine::new(&stub.url());
 
-    let output = machine.run(&["save", "committed but unreadable", "--type", "project"]);
+    let output = machine.run(&[
+        "save",
+        "--body",
+        "committed but unreadable",
+        "--title",
+        "A title",
+        "--type",
+        "project",
+    ]);
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
@@ -521,7 +620,15 @@ fn saves_fail_closed_in_a_git_checkout_with_no_matching_rule() {
     ));
     machine.init_git_repo();
 
-    let refused = machine.run(&["save", "risky fact", "--type", "project"]);
+    let refused = machine.run(&[
+        "save",
+        "--body",
+        "risky fact",
+        "--title",
+        "A title",
+        "--type",
+        "project",
+    ]);
     assert!(!refused.status.success());
     assert!(
         stderr(&refused).contains("no workspace rule matches"),
@@ -535,7 +642,10 @@ fn saves_fail_closed_in_a_git_checkout_with_no_matching_rule() {
 
     let explicit = machine.run(&[
         "save",
+        "--body",
         "risky fact",
+        "--title",
+        "A title",
         "--type",
         "project",
         "--workspace",
@@ -550,7 +660,10 @@ fn saves_fail_closed_in_a_git_checkout_with_no_matching_rule() {
 
     let named_shared = machine.run(&[
         "save",
+        "--body",
         "risky fact",
+        "--title",
+        "A title",
         "--type",
         "project",
         "--workspace",
@@ -670,6 +783,34 @@ fn context_prints_a_digest_and_stays_silent_when_empty() {
         stdout(&filled),
         "## Memory (syn context)\n\
          - [m_0000000000000000000002] Prefers Datadog links\n\
+         - (recall more with: syn recall \"<query>\")\n"
+    );
+}
+
+#[test]
+fn the_digest_shortens_a_long_untitled_memory_to_its_first_sentence() {
+    let stub = Stub::start();
+    let machine = Machine::new(&stub.url());
+
+    stub.with(|state| {
+        state.context = Some(
+            serde_json::json!({
+                "pinned": [{"origin": "preference", "id": "m_0000000000000000000002",
+                    "content": "Never push unsigned commits. Benedikt said so after three \
+                                landed unsigned on a PR branch, and re-signing is a rebase.",
+                    "kind": "user", "scope": "workspace",
+                    "tags": [], "pinned": true, "created_at": "2026-06-02T09:00:00Z",
+                    "updated_at": "2026-06-02T09:00:00Z"}],
+                "recent_project": [],
+                "preferences": []
+            })
+            .to_string(),
+        );
+    });
+    assert_eq!(
+        stdout(&machine.run(&["context"])),
+        "## Memory (syn context)\n\
+         - [m_0000000000000000000002] Never push unsigned commits…\n\
          - (recall more with: syn recall \"<query>\")\n"
     );
 }
@@ -884,7 +1025,10 @@ fn scope_everywhere_saves_without_naming_a_workspace_or_inheriting_the_repo_scop
 
     let output = machine.run(&[
         "save",
+        "--body",
         "Benedikt prefers Datadog links over log tailing",
+        "--title",
+        "A title",
         "--kind",
         "user",
         "--scope",
@@ -927,7 +1071,10 @@ fn a_queued_everywhere_save_replays_as_one() {
 
     let queued = machine.run(&[
         "save",
+        "--body",
         "prefers oat milk",
+        "--title",
+        "A title",
         "--kind",
         "user",
         "--scope",
@@ -969,7 +1116,9 @@ fn workspace_map_writes_a_path_rule_that_saves_resolve_against() {
     let machine = Machine::with_config(&format!("url = \"{}\"\ntoken = \"t\"\n", stub.url()));
     machine.init_git_repo();
 
-    let refused = machine.run(&["save", "a fact", "--type", "project"]);
+    let refused = machine.run(&[
+        "save", "--body", "a fact", "--title", "A title", "--type", "project",
+    ]);
     assert!(
         !refused.status.success(),
         "no rule and no default: {}",
@@ -984,7 +1133,9 @@ fn workspace_map_writes_a_path_rule_that_saves_resolve_against() {
         stdout(&mapped)
     );
 
-    let saved = machine.run(&["save", "a fact", "--type", "project"]);
+    let saved = machine.run(&[
+        "save", "--body", "a fact", "--title", "A title", "--type", "project",
+    ]);
     assert!(saved.status.success(), "{}", stderr(&saved));
     assert!(
         stdout(&saved).contains("(work · workspace)"),
@@ -1023,7 +1174,10 @@ fn explicit_workspace_and_scope_save_succeeds_without_git() {
 
     let saved = machine.run_without_git(&[
         "save",
+        "--body",
         "a fact",
+        "--title",
+        "A title",
         "--type",
         "project",
         "--workspace",
@@ -1046,7 +1200,10 @@ fn a_save_that_reaches_everywhere_needs_neither_git_nor_a_workspace() {
 
     let saved = machine.run_without_git(&[
         "save",
+        "--body",
         "Benedikt wants the failing test output before a fix",
+        "--title",
+        "A title",
         "--kind",
         "feedback",
         "--scope",
@@ -1061,7 +1218,10 @@ fn a_save_that_reaches_everywhere_needs_neither_git_nor_a_workspace() {
 
     let contradiction = machine.run(&[
         "save",
+        "--body",
         "a fact",
+        "--title",
+        "A title",
         "--kind",
         "feedback",
         "--scope",
@@ -1108,7 +1268,10 @@ fn kind_decision_is_stored_as_the_project_kind_the_server_knows() {
 
     let saved = machine.run(&[
         "save",
+        "--body",
         "staging deploys go through ArgoCD",
+        "--title",
+        "A title",
         "--kind",
         "decision",
         "--scope",
@@ -1128,7 +1291,9 @@ fn a_save_needing_inference_errors_rather_than_defaulting_without_git() {
     let stub = Stub::start();
     let machine = Machine::new(&stub.url());
 
-    let refused = machine.run_without_git(&["save", "a fact", "--type", "project"]);
+    let refused = machine.run_without_git(&[
+        "save", "--body", "a fact", "--title", "A title", "--type", "project",
+    ]);
     assert!(!refused.status.success());
     assert!(
         stderr(&refused).contains("could not run git"),
@@ -1193,7 +1358,9 @@ fn re_mapping_an_org_under_a_different_case_replaces_the_old_rule() {
     assert!(config.contains("workspace = \"two\""), "{config}");
 
     machine.init_git_repo_with_origin("git@github.com:Acme/widgets.git");
-    let saved = machine.run(&["save", "a fact", "--type", "project"]);
+    let saved = machine.run(&[
+        "save", "--body", "a fact", "--title", "A title", "--type", "project",
+    ]);
     assert!(saved.status.success(), "{}", stderr(&saved));
     assert!(
         stdout(&saved).contains("(two · Acme/widgets)"),
@@ -1208,7 +1375,9 @@ fn a_present_but_unusable_repo_refuses_the_save_instead_of_defaulting() {
     let machine = Machine::new(&stub.url());
     std::fs::write(machine.cwd.join(".git"), "gitdir: /nonexistent/path.git\n").unwrap();
 
-    let refused = machine.run(&["save", "a fact", "--type", "project"]);
+    let refused = machine.run(&[
+        "save", "--body", "a fact", "--title", "A title", "--type", "project",
+    ]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     assert!(
         stderr(&refused).contains(machine.cwd.to_str().unwrap()),
@@ -1227,13 +1396,17 @@ fn an_org_rule_routes_an_unmapped_repo_and_its_worktree() {
     let machine = Machine::with_config(&format!("url = \"{}\"\ntoken = \"t\"\n", stub.url()));
     machine.init_git_repo_with_origin("git@github.com:acme/widgets.git");
 
-    let refused = machine.run(&["save", "a fact", "--type", "project"]);
+    let refused = machine.run(&[
+        "save", "--body", "a fact", "--title", "A title", "--type", "project",
+    ]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
 
     let mapped = machine.run(&["workspace", "map-org", "acme", "acme-ws"]);
     assert!(mapped.status.success(), "{}", stderr(&mapped));
 
-    let saved = machine.run(&["save", "a fact", "--type", "project"]);
+    let saved = machine.run(&[
+        "save", "--body", "a fact", "--title", "A title", "--type", "project",
+    ]);
     assert!(saved.status.success(), "{}", stderr(&saved));
     assert!(
         stdout(&saved).contains("(acme-ws · acme/widgets)"),
@@ -1258,7 +1431,9 @@ fn an_org_rule_routes_an_unmapped_repo_and_its_worktree() {
     assert!(status.success(), "git worktree add failed");
 
     let output = Command::new(env!("CARGO_BIN_EXE_syn"))
-        .args(["save", "a fact", "--type", "project"])
+        .args([
+            "save", "--body", "a fact", "--title", "A title", "--type", "project",
+        ])
         .current_dir(&worktree)
         .env("SYNAPSE_CONFIG_DIR", machine.home.path().join("config"))
         .env("SYNAPSE_STATE_DIR", machine.state_dir())
@@ -1290,7 +1465,9 @@ fn a_nested_path_rule_still_beats_an_org_rule_for_the_same_repo() {
     ]);
     assert!(path_mapped.status.success(), "{}", stderr(&path_mapped));
 
-    let saved = machine.run(&["save", "a fact", "--type", "project"]);
+    let saved = machine.run(&[
+        "save", "--body", "a fact", "--title", "A title", "--type", "project",
+    ]);
     assert!(saved.status.success(), "{}", stderr(&saved));
     assert!(
         stdout(&saved).contains("(client-a-ws · acme/widgets)"),
@@ -1308,7 +1485,9 @@ fn an_origin_less_repo_falls_through_org_rules_without_crashing() {
     let mapped = machine.run(&["workspace", "map-org", "acme", "acme-ws"]);
     assert!(mapped.status.success(), "{}", stderr(&mapped));
 
-    let refused = machine.run(&["save", "a fact", "--type", "project"]);
+    let refused = machine.run(&[
+        "save", "--body", "a fact", "--title", "A title", "--type", "project",
+    ]);
     assert!(!refused.status.success());
     assert!(
         stderr(&refused).contains("no workspace rule matches"),

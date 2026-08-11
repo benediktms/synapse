@@ -365,6 +365,7 @@ mod tests {
             "origin": {"workspace": "work"},
             "id": ID,
             "content": "deploy staging offers",
+            "title": "Offers deploy to staging",
             "kind": "reference",
             "scope": "workspace",
         });
@@ -401,7 +402,7 @@ mod tests {
         .await;
         assert_eq!(resp["error"]["code"], -32001, "{resp}");
 
-        let resp = call(&app, "memory.save", json!({"origin": "preference", "id": ID, "content": "prefers rebase", "kind": "feedback", "scope": "workspace"})).await;
+        let resp = call(&app, "memory.save", json!({"origin": "preference", "id": ID, "content": "prefers rebase", "title": "Prefers rebase", "kind": "feedback", "scope": "workspace"})).await;
         assert_eq!(resp["result"]["created"], true, "{resp}");
         let resp = call(&app, "memory.list", json!({"origin": "preference"})).await;
         assert_eq!(resp["result"]["memories"][0]["content"], "prefers rebase");
@@ -412,5 +413,159 @@ mod tests {
         assert_eq!(resp["error"]["code"], -32602, "{resp}");
         let resp = dispatch("not json", &app).await;
         assert!(resp.contains("-32700"), "{resp}");
+    }
+
+    /// A dry run of the title migration over real data, driven through the RPC surface the CLI
+    /// actually calls, with the real embedding model rather than a stub.
+    ///
+    /// It binds only the databases named in `SYNAPSE_DRYRUN_DBS` — never the live ones. This is
+    /// deliberate: `DaemonApp::boot` adopts every database in the org whose name parses as a
+    /// workspace, so a second daemon pointed at this org would migrate the live primaries too.
+    /// Branch the real databases first (`turso db create <name>-dryrun --from-db <name>`) and
+    /// delete the branches afterwards, or the next daemon boot adopts them as workspaces.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Turso Cloud credentials, branch databases, and network"]
+    async fn a_dry_run_of_the_title_migration_over_real_data() {
+        let Some(token) = std::env::var("SYNAPSE_TURSO_TEST_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+        else {
+            eprintln!("skipping: SYNAPSE_TURSO_TEST_TOKEN is not set");
+            return;
+        };
+        let org =
+            std::env::var("SYNAPSE_TURSO_TEST_ORG").unwrap_or_else(|_| "benediktms".to_string());
+        let names: Vec<String> = std::env::var("SYNAPSE_DRYRUN_DBS")
+            .expect("SYNAPSE_DRYRUN_DBS must name the branch databases")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let platform = adapters_libsql::TursoPlatform::new();
+        let group = platform.ensure_group(&org, &token).await.unwrap();
+        let db_token = platform.mint_db_token(&org, &token, &group).await.unwrap();
+        let (dbs, _) = platform.list_databases(&org, &token).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let embedder =
+            tokio::task::spawn_blocking(|| Arc::new(FastEmbedder::new().expect("model init")))
+                .await
+                .expect("join");
+        let mut stores = HashMap::new();
+        for name in &names {
+            let db = dbs
+                .iter()
+                .find(|db| &db.name == name)
+                .unwrap_or_else(|| panic!("no database named {name} in {org}"));
+            // The open that migrates: these branches predate the title column.
+            let store = LibsqlStore::open(
+                dir.path().join(format!("{name}.db")),
+                db.url.clone(),
+                db_token.clone(),
+                MODEL_NAME,
+                DIMENSION,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("open {name}: {e}"));
+            stores.insert(Workspace::new(name).unwrap(), Arc::new(store));
+        }
+        let app = DaemonApp::for_tests(dir.path().to_path_buf(), embedder, stores);
+        let ws = names.first().expect("at least one branch database");
+
+        // The drill writes one memory of its own. Clearing it up front keeps a re-run against
+        // the same branches honest, whatever an earlier run left behind.
+        const DRILL_ID: &str = "m_0000000000000000009999";
+        call(
+            &app,
+            "memory.forget",
+            json!({"origin": {"workspace": ws}, "id": DRILL_ID}),
+        )
+        .await;
+
+        // Every migrated row still reads back, with an empty title and a usable short form.
+        for name in &names {
+            let resp = call(&app, "memory.list", json!({"origin": {"workspace": name}})).await;
+            let memories = resp["result"]["memories"].as_array().unwrap();
+            assert!(!memories.is_empty(), "{name} came back empty: {resp}");
+            for memory in memories {
+                assert_eq!(memory["title"], "", "{name} row gained a title");
+                let short = domain::short_form(
+                    memory["title"].as_str().unwrap(),
+                    memory["content"].as_str().unwrap(),
+                );
+                assert!(!short.is_empty(), "empty short form for {}", memory["id"]);
+                assert!(
+                    short.chars().count() <= domain::TITLE_MAX_CHARS,
+                    "{short:?} exceeds the cap"
+                );
+            }
+            eprintln!("{name}: {} memories migrated and readable", memories.len());
+        }
+
+        // A title whose words appear nowhere in the body: the vector lane is the only thing
+        // that can find it, so this is what proves the title reached the embedding.
+        let params = json!({
+            "origin": {"workspace": ws},
+            "id": DRILL_ID,
+            "content": "The nightly job writes its report to the bucket at 03:00 UTC.",
+            "title": "Marmalade quokka telemetry",
+            "kind": "reference",
+            "scope": "workspace",
+        });
+        let resp = call(&app, "memory.save", params).await;
+        assert_eq!(resp["result"]["created"], true, "{resp}");
+
+        let resp = call(&app, "search", json!({"ws": ws, "q": "marmalade quokka"})).await;
+        let hits = resp["result"]["hits"].as_array().unwrap();
+        assert_eq!(
+            hits.first().map(|h| &h["id"]),
+            Some(&json!(DRILL_ID)),
+            "a title-only phrase did not recall its memory: {resp}"
+        );
+        eprintln!("recall by a title-only phrase: hit at rank 1 among real data");
+
+        // A title-only edit must re-embed, or the new title is unrecallable.
+        let resp = call(
+            &app,
+            "memory.edit",
+            json!({"origin": {"workspace": ws}, "id": DRILL_ID, "title": "Rhubarb axolotl ledger"}),
+        )
+        .await;
+        assert_eq!(resp["result"]["title"], "Rhubarb axolotl ledger", "{resp}");
+        let resp = call(&app, "search", json!({"ws": ws, "q": "rhubarb axolotl"})).await;
+        assert_eq!(
+            resp["result"]["hits"][0]["id"], DRILL_ID,
+            "an edited title did not re-embed: {resp}"
+        );
+        eprintln!("recall by an edited title: hit at rank 1");
+
+        // What the session-start digest would print for real memories.
+        let resp = call(&app, "context", json!({"origin": {"workspace": ws}})).await;
+        let entries = resp["result"]["recent_project"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let pinned = resp["result"]["pinned"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for entry in pinned.iter().chain(&entries).take(5) {
+            eprintln!(
+                "digest: - [{}] {}",
+                entry["id"].as_str().unwrap(),
+                domain::short_form(
+                    entry["title"].as_str().unwrap_or(""),
+                    entry["content"].as_str().unwrap()
+                )
+            );
+        }
+
+        call(
+            &app,
+            "memory.forget",
+            json!({"origin": {"workspace": ws}, "id": DRILL_ID}),
+        )
+        .await;
     }
 }

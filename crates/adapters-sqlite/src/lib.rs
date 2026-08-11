@@ -86,12 +86,14 @@ impl SqliteStore {
     ) -> Result<usize, Error> {
         let dim = i64::try_from(embedding_dim).map_err(store_err)?;
         let mut tx = self.pool.begin().await.map_err(store_err)?;
-        let rows = sqlx::query!("SELECT id, content FROM memories")
+        let rows = sqlx::query!("SELECT id, content, title FROM memories")
             .fetch_all(&mut *tx)
             .await
             .map_err(store_err)?;
         for row in &rows {
-            let embedding = embedder.embed(&row.content).await?;
+            let embedding = embedder
+                .embed(&domain::embed_text(&row.title, &row.content))
+                .await?;
             let blob = encode_embedding(&embedding, embedding_dim)?;
             sqlx::query!(
                 "UPDATE memories SET embedding = ? WHERE id = ?",
@@ -139,7 +141,7 @@ impl Store for SqliteStore {
         let id = id.as_str();
         sqlx::query_as!(
             MemoryRow,
-            "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at \
+            "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at, title \
              FROM memories WHERE id = ?",
             id
         )
@@ -153,7 +155,7 @@ impl Store for SqliteStore {
     async fn get_with_embedding(&self, id: &MemoryId) -> Result<Option<(Memory, Vec<f32>)>, Error> {
         let key = id.as_str();
         let row = sqlx::query!(
-            "SELECT id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at \
+            "SELECT id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at, title \
              FROM memories WHERE id = ?",
             key
         )
@@ -174,6 +176,7 @@ impl Store for SqliteStore {
             importance: row.importance,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            title: row.title,
         })?;
         Ok(Some((memory, embedding)))
     }
@@ -189,8 +192,8 @@ impl Store for SqliteStore {
         let created_at = memory.created_at.as_str();
         let updated_at = memory.updated_at.as_str();
         let result = sqlx::query!(
-            "INSERT INTO memories (id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO memories (id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at, title) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
             id,
             memory.content,
             kind,
@@ -200,7 +203,8 @@ impl Store for SqliteStore {
             importance,
             blob,
             created_at,
-            updated_at
+            updated_at,
+            memory.title
         )
         .execute(&self.pool)
         .await
@@ -213,6 +217,7 @@ impl Store for SqliteStore {
             .await?
             .ok_or_else(|| Error::Store(format!("memory {id} vanished during insert")))?;
         let same_payload = existing.content == memory.content
+            && existing.title == memory.title
             && existing.kind == memory.kind
             && existing.scope == memory.scope
             && existing.tags == memory.tags
@@ -233,6 +238,7 @@ impl Store for SqliteStore {
         now: &Timestamp,
     ) -> Result<Memory, Error> {
         let content = patch.content.as_deref();
+        let title = patch.title.as_deref();
         let tags = patch
             .tags
             .as_ref()
@@ -248,14 +254,16 @@ impl Store for SqliteStore {
         let key = id.as_str();
         sqlx::query_as!(
             MemoryRow,
-            r#"UPDATE memories SET content = COALESCE(?, content), tags = COALESCE(?, tags),
+            r#"UPDATE memories SET content = COALESCE(?, content), title = COALESCE(?, title),
+                   tags = COALESCE(?, tags),
                    pinned = COALESCE(?, pinned), importance = COALESCE(?, importance),
                    embedding = COALESCE(?, embedding), updated_at = ?
                WHERE id = ?
                RETURNING id AS "id!", content AS "content!", kind AS "kind!", scope AS "scope!",
                    tags AS "tags!", pinned AS "pinned!", importance AS "importance!",
-                   created_at AS "created_at!", updated_at AS "updated_at!""#,
+                   created_at AS "created_at!", updated_at AS "updated_at!", title AS "title!""#,
             content,
+            title,
             tags,
             pinned,
             importance,
@@ -282,7 +290,7 @@ impl Store for SqliteStore {
     async fn list(&self) -> Result<Vec<Memory>, Error> {
         sqlx::query_as!(
             MemoryRow,
-            "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at FROM memories"
+            "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at, title FROM memories"
         )
         .fetch_all(&self.pool)
         .await
@@ -459,6 +467,7 @@ struct MemoryRow {
     importance: i64,
     created_at: String,
     updated_at: String,
+    title: String,
 }
 
 impl TryFrom<MemoryRow> for Memory {
@@ -468,6 +477,7 @@ impl TryFrom<MemoryRow> for Memory {
         Ok(Memory {
             id: MemoryId::parse(&row.id)?,
             content: row.content,
+            title: row.title,
             kind: MemoryKind::parse(&row.kind)?,
             scope: Scope::parse(&row.scope)?,
             tags: serde_json::from_str(&row.tags).map_err(store_err)?,

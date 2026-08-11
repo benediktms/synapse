@@ -279,6 +279,7 @@ mod tests {
                 workspace: "work".into(),
                 body: PutMemoryBody {
                     content: "fact".into(),
+                    title: None,
                     kind: "project".into(),
                     scope: "workspace".into(),
                     tags: vec![],
@@ -296,6 +297,7 @@ mod tests {
             target: SaveTarget::Preference {
                 body: PutPreferenceBody {
                     content: "prefers oat milk".into(),
+                    title: None,
                     kind: "user".into(),
                     tags: vec![],
                     importance: None,

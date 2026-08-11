@@ -14,7 +14,9 @@ use crate::dto::{
     PutMemoryBody, SearchResponse, WorkspaceDto, WorkspacesResponse,
 };
 use crate::error::ApiError;
-use crate::validate::{normalize_timestamp, validate_content, validate_query, validate_tags};
+use crate::validate::{
+    normalize_timestamp, validate_content, validate_query, validate_tags, validate_title,
+};
 
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const DEFAULT_GRAPH_DEPTH: usize = 2;
@@ -87,9 +89,13 @@ pub async fn save<B: Backend>(
     let id = MemoryId::parse(id)?;
     validate_content(backend, &body.content)?;
     validate_tags(&body.tags)?;
+    if let Some(title) = &body.title {
+        validate_title(title, false)?;
+    }
     let request = SaveRequest {
         id,
         content: body.content,
+        title: body.title,
         kind: MemoryKind::parse(&body.kind)?,
         scope: Scope::parse(&body.scope)?,
         tags: body.tags,
@@ -124,8 +130,12 @@ pub async fn edit<B: Backend>(
     if let Some(tags) = &body.tags {
         validate_tags(tags)?;
     }
+    if let Some(title) = &body.title {
+        validate_title(title, false)?;
+    }
     let request = EditRequest {
         content: body.content,
+        title: body.title,
         tags: body.tags,
         pinned: body.pinned,
         importance: body
@@ -346,6 +356,7 @@ pub async fn import<B: Backend>(
         };
         validate_content(backend, &dto.content).map_err(item)?;
         validate_tags(&dto.tags).map_err(item)?;
+        validate_title(&dto.title, true).map_err(item)?;
         let created_at = normalize_timestamp(&dto.created_at).map_err(item)?;
         let updated_at = normalize_timestamp(&dto.updated_at).map_err(item)?;
         let mut memory = dto.to_memory().map_err(|e| item(ApiError::from(e)))?;

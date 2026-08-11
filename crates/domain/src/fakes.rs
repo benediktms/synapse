@@ -60,6 +60,7 @@ impl Store for FakeStore {
         let mut rows = self.rows.lock().unwrap();
         if let Some((existing, _)) = rows.get(&memory.id) {
             let same_payload = existing.content == memory.content
+                && existing.title == memory.title
                 && existing.kind == memory.kind
                 && existing.scope == memory.scope
                 && existing.tags == memory.tags
@@ -88,6 +89,9 @@ impl Store for FakeStore {
         };
         if let Some(content) = &patch.content {
             memory.content = content.clone();
+        }
+        if let Some(title) = &patch.title {
+            memory.title = title.clone();
         }
         if let Some(tags) = &patch.tags {
             memory.tags = tags.clone();
