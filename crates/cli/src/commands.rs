@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use api::{
     ExportDoc, MemoryDto, MoveBody, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody,
-    SearchResponse,
+    SearchResponse, limits,
 };
 use api_client::SynapseApiClient;
 use daemon_client::{DaemonClient, DaemonConfig, ScopedOrg};
@@ -157,6 +157,9 @@ fn flush_before_read(ctx: &Context) {
     for (id, failure) in &report.dead_lettered {
         eprintln!("note: {id} moved to dead-letter: {failure}");
     }
+    for (id, failure) in &report.rejected {
+        eprintln!("note: {id} dropped as invalid: {failure}");
+    }
     if report.still_queued > 0 {
         let reason = report.deferred.as_deref().unwrap_or("still unsent");
         eprintln!(
@@ -254,6 +257,7 @@ fn retired_remember(args: RetiredArgs) -> Result<(), String> {
 /// The outbox is written before the first send, so a reply lost in flight replays
 /// against the same id and the idempotent PUT collapses it.
 fn queue_and_flush(ctx: &Context, target: SaveTarget) -> Result<(), String> {
+    check_before_queueing(&target)?;
     let id = MemoryId::generate().to_string();
     let where_to = target.label();
     let item = PendingSave {
@@ -279,6 +283,9 @@ fn queue_and_flush(ctx: &Context, target: SaveTarget) -> Result<(), String> {
         println!("saved {id} ({where_to})");
         return Ok(());
     }
+    if let Some((_, failure)) = report.rejected.iter().find(|(rejected, _)| *rejected == id) {
+        return Err(failure.clone());
+    }
     if let Some((_, failure)) = report.dead_lettered.iter().find(|(dead, _)| *dead == id) {
         return Err(format!("{failure} (see: syn list --pending)"));
     }
@@ -287,12 +294,29 @@ fn queue_and_flush(ctx: &Context, target: SaveTarget) -> Result<(), String> {
     Ok(())
 }
 
+/// Rejected here, a bad draft never reaches the outbox, so it cannot dead-letter. The daemon
+/// still checks the token window, which needs a tokenizer this crate does not link.
+fn check_before_queueing(target: &SaveTarget) -> Result<(), String> {
+    let (content, title, tags) = match target {
+        SaveTarget::Memory { body, .. } => (&body.content, &body.title, &body.tags),
+        SaveTarget::Preference { body } => (&body.content, &body.title, &body.tags),
+    };
+    limits::content(content)?;
+    if let Some(title) = title {
+        limits::title(title, false)?;
+    }
+    limits::tags(tags)
+}
+
 fn report_backlog(report: &FlushReport) {
     if let Some(reason) = &report.deferred {
         eprintln!("note: {reason}");
     }
     for (id, failure) in &report.dead_lettered {
         eprintln!("note: {id} moved to dead-letter: {failure}");
+    }
+    for (id, failure) in &report.rejected {
+        eprintln!("note: {id} dropped as invalid: {failure}");
     }
 }
 

@@ -41,6 +41,7 @@ impl Client {
             }
             .map_err(|e| SendFailure {
                 retryable: e.is_retryable(),
+                invalid: e.is_invalid_request(),
                 message: e.to_string(),
             }),
             Self::Daemon(d) => match target {
@@ -53,6 +54,7 @@ impl Client {
             }
             .map_err(|e| SendFailure {
                 retryable: e.is_retryable(),
+                invalid: e.is_invalid_request(),
                 message: e.to_string(),
             }),
         }

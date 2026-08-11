@@ -101,6 +101,12 @@ impl DaemonError {
             Self::Rpc { code, .. } => matches!(code, -32000 | -32003),
         }
     }
+
+    /// The request itself is the problem, so replaying it unchanged can never succeed and
+    /// keeping it queued only accumulates work nobody can drain. -32602 is `BadRequest`.
+    pub fn is_invalid_request(&self) -> bool {
+        matches!(self, Self::Rpc { code: -32602, .. })
+    }
 }
 
 impl fmt::Display for DaemonError {

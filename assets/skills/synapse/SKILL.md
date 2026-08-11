@@ -204,6 +204,11 @@ its title even when the body never repeats them. Keyword matching still reads th
 body alone, so do not rely on an exact-phrase search for a word that appears only
 in a title.
 
+Keep the body lean: one fact, stated once. `syn save` refuses a body over 2 KB, and
+that ceiling is the design, not a limitation to work around — a synapse that needs
+more is several facts wearing one coat. Split it into one memory per fact and join
+them with `syn relate`, which recall then surfaces together as neighbours.
+
 
 Write in the same turn it happens. A decision is durable the moment it is reached;
 deferring to a tidier moment is how it gets lost. Do not ask permission — a write
