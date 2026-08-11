@@ -1,8 +1,63 @@
+use std::collections::BTreeSet;
+
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct MintResponse {
     token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListDatabasesResponse {
+    #[serde(default)]
+    databases: Vec<serde_json::Value>,
+}
+
+/// Discover the workspace databases already present in every configured Turso org.
+///
+/// `shared` is the cross-workspace preference store, not a selectable workspace.
+pub fn list_workspaces<'a>(
+    orgs: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<Vec<String>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut workspaces = BTreeSet::new();
+    for (org, token) in orgs {
+        let url = format!("https://api.turso.tech/v1/organizations/{org}/databases");
+        let response = client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        let status = response.status();
+        let body = response.text().map_err(|e| format!("GET {url}: {e}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "listing databases in {org} failed ({status}): {body}"
+            ));
+        }
+        workspaces.extend(workspace_names(&body)?);
+    }
+    Ok(workspaces.into_iter().collect())
+}
+
+fn workspace_names(body: &str) -> Result<Vec<String>, String> {
+    let response: ListDatabasesResponse =
+        serde_json::from_str(body).map_err(|e| format!("unreadable database list: {e}"))?;
+    Ok(response
+        .databases
+        .iter()
+        .filter_map(|database| {
+            database
+                .get("Name")
+                .or_else(|| database.get("name"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|name| *name != "shared" && domain::Workspace::new(name).is_ok())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Mint a new platform API token named `name`, authenticated by an existing token.
@@ -79,5 +134,21 @@ mod tests {
         let name = machine_token_name();
         assert!(name.starts_with("synapse"));
         assert!(!name.ends_with('-'));
+    }
+
+    #[test]
+    fn database_list_keeps_only_selectable_workspaces_in_api_casing() {
+        let names = workspace_names(
+            r#"{"databases":[
+                {"Name":"personal","name":"personal"},
+                {"name":"work"},
+                {"Name":"shared"},
+                {"name":"not_a_workspace"},
+                {"Hostname":"missing-name.turso.io"}
+            ]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(names, ["personal", "work"]);
     }
 }

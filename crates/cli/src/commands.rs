@@ -66,7 +66,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Command::Export(args) => export(&ctx, args),
         Command::Import(args) => import(&ctx, args),
         Command::Config(command) => set_config(ctx.config, command),
-        Command::Setup => setup(),
+        Command::Setup => setup(&ctx),
         Command::Sync(args) => sync(&ctx, args),
         Command::Status => status(&ctx),
         Command::Daemon(command) => crate::daemon::run(command),
@@ -767,10 +767,9 @@ fn set_config(mut config: Config, command: ConfigCommand) -> Result<(), String> 
     Ok(())
 }
 
-/// `syn setup` — write the daemon's config: the Turso orgs this machine replicates, one
-/// org-scoped token each. Per-machine scope is the security boundary: a personal machine
-/// simply never gets the work org's token.
-fn setup() -> Result<(), String> {
+/// `syn setup` — configure both sides of a replicated installation: the Turso orgs
+/// the daemon can reach and the machine-local routing that selects a workspace.
+fn setup(ctx: &Context) -> Result<(), String> {
     let dir = daemon_client::state_dir()?;
     let path = daemon_client::config_path(&dir);
     if path.exists() {
@@ -793,23 +792,158 @@ fn setup() -> Result<(), String> {
     if orgs.is_empty() {
         return Err("no orgs given; setup unchanged".to_string());
     }
-    let config = DaemonConfig {
+
+    let mut workspaces = crate::turso::list_workspaces(
+        orgs.iter()
+            .map(|org| (org.name.as_str(), org.token.as_str())),
+    )?;
+    let create_workspace = if workspaces.is_empty() {
+        let name = prompt("no workspace databases found; first workspace [personal]: ")?;
+        let name = if name.is_empty() {
+            "personal".to_string()
+        } else {
+            resolve::validate_workspace(&name)?
+        };
+        workspaces.push(name.clone());
+        Some(name)
+    } else {
+        println!("discovered workspaces: {}", workspaces.join(", "));
+        None
+    };
+
+    let current_owner = ctx
+        .facts()
+        .ok()
+        .flatten()
+        .and_then(|facts| facts.owner.as_deref());
+    println!(
+        "Configure local workspace routing. Source-control org rules decide where repository saves go."
+    );
+    let cli_config =
+        configure_workspace_routing(&ctx.config, &workspaces, current_owner, |label| {
+            prompt(label)
+        })?;
+    let daemon_config = DaemonConfig {
         scoped_orgs: orgs,
         auto_update: None,
     };
+
     crate::config::private_dir(&dir)?;
-    crate::config::write_private(&path, config.to_toml()?.as_bytes())?;
+    crate::config::write_private(&path, daemon_config.to_toml()?.as_bytes())?;
+    cli_config.save()?;
     println!("wrote {}", path.display());
+    println!(
+        "CLI transport set to daemon; default workspace is {}",
+        cli_config.default_workspace.as_deref().unwrap_or_default()
+    );
+
     // The daemon reads its config once at boot; a live one keeps serving the old orgs.
     let probe = DaemonClient::new(daemon_client::socket_path(&dir), Duration::from_secs(1));
-    if probe.ping().is_ok() {
+    let running = probe.ping().is_ok();
+    if running {
         println!(
             "a daemon is running with the previous config; restart it to pick this up: \
              pkill synd (the next syn command starts it again)"
         );
     }
-    println!("switch the CLI over with: syn config set-transport daemon");
+    if let Some(workspace) = create_workspace {
+        if running {
+            return Err(format!(
+                "restart the daemon, then create the first workspace with: \
+                 syn workspace create {workspace}"
+            ));
+        }
+        daemon_client::ensure_running(&probe, &dir)?;
+        let created = probe
+            .create_workspace(&workspace)
+            .map_err(|e| e.to_string())?;
+        println!("workspace {} ready", created.workspace);
+    }
     Ok(())
+}
+
+fn configure_workspace_routing(
+    existing: &Config,
+    workspaces: &[String],
+    current_owner: Option<&str>,
+    mut ask: impl FnMut(&str) -> Result<String, String>,
+) -> Result<Config, String> {
+    let mut config = existing.clone();
+    config.transport = Some(Transport::Daemon);
+    let default = match existing
+        .default_workspace
+        .as_deref()
+        .filter(|name| workspaces.iter().any(|workspace| workspace == name))
+    {
+        Some(name) => name.to_string(),
+        None if workspaces.len() == 1 => workspaces[0].clone(),
+        None => {
+            let answer = ask(&format!("default workspace ({}): ", workspaces.join(", ")))?;
+            choose_workspace(&answer, None, workspaces)?
+        }
+    };
+    config.default_workspace = Some(default.clone());
+
+    if let Some(owner) = current_owner
+        && !config
+            .org_rules
+            .iter()
+            .any(|rule| rule.org.eq_ignore_ascii_case(owner))
+    {
+        let answer = ask(&format!(
+            "workspace for current source-control org {owner} [{default}]: "
+        ))?;
+        let workspace = choose_workspace(&answer, Some(&default), workspaces)?;
+        upsert_org_rule(&mut config, owner, &workspace);
+    }
+
+    loop {
+        let org = ask("source-control org slug (empty to finish): ")?;
+        if org.is_empty() {
+            break;
+        }
+        let org = resolve::validate_org(&org)?;
+        let suggested = config
+            .org_rules
+            .iter()
+            .find(|rule| rule.org.eq_ignore_ascii_case(&org))
+            .map(|rule| rule.workspace.as_str())
+            .unwrap_or(&default);
+        let answer = ask(&format!("workspace for {org} [{suggested}]: "))?;
+        let workspace = choose_workspace(&answer, Some(suggested), workspaces)?;
+        upsert_org_rule(&mut config, &org, &workspace);
+    }
+    Ok(config)
+}
+
+fn choose_workspace(
+    answer: &str,
+    default: Option<&str>,
+    workspaces: &[String],
+) -> Result<String, String> {
+    let selected = if answer.is_empty() {
+        default.ok_or_else(|| "a default workspace is required; setup unchanged".to_string())?
+    } else {
+        answer
+    };
+    let selected = resolve::validate_workspace(selected)?;
+    if !workspaces.iter().any(|workspace| workspace == &selected) {
+        return Err(format!(
+            "workspace {selected} was not found; choose one of: {}",
+            workspaces.join(", ")
+        ));
+    }
+    Ok(selected)
+}
+
+fn upsert_org_rule(config: &mut Config, org: &str, workspace: &str) {
+    config
+        .org_rules
+        .retain(|rule| !rule.org.eq_ignore_ascii_case(org));
+    config.org_rules.push(OrgRule {
+        org: org.to_string(),
+        workspace: workspace.to_string(),
+    });
 }
 
 /// Offer to trade the pasted token for a fresh machine-scoped one, so the long-lived
@@ -931,7 +1065,10 @@ fn print_statuses(statuses: Vec<api::rpc::WorkspaceStatus>) {
 
 #[cfg(test)]
 mod tests {
-    use super::age;
+    use std::collections::VecDeque;
+
+    use super::{age, configure_workspace_routing};
+    use crate::config::{Config, Transport};
 
     #[test]
     fn age_reads_in_the_largest_useful_unit() {
@@ -939,5 +1076,88 @@ mod tests {
         assert_eq!(age(95_000, 5_000), "1m ago");
         assert_eq!(age(7_205_000, 5_000), "2h ago");
         assert_eq!(age(172_805_000, 5_000), "2d ago");
+    }
+
+    #[test]
+    fn fresh_setup_selects_a_default_and_routes_source_control_orgs() {
+        let mut answers: VecDeque<String> = [
+            "work",
+            "personal",
+            "freshaengineering",
+            "work",
+            "surgeventures",
+            "work",
+            "",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let config = configure_workspace_routing(
+            &Config::default(),
+            &["personal".into(), "work".into()],
+            Some("benediktms"),
+            |_| Ok(answers.pop_front().expect("prompt has an answer")),
+        )
+        .unwrap();
+
+        assert_eq!(config.transport, Some(Transport::Daemon));
+        assert_eq!(config.default_workspace.as_deref(), Some("work"));
+        let routes: Vec<_> = config
+            .org_rules
+            .iter()
+            .map(|rule| (rule.org.as_str(), rule.workspace.as_str()))
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                ("benediktms", "personal"),
+                ("freshaengineering", "work"),
+                ("surgeventures", "work")
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_preserves_valid_existing_routing_without_reasking_for_it() {
+        let existing: Config = toml::from_str(
+            r#"
+                transport = "http"
+                default_workspace = "personal"
+                [[org_rules]]
+                org = "benediktms"
+                workspace = "personal"
+            "#,
+        )
+        .unwrap();
+        let mut answers = VecDeque::from(["".to_string()]);
+        let config = configure_workspace_routing(
+            &existing,
+            &["personal".into(), "work".into()],
+            Some("benediktms"),
+            |_| Ok(answers.pop_front().expect("only the additional-org prompt")),
+        )
+        .unwrap();
+
+        assert_eq!(config.transport, Some(Transport::Daemon));
+        assert_eq!(config.default_workspace.as_deref(), Some("personal"));
+        assert_eq!(config.org_rules.len(), 1);
+        assert_eq!(config.org_rules[0].org, "benediktms");
+    }
+
+    #[test]
+    fn setup_rejects_a_default_that_turso_did_not_return() {
+        let mut answers = VecDeque::from(["missing".to_string()]);
+        let error = configure_workspace_routing(
+            &Config::default(),
+            &["personal".into(), "work".into()],
+            None,
+            |_| Ok(answers.pop_front().unwrap()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "workspace missing was not found; choose one of: personal, work"
+        );
     }
 }
