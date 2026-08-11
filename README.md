@@ -4,6 +4,24 @@ Centralised agent memory. One server process owns the SQLite files, the embeddin
 and all business rules; the `syn` CLI is a thin client whose only local state is a config
 file and an offline outbox.
 
+## Local daemon durability
+
+The local daemon treats Turso as the source of truth. Its embedded replicas are read
+caches: reads run locally, while every mutation is sent to the primary and returns
+success only after the primary commits it. `syn sync` only pulls committed primary
+frames into those caches.
+
+Offline saves remain durable without weakening that guarantee. Before contacting the
+daemon, `syn save` writes the complete request to the CLI outbox. A transport or primary
+failure leaves it queued and reports that it is not yet recallable; the next read command
+tries to flush it. Inspect unresolved items with `syn list --pending`.
+
+When upgrading a machine from a local-write replica build, first stop its daemon and
+archive every replica file and sidecar before running any `syn` read or export command.
+Confirm that the primary contains every acknowledged memory, then remove the old replica
+files and let the remote-first daemon pull fresh caches. This avoids treating a stale
+local WAL as authoritative during the cutover.
+
 ## Running the server
 
 ```sh

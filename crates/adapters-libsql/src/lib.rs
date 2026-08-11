@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use domain::{
     EditRequest, Error, Link, Memory, MemoryId, MemoryKind, Relation, Scope, ScopeFilter, Store,
@@ -59,19 +59,17 @@ pub struct LibsqlStore {
     last_sync_ok: std::sync::atomic::AtomicU64,
     /// Whether the last sync reached the primary (network was up).
     connected: std::sync::atomic::AtomicBool,
-    /// Local writes since the last successful sync (offline outbox backlog proxy).
-    dirty: std::sync::atomic::AtomicU64,
     /// What the last failed sync said, so status can name an auth failure instead of
     /// letting it masquerade as a network outage.
     last_error: std::sync::Mutex<Option<String>>,
 }
 
 impl LibsqlStore {
-    /// Open (or create) an offline-writable embedded replica of a Turso primary.
+    /// Open (or create) a remote-first embedded replica of a Turso primary.
     ///
-    /// Syncs before the first local write: schema frames written first would read as
-    /// a divergent push into a primary that already has history, wedging the replica.
-    /// A wedged replica with no user data is rebuilt from the primary instead.
+    /// Reads use the local replica. Mutations are committed by the primary before
+    /// returning and then reflected locally, so an acknowledged write is visible to
+    /// every machine after its next pull. The CLI's durable outbox owns offline saves.
     pub async fn open(
         path: impl AsRef<Path>,
         url: String,
@@ -79,20 +77,14 @@ impl LibsqlStore {
         embedding_model: &str,
         embedding_dim: usize,
     ) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let db = Builder::new_synced_database(path, url.clone(), auth_token.clone())
+        let db = Builder::new_remote_replica(path, url, auth_token)
+            .read_your_writes(true)
             .build()
             .await
             .map_err(store_err)?;
-        let db = match db.sync().await {
-            Ok(_) => db,
-            Err(e) if is_divergent_push(&e) && replica_holds_no_memories(&db).await => {
-                drop(db);
-                rebuild_and_pull(path, &url, &auth_token).await?
-            }
-            // Fail open: the background sync retries, and `syn status` reports the error.
-            Err(_) => db,
-        };
+        // Fail open for an existing replica: reads remain available and the background
+        // sync retries. A fresh replica still needs the primary to initialize its schema.
+        let _ = db.sync().await;
         Self::init(db, embedding_model, embedding_dim).await
     }
 
@@ -139,15 +131,12 @@ impl LibsqlStore {
             dim: embedding_dim,
             last_sync_ok: std::sync::atomic::AtomicU64::new(0),
             connected: std::sync::atomic::AtomicBool::new(false),
-            dirty: std::sync::atomic::AtomicU64::new(0),
             last_error: std::sync::Mutex::new(None),
         })
     }
 
-    /// Push local WAL frames (outbox) to the primary and pull remote frames down.
-    /// On the synced-database path an unreachable remote surfaces as Err (verified
-    /// against Turso Cloud 2026-08-08; frame numbers are a remote-replica concept and
-    /// stay None here even on success), so Ok is the reached signal.
+    /// Pull committed primary frames into the local read replica.
+    /// Mutations already reached the primary before their Store operation returned.
     pub async fn sync(&self) -> Result<(), Error> {
         match self.db.sync().await {
             Ok(_) => {
@@ -159,7 +148,6 @@ impl LibsqlStore {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 self.last_sync_ok
                     .store(now, std::sync::atomic::Ordering::Relaxed);
-                self.dirty.store(0, std::sync::atomic::Ordering::Relaxed);
                 *self.last_error.lock().expect("last_error lock") = None;
                 Ok(())
             }
@@ -173,11 +161,6 @@ impl LibsqlStore {
         }
     }
 
-    fn mark_dirty(&self) {
-        self.dirty
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// Unix seconds of the last successful sync (0 if none).
     pub fn last_synced_at(&self) -> u64 {
         self.last_sync_ok.load(std::sync::atomic::Ordering::Relaxed)
@@ -186,11 +169,6 @@ impl LibsqlStore {
     /// Whether the last sync reached the primary.
     pub fn online(&self) -> bool {
         self.connected.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Local writes not yet pushed to the primary (offline outbox backlog proxy).
-    pub fn pending_outbox(&self) -> usize {
-        self.dirty.load(std::sync::atomic::Ordering::Relaxed) as usize
     }
 
     /// What the last failed sync said; None after a successful sync.
@@ -275,7 +253,6 @@ impl Store for LibsqlStore {
             .await
             .map_err(store_err)?;
         if affected == 1 {
-            self.mark_dirty();
             return Ok(());
         }
         let existing = self
@@ -341,7 +318,6 @@ impl Store for LibsqlStore {
         if affected == 0 {
             return Err(Error::NotFound(id.clone()));
         }
-        self.mark_dirty();
         self.get(id)
             .await?
             .ok_or_else(|| Error::NotFound(id.clone()))
@@ -353,9 +329,6 @@ impl Store for LibsqlStore {
             .execute("DELETE FROM memories WHERE id = ?", params![id.as_str()])
             .await
             .map_err(store_err)?;
-        if affected > 0 {
-            self.mark_dirty();
-        }
         Ok(affected > 0)
     }
 
@@ -435,20 +408,16 @@ impl Store for LibsqlStore {
             return Err(Error::NotFound(canonical.target));
         }
         let conn = self.conn()?;
-        let affected = conn
-            .execute(
-                "INSERT OR IGNORE INTO links (low_id, high_id, relation) VALUES (?, ?, ?)",
-                params![
-                    canonical.source.as_str(),
-                    canonical.target.as_str(),
-                    canonical.relation.as_str(),
-                ],
-            )
-            .await
-            .map_err(store_err)?;
-        if affected > 0 {
-            self.mark_dirty();
-        }
+        conn.execute(
+            "INSERT OR IGNORE INTO links (low_id, high_id, relation) VALUES (?, ?, ?)",
+            params![
+                canonical.source.as_str(),
+                canonical.target.as_str(),
+                canonical.relation.as_str(),
+            ],
+        )
+        .await
+        .map_err(store_err)?;
         Ok(())
     }
 
@@ -461,9 +430,6 @@ impl Store for LibsqlStore {
             )
             .await
             .map_err(store_err)?;
-        if affected > 0 {
-            self.mark_dirty();
-        }
         usize::try_from(affected).map_err(store_err)
     }
 
@@ -593,63 +559,6 @@ async fn scalar(conn: &Connection, sql: &str) -> Result<i64, Error> {
         .map_err(store_err)?
         .ok_or_else(|| Error::Store("scalar query returned no rows".into()))?;
     row.get::<i64>(0).map_err(store_err)
-}
-
-/// True when the primary rejected the replica's frames, rather than being unreachable.
-fn is_divergent_push(err: &libsql::Error) -> bool {
-    match err {
-        libsql::Error::Sync(inner) => is_divergent_message(&inner.to_string()),
-        _ => false,
-    }
-}
-
-/// libsql hides the error variant, so this matches its message text (libsql 0.9.30 pinned).
-fn is_divergent_message(msg: &str) -> bool {
-    // SyncError::InvalidPushFrameNoHigh / InvalidPushFrameConflict.
-    msg.contains("server returned a higher frame_no") || msg.contains("server returned a conflict")
-}
-
-/// True when the replica holds no memories, so a rebuild cannot lose data.
-async fn replica_holds_no_memories(db: &Database) -> bool {
-    let conn = match db.connect() {
-        Ok(conn) => conn,
-        Err(_) => return true,
-    };
-    matches!(scalar(&conn, "SELECT COUNT(*) FROM memories").await, Ok(0))
-}
-
-/// Delete a replica's files and pull a fresh copy from the primary.
-async fn rebuild_and_pull(path: &Path, url: &str, auth_token: &str) -> Result<Database, Error> {
-    remove_replica_files(path)?;
-    let db = Builder::new_synced_database(path, url.to_string(), auth_token.to_string())
-        .build()
-        .await
-        .map_err(store_err)?;
-    db.sync()
-        .await
-        .map_err(|e| store_err(format!("pulling rebuilt replica {}: {e}", path.display())))?;
-    Ok(db)
-}
-
-/// Remove every file a replica can own: the database, its WAL/journal/shm sidecars, and
-/// libsql's replica-state info file. Misses are not errors — the sidecars don't always exist.
-fn remove_replica_files(path: &Path) -> Result<(), Error> {
-    for suffix in ["", "-wal", "-shm", "-journal", "-info"] {
-        let mut name = path.as_os_str().to_os_string();
-        name.push(suffix);
-        let file = PathBuf::from(name);
-        match std::fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(store_err(format!(
-                    "cannot remove wedged replica {}: {e}",
-                    file.display()
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn encode_embedding(embedding: &[f32], dim: usize) -> Result<Vec<u8>, Error> {
@@ -921,7 +830,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn offline_roundtrip() {
+    async fn local_sql_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replica.db");
         // A plain local libSQL DB (same engine, same Connection API, no replication) exercises
@@ -941,9 +850,7 @@ mod tests {
         };
         let embedding = vec![0.1f32, 0.2, 0.3, 0.4];
         store.insert(&memory, &embedding).await.unwrap();
-        assert_eq!(store.pending_outbox(), 1, "a real write counts as pending");
         store.insert(&memory, &embedding).await.unwrap();
-        assert_eq!(store.pending_outbox(), 1, "an idempotent re-save does not");
         let got = store.get(&memory.id).await.unwrap().unwrap();
         assert_eq!(got.content, memory.content);
         assert_eq!(got.tags, memory.tags);
@@ -970,71 +877,13 @@ mod tests {
         assert_eq!(decode_embedding(&blob, 4).unwrap(), original);
     }
 
-    #[test]
-    fn divergent_message_matches_the_libsql_wording_we_depend_on() {
-        // The heal trigger keys off libsql's two push-rejection messages (0.9.30),
-        // because the error variant is unreachable from outside the crate.
-        assert!(is_divergent_message(
-            "server returned a higher frame_no: sent=1, got=233"
-        ));
-        assert!(is_divergent_message(
-            "server returned a conflict: sent=1, got=2"
-        ));
-        assert!(!is_divergent_message(
-            "failed to connect to primary: connection refused"
-        ));
-        assert!(!is_divergent_message(""));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn rebuild_guard_tracks_local_memories() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Builder::new_local(dir.path().join("r.db"))
-            .build()
-            .await
-            .unwrap();
-        let store = LibsqlStore::init(db, "test-model", 4).await.unwrap();
-        assert!(
-            replica_holds_no_memories(&store.db).await,
-            "schema alone must not block a rebuild"
-        );
-        let memory = test_memory(
-            "m_0000000000000000000001",
-            "a memory that only exists locally",
-        );
-        store.insert(&memory, &[0.0f32; 4]).await.unwrap();
-        assert!(
-            !replica_holds_no_memories(&store.db).await,
-            "a local memory must veto the rebuild"
-        );
-    }
-
-    #[test]
-    fn remove_replica_files_cleans_every_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("replica.db");
-        for suffix in ["", "-wal", "-shm", "-journal", "-info"] {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(suffix);
-            std::fs::write(PathBuf::from(name), b"x").unwrap();
-        }
-        remove_replica_files(&path).unwrap();
-        for suffix in ["", "-wal", "-shm", "-journal", "-info"] {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(suffix);
-            assert!(!PathBuf::from(name).exists(), "left behind {suffix:?} file");
-        }
-        remove_replica_files(&path).unwrap(); // idempotent on an already-clean state
-    }
-
-    /// End-to-end replication against real Turso Cloud: the sync-before-write happy
-    /// path, the old-order wedge heal, and the data-safety veto. Skips when
+    /// End-to-end remote-first replication against real Turso Cloud. Skips when
     /// `SYNAPSE_TURSO_TEST_TOKEN` (a platform API token) is unset, so `--ignored` runs
     /// stay usable without credentials. Provisions one throwaway database and deletes
     /// it afterwards.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires Turso Cloud credentials and network"]
-    async fn replicates_and_heals_against_turso_cloud() {
+    async fn remote_first_writes_against_turso_cloud() {
         let Some(token) = std::env::var("SYNAPSE_TURSO_TEST_TOKEN")
             .ok()
             .filter(|t| !t.is_empty())
@@ -1057,15 +906,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let scenario = turso_scenario(&dir, &db.url, &db_token).await;
         let cleanup = platform.delete_database(&org, &token, &name).await;
-        scenario.unwrap();
+        let store = scenario.unwrap();
         cleanup.unwrap();
+
+        // Once the primary is gone, a rejected mutation must not be acknowledged or
+        // appear in the local read replica.
+        let rejected = test_memory("m_0000000000000000000002", "must not exist locally");
+        assert!(
+            store.insert(&rejected, &[0.0f32; 4]).await.is_err(),
+            "an unavailable primary must reject the Store write"
+        );
+        assert!(
+            store.get(&rejected.id).await.unwrap().is_none(),
+            "a rejected write must not modify the local read replica"
+        );
     }
 
     async fn turso_scenario(
         dir: &tempfile::TempDir,
         url: &str,
         token: &str,
-    ) -> Result<(), domain::Error> {
+    ) -> Result<LibsqlStore, domain::Error> {
         let open = |name: &str| {
             LibsqlStore::open(
                 dir.path().join(name),
@@ -1076,59 +937,20 @@ mod tests {
             )
         };
 
-        // A fresh replica syncs before any local write, so its schema frames push into
-        // the empty primary cleanly; the memory then reaches the primary on sync.
         let store_a = open("a.db").await?;
         let memory = test_memory("m_0000000000000000000001", "turso replication smoke test");
         store_a.insert(&memory, &[0.1f32, 0.2, 0.3, 0.4]).await?;
-        store_a.sync().await?;
-        assert!(store_a.online(), "write side reached the primary");
 
-        // A second fresh replica must pull the populated primary before writing
-        // anything. This is the regression: schema-before-first-sync pushes rejected
-        // frames and wedges the replica at zero rows.
+        // No explicit sync on store_a: a second replica can pull the memory because the
+        // insert committed on the primary before it returned.
         let store_b = open("b.db").await?;
         let got = store_b
             .get(&memory.id)
             .await?
-            .expect("memory replicated down");
+            .expect("acknowledged write reached the primary");
         assert_eq!(got.content, memory.content);
 
-        // A replica wedged by the old order (schema applied, never synced) holds no
-        // user data, so open() rebuilds it from the primary and the memory appears.
-        let wedged = Builder::new_synced_database(
-            dir.path().join("c.db"),
-            url.to_string(),
-            token.to_string(),
-        )
-        .build()
-        .await
-        .map_err(store_err)?;
-        LibsqlStore::init(wedged, "test-model", 4).await?; // the old write-first order
-        let store_c = open("c.db").await?;
-        let got = store_c
-            .get(&memory.id)
-            .await?
-            .expect("wedged replica healed");
-        assert_eq!(got.content, memory.content);
-
-        // A wedged replica holding a local write is never rebuilt: open() fails open
-        // and the local memory survives.
-        let local = test_memory("m_0000000000000000000002", "only exists locally");
-        let wedged = Builder::new_synced_database(
-            dir.path().join("d.db"),
-            url.to_string(),
-            token.to_string(),
-        )
-        .build()
-        .await
-        .map_err(store_err)?;
-        let store_d = LibsqlStore::init(wedged, "test-model", 4).await?;
-        store_d.insert(&local, &[0.0f32; 4]).await?;
-        let store_d = open("d.db").await?;
-        let got = store_d.get(&local.id).await?.expect("local write survives");
-        assert_eq!(got.content, local.content);
-        Ok(())
+        Ok(store_a)
     }
 
     fn test_memory(id: &str, content: &str) -> Memory {

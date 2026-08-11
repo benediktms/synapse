@@ -522,6 +522,21 @@ mod tests {
     }
 
     #[test]
+    fn internal_rpc_failures_remain_retryable_for_the_cli_outbox() {
+        let failure = DaemonError::Rpc {
+            code: -32000,
+            message: "primary unavailable".into(),
+        };
+        assert!(failure.is_retryable());
+
+        let conflict = DaemonError::Rpc {
+            code: -32002,
+            message: "memory already exists with different content".into(),
+        };
+        assert!(!conflict.is_retryable());
+    }
+
+    #[test]
     fn daemon_config_roundtrips_through_toml() {
         let config = DaemonConfig {
             scoped_orgs: vec![ScopedOrg {

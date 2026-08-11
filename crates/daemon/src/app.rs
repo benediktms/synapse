@@ -20,8 +20,8 @@ use api::rpc::WorkspaceStatus;
 
 use crate::rpc::RpcHost;
 
-/// Bound on the network-first sync attempted before freshness-sensitive reads and after
-/// writes. On timeout or failure the operation falls back to the local replica as-is.
+/// Bound on the pull attempted before freshness-sensitive reads and after writes. On
+/// timeout or failure, reads use the local replica; Store mutations still fail.
 const SYNC_BOUND: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
@@ -171,8 +171,8 @@ impl DaemonApp {
         Ok(binding)
     }
 
-    /// Network-first sync bounded by SYNC_BOUND; offline or slow degrades to the local
-    /// replica without failing the surrounding operation.
+    /// Pull remote commits within SYNC_BOUND. Failure leaves cached reads available
+    /// without weakening the remote-first mutation contract.
     async fn freshen(&self, store: &LibsqlStore) {
         match tokio::time::timeout(SYNC_BOUND, store.sync()).await {
             Ok(Ok(())) => {}
@@ -213,7 +213,6 @@ impl RpcHost for DaemonApp {
                 name: ws.to_string(),
                 online: store.online(),
                 last_synced_at: store.last_synced_at(),
-                pending_outbox: store.pending_outbox(),
                 error: store.last_sync_error(),
             })
             .collect();
