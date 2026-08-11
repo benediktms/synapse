@@ -71,6 +71,10 @@ impl LibsqlStore {
     /// Reads use the local replica. Mutations are committed by the primary before
     /// returning and then reflected locally, so an acknowledged write is visible to
     /// every machine after its next pull. The CLI's durable outbox owns offline saves.
+    ///
+    /// A replica that fails `corruption` is discarded and pulled again rather than served.
+    /// Remote-first writes are what make that safe: the file holds nothing the primary does
+    /// not already have, so the rebuild costs a pull and never data.
     pub async fn open(
         path: impl AsRef<Path>,
         url: String,
@@ -78,14 +82,33 @@ impl LibsqlStore {
         embedding_model: &str,
         embedding_dim: usize,
     ) -> Result<Self, Error> {
-        let db = Builder::new_remote_replica(path, url, auth_token)
-            .read_your_writes(true)
-            .build()
-            .await
-            .map_err(store_err)?;
+        let path = path.as_ref();
+        let build = async |path: &Path| {
+            Builder::new_remote_replica(path, url.clone(), auth_token.clone())
+                .read_your_writes(true)
+                .build()
+                .await
+                .map_err(store_err)
+        };
+        let db = build(path).await?;
         // Fail open for an existing replica: reads remain available and the background
         // sync retries. A fresh replica still needs the primary to initialize its schema.
         let _ = db.sync().await;
+
+        if let Some(damage) = corruption(&db).await {
+            tracing::warn!("rebuilding {}: {damage}", path.display());
+            drop(db);
+            remove_replica_files(path)?;
+            let db = build(path).await?;
+            db.sync().await.map_err(|e| {
+                store_err(format!(
+                    "replica {} is corrupt ({damage}) and the primary could not be \
+                     reached to rebuild it: {e}",
+                    path.display()
+                ))
+            })?;
+            return Self::init(db, embedding_model, embedding_dim).await;
+        }
         Self::init(db, embedding_model, embedding_dim).await
     }
 
@@ -523,6 +546,49 @@ async fn links_from_rows(rows: &mut libsql::Rows) -> Result<Vec<Link>, Error> {
         });
     }
     Ok(out)
+}
+
+/// What `PRAGMA quick_check` complains about, or None when the replica is sound. Cheaper than
+/// `integrity_check` — it skips the index-versus-table cross-check — and it still catches the
+/// out-of-order rowids that make a whole-table scan repeat and skip rows. A replica too broken
+/// to answer the pragma at all counts as damaged, which is the point.
+async fn corruption(db: &Database) -> Option<String> {
+    let conn = match db.connect() {
+        Ok(conn) => conn,
+        Err(e) => return Some(e.to_string()),
+    };
+    let mut rows = match conn.query("PRAGMA quick_check(1)", params![]).await {
+        Ok(rows) => rows,
+        Err(e) => return Some(e.to_string()),
+    };
+    match rows.next().await {
+        Ok(Some(row)) => match row.get::<String>(0) {
+            Ok(verdict) if verdict == "ok" => None,
+            Ok(verdict) => Some(verdict),
+            Err(e) => Some(e.to_string()),
+        },
+        Ok(None) => Some("quick_check returned no verdict".to_string()),
+        Err(e) => Some(e.to_string()),
+    }
+}
+
+fn remove_replica_files(path: &Path) -> Result<(), Error> {
+    for suffix in ["", "-wal", "-shm", "-journal", "-info"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let file = std::path::PathBuf::from(name);
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(store_err(format!(
+                    "cannot remove corrupt replica {}: {e}",
+                    file.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn ensure_schema(conn: &Connection) -> Result<(), Error> {
@@ -993,6 +1059,65 @@ mod tests {
         assert_eq!(reopened.get(&id).await.unwrap().unwrap().title, "Old fact");
     }
 
+    /// Overwrite the interior of every file the replica reads, leaving each header intact, so
+    /// they still open and still answer queries but the b-tree no longer holds — the shape the
+    /// real damage took. The WAL is overwritten rather than deleted on purpose: a missing WAL
+    /// reads as a clean replica, and a corrupt one is the case under test.
+    fn damage_pages(path: &Path) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut damaged_any = false;
+        for suffix in ["", "-wal"] {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            let file_path = std::path::PathBuf::from(name);
+            let Ok(mut file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file_path)
+            else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            let from = 4096.min(bytes.len() / 2);
+            if bytes.len() <= from + 512 {
+                continue;
+            }
+            file.seek(SeekFrom::Start(from as u64)).unwrap();
+            file.write_all(&vec![0x5A; bytes.len() - from]).unwrap();
+            file.flush().unwrap();
+            damaged_any = true;
+        }
+        assert!(damaged_any, "nothing to damage at {}", path.display());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_check_names_the_damage_and_passes_a_sound_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.db");
+        let db = libsql::Builder::new_local(&path).build().await.unwrap();
+        let store = LibsqlStore::init(db, "test-model", 4).await.unwrap();
+        for n in 0..40 {
+            let memory = test_memory(&format!("m_{n:022}"), &format!("fact number {n}"));
+            store
+                .insert(&memory, &[0.1f32, 0.2, 0.3, 0.4])
+                .await
+                .unwrap();
+        }
+        drop(store);
+
+        let sound = libsql::Builder::new_local(&path).build().await.unwrap();
+        assert_eq!(corruption(&sound).await, None, "a sound replica must pass");
+        drop(sound);
+
+        damage_pages(&path);
+        let broken = libsql::Builder::new_local(&path).build().await.unwrap();
+        assert!(
+            corruption(&broken).await.is_some(),
+            "a damaged replica must be reported, not served"
+        );
+    }
+
     #[test]
     fn escape_quotes_each_whitespace_token() {
         assert_eq!(
@@ -1194,6 +1319,16 @@ mod tests {
             .await?
             .expect("acknowledged write reached the primary");
         assert_eq!(got.content, memory.content);
+
+        drop(store_b);
+        remove_replica_files(&dir.path().join("b.db"))?;
+        let rebuilt = open("b.db").await?;
+        assert_eq!(
+            rebuilt.get(&memory.id).await?.map(|m| m.content),
+            Some(memory.content.clone()),
+            "the rebuilt replica lost the memory"
+        );
+        assert_eq!(rebuilt.list().await?.len(), 1);
 
         Ok(store_a)
     }
