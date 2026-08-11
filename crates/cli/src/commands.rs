@@ -158,7 +158,7 @@ fn flush_before_read(ctx: &Context) {
         eprintln!("note: {id} moved to dead-letter: {failure}");
     }
     for (id, failure) in &report.rejected {
-        eprintln!("note: {id} dropped, the server refused it: {failure}");
+        eprintln!("note: {id} dropped as invalid: {failure}");
     }
     if report.still_queued > 0 {
         let reason = report.deferred.as_deref().unwrap_or("still unsent");
@@ -316,7 +316,7 @@ fn report_backlog(report: &FlushReport) {
         eprintln!("note: {id} moved to dead-letter: {failure}");
     }
     for (id, failure) in &report.rejected {
-        eprintln!("note: {id} dropped, the server refused it: {failure}");
+        eprintln!("note: {id} dropped as invalid: {failure}");
     }
 }
 
