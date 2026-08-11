@@ -24,6 +24,9 @@ const CANDIDATE_DEPTH: usize = 50;
 pub struct SaveRequest {
     pub id: MemoryId,
     pub content: String,
+    /// Some: the caller sets an explicit title (conflict if it differs); None: keep the stored
+    /// title on an existing idempotent save, and derive the short form on a true create.
+    pub title: Option<String>,
     pub kind: MemoryKind,
     pub scope: Scope,
     pub tags: Vec<String>,
@@ -46,6 +49,7 @@ pub async fn save<S: Store, E: Embedder>(
 ) -> Result<SaveOutcome, Error> {
     if let Some(existing) = store.get(&req.id).await? {
         let same_payload = existing.content == req.content
+            && req.title.as_ref().is_none_or(|t| existing.title == *t)
             && existing.kind == req.kind
             && existing.scope == req.scope
             && existing.tags == req.tags
@@ -58,10 +62,20 @@ pub async fn save<S: Store, E: Embedder>(
             Err(Error::Conflict(req.id))
         };
     }
-    let embedding = embedder.embed(&req.content).await?;
+    // Creating is where the rule bites: a new memory must carry a title. Re-saving an existing
+    // one may omit it (the stored title stands), and `restore` never comes through here, so a
+    // dump written before titles existed still imports.
+    let title = req.title.unwrap_or_default();
+    if title.is_empty() {
+        return Err(Error::MissingTitle(req.id));
+    }
+    let embedding = embedder
+        .embed(&crate::memory::embed_text(&title, &req.content))
+        .await?;
     let memory = Memory {
         id: req.id,
         content: req.content,
+        title,
         kind: req.kind,
         scope: req.scope,
         tags: req.tags,
@@ -77,6 +91,8 @@ pub async fn save<S: Store, E: Embedder>(
 #[derive(Clone, Debug, Default)]
 pub struct EditRequest {
     pub content: Option<String>,
+    /// Replace the short level-of-detail form; an empty string clears it back to derived.
+    pub title: Option<String>,
     pub tags: Option<Vec<String>>,
     pub pinned: Option<bool>,
     pub importance: Option<Importance>,
@@ -95,20 +111,31 @@ pub async fn edit<S: Store, E: Embedder>(
         .ok_or_else(|| Error::NotFound(id.clone()))?;
     let patch = EditRequest {
         content: req.content.filter(|content| *content != current.content),
+        title: req.title.filter(|title| *title != current.title),
         tags: req.tags.filter(|tags| *tags != current.tags),
         pinned: req.pinned.filter(|pinned| *pinned != current.pinned),
         importance: req.importance.filter(|tier| *tier != current.importance),
     };
     if patch.content.is_none()
+        && patch.title.is_none()
         && patch.tags.is_none()
         && patch.pinned.is_none()
         && patch.importance.is_none()
     {
         return Ok(current);
     }
-    let embedding = match &patch.content {
-        Some(content) => Some(embedder.embed(content).await?),
-        None => None,
+    // A title edit re-embeds too: the title is part of what a memory is embedded from, so
+    // leaving the old vector in place would make the new title unrecallable.
+    let embedding = if patch.content.is_some() || patch.title.is_some() {
+        let content = patch.content.as_deref().unwrap_or(&current.content);
+        let title = patch.title.as_deref().unwrap_or(&current.title);
+        Some(
+            embedder
+                .embed(&crate::memory::embed_text(title, content))
+                .await?,
+        )
+    } else {
+        None
     };
     store.update(id, &patch, embedding.as_deref(), &now).await
 }
@@ -866,6 +893,7 @@ mod tests {
         Memory {
             id: mid(n),
             content: content.to_string(),
+            title: String::new(),
             kind,
             scope,
             tags: Vec::new(),
@@ -915,10 +943,18 @@ mod tests {
         block_on(store.get(id)).unwrap().unwrap()
     }
 
+    const TEST_TITLE: &str = "A stated fact";
+
+    /// What `save` embeds for a `save_req` carrying this content.
+    fn saved_text(content: &str) -> String {
+        crate::memory::embed_text(TEST_TITLE, content)
+    }
+
     fn save_req(n: u32, content: &str) -> SaveRequest {
         SaveRequest {
             id: mid(n),
             content: content.to_string(),
+            title: Some(TEST_TITLE.to_string()),
             kind: MemoryKind::Project,
             scope: Scope::Workspace,
             tags: Vec::new(),
@@ -940,7 +976,7 @@ mod tests {
     #[test]
     fn save_creates_memory_with_embedding() {
         let store = FakeStore::new();
-        let embedder = FakeEmbedder::new().with("fact", vec![1.0, 0.0]);
+        let embedder = FakeEmbedder::new().with(&saved_text("fact"), vec![1.0, 0.0]);
         let outcome = block_on(save(&store, &embedder, save_req(1, "fact"), ts(1))).unwrap();
         let SaveOutcome::Created(memory) = outcome else {
             panic!("expected Created");
@@ -953,7 +989,7 @@ mod tests {
     #[test]
     fn save_with_same_payload_is_idempotent() {
         let store = FakeStore::new();
-        let embedder = FakeEmbedder::new().with("fact", vec![1.0, 0.0]);
+        let embedder = FakeEmbedder::new().with(&saved_text("fact"), vec![1.0, 0.0]);
         block_on(save(&store, &embedder, save_req(1, "fact"), ts(1))).unwrap();
         let outcome = block_on(save(&store, &embedder, save_req(1, "fact"), ts(2))).unwrap();
         assert!(matches!(outcome, SaveOutcome::Unchanged(_)));
@@ -962,12 +998,67 @@ mod tests {
         assert_eq!(stored.created_at, ts(1));
     }
 
+    /// A title is what recall shows, so it has to be what recall can match. `FakeEmbedder`
+    /// errors on any text it has no entry for, which makes the exact embedded string the
+    /// assertion — and the edit half proves a title-only change does not leave a stale vector.
+    #[test]
+    fn a_title_is_embedded_with_the_content_and_re_embedded_when_it_changes() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new()
+            .with("ArgoCD owns deploys\nfact", vec![1.0, 0.0])
+            .with("Deploys are ArgoCD's\nfact", vec![0.0, 1.0]);
+        let req = SaveRequest {
+            title: Some("ArgoCD owns deploys".to_string()),
+            ..save_req(1, "fact")
+        };
+        block_on(save(&store, &embedder, req, ts(1))).unwrap();
+        assert_eq!(store.embedding_of(&mid(1)), Some(vec![1.0, 0.0]));
+
+        let patch = EditRequest {
+            title: Some("Deploys are ArgoCD's".to_string()),
+            ..EditRequest::default()
+        };
+        let edited = block_on(edit(&store, &embedder, &mid(1), patch, ts(2))).unwrap();
+        assert_eq!(edited.title, "Deploys are ArgoCD's");
+        assert_eq!(
+            edited.content, "fact",
+            "a title edit leaves the content alone"
+        );
+        assert_eq!(store.embedding_of(&mid(1)), Some(vec![0.0, 1.0]));
+    }
+
+    /// An omitted title must not turn a replayed save into a conflict — an outbox entry
+    /// queued before titles existed carries none, and the memory it re-sends may have gained
+    /// one since.
+    #[test]
+    fn a_save_that_omits_the_title_leaves_a_stored_one_alone() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new()
+            .with("Titled\nfact", vec![1.0, 0.0])
+            .with("fact", vec![0.5, 0.5]);
+        let req = SaveRequest {
+            title: Some("Titled".to_string()),
+            ..save_req(1, "fact")
+        };
+        block_on(save(&store, &embedder, req, ts(1))).unwrap();
+        let replay = SaveRequest {
+            title: None,
+            ..save_req(1, "fact")
+        };
+        let outcome = block_on(save(&store, &embedder, replay, ts(2))).unwrap();
+        assert!(matches!(outcome, SaveOutcome::Unchanged(_)), "{outcome:?}");
+        assert_eq!(
+            block_on(store.get(&mid(1))).unwrap().unwrap().title,
+            "Titled"
+        );
+    }
+
     #[test]
     fn save_with_different_payload_conflicts() {
         let store = FakeStore::new();
         let embedder = FakeEmbedder::new()
-            .with("fact", vec![1.0, 0.0])
-            .with("other", vec![0.0, 1.0]);
+            .with(&saved_text("fact"), vec![1.0, 0.0])
+            .with(&saved_text("other"), vec![0.0, 1.0]);
         block_on(save(&store, &embedder, save_req(1, "fact"), ts(1))).unwrap();
         let err = block_on(save(&store, &embedder, save_req(1, "other"), ts(2))).unwrap_err();
         assert_eq!(err, Error::Conflict(mid(1)));

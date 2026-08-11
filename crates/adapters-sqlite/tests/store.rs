@@ -22,6 +22,7 @@ fn mem(id: &MemoryId, content: &str, scope: Scope) -> Memory {
     Memory {
         id: id.clone(),
         content: content.to_string(),
+        title: String::new(),
         kind: MemoryKind::Project,
         scope,
         tags: vec!["alpha".to_string(), "beta".to_string()],

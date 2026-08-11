@@ -29,7 +29,7 @@ pub enum Command {
     /// List memories, or queued saves with --pending
     List(ListArgs),
     /// Show a single memory
-    Show(IdArgs),
+    Show(ShowArgs),
     /// Dump the linked-neighbors graph around a memory as JSON (JGF v2)
     Links(LinksArgs),
     /// Link two memories as generically related (bidirectional)
@@ -123,7 +123,12 @@ fn tiers() -> Vec<clap::builder::PossibleValue> {
 
 #[derive(Debug, Args)]
 pub struct SaveArgs {
-    pub content: String,
+    /// The fact in full
+    #[arg(long)]
+    pub body: String,
+    /// One line stating the fact — this is all the session-start digest shows of it
+    #[arg(long)]
+    pub title: String,
     /// What kind of fact this is
     #[arg(long = "kind", visible_alias = "type", value_name = "KIND", value_parser = clap::builder::PossibleValuesParser::new(kinds()))]
     pub kind: String,
@@ -180,6 +185,8 @@ pub struct RecallArgs {
     /// Only surface linked neighbors within the recall's scope (default: cross-scope links surface)
     #[arg(long)]
     pub links_in_scope: bool,
+    #[command(flatten)]
+    pub detail: DetailArgs,
 }
 
 #[derive(Debug, Args)]
@@ -193,9 +200,12 @@ pub struct ContextArgs {
 #[derive(Debug, Args)]
 pub struct EditArgs {
     pub id: String,
-    /// New content (memory edit); may be combined with --relation/--type to also retype a link
+    /// Replace the fact in full; may be combined with --relation/--type to also retype a link
+    #[arg(long = "body", alias = "content")]
+    pub body: Option<String>,
+    /// Replace the one-line statement of the fact
     #[arg(long)]
-    pub content: Option<String>,
+    pub title: Option<String>,
     /// New importance tier for the memory
     #[arg(long, value_name = "TIER", value_parser = clap::builder::PossibleValuesParser::new(tiers()))]
     pub importance: Option<String>,
@@ -221,6 +231,31 @@ pub struct IdArgs {
     pub id: String,
     #[command(flatten)]
     pub store: StoreArgs,
+}
+
+/// How much of a memory to print. `short` is its title, or the one derived from its content;
+/// `full` is the whole content. The session-start digest is always short.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Detail {
+    Short,
+    #[default]
+    Full,
+}
+
+#[derive(Debug, Args)]
+pub struct ShowArgs {
+    pub id: String,
+    #[command(flatten)]
+    pub detail: DetailArgs,
+    #[command(flatten)]
+    pub store: StoreArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct DetailArgs {
+    /// How much of each memory to print
+    #[arg(long, value_enum, default_value_t = Detail::Full)]
+    pub detail: Detail,
 }
 
 #[derive(Debug, Args)]
@@ -288,6 +323,8 @@ pub struct ListArgs {
     /// Restrict --reassign/--discard to one memory id
     #[arg(long, requires = "pending")]
     pub id: Option<String>,
+    #[command(flatten)]
+    pub detail: DetailArgs,
 }
 
 #[derive(Debug, Args)]
@@ -336,35 +373,39 @@ pub enum ConfigCommand {
 mod tests {
     use super::*;
 
+    fn save_from(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["syn", "save", "--body", "a fact", "--kind", "user"];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv)
+    }
+
     #[test]
     fn importance_flag_accepts_only_domain_tiers() {
-        let cli = Cli::try_parse_from([
-            "syn",
-            "save",
-            "--kind",
-            "user",
-            "--importance",
-            "high",
-            "a fact",
-        ])
-        .expect("a domain tier must parse");
+        let cli = save_from(&["--title", "A title", "--importance", "high"])
+            .expect("a domain tier must parse");
         let Command::Save(args) = cli.command else {
             panic!("expected save")
         };
         assert_eq!(args.importance.as_deref(), Some("high"));
 
         assert!(
-            Cli::try_parse_from([
-                "syn",
-                "save",
-                "--kind",
-                "user",
-                "--importance",
-                "urgent",
-                "a fact",
-            ])
-            .is_err(),
+            save_from(&["--title", "A title", "--importance", "urgent"]).is_err(),
             "an unknown tier must be rejected by clap"
         );
+    }
+
+    /// A derived title is a fallback for memories written before titles existed, never a
+    /// substitute for one on a new memory — so clap refuses the save rather than inferring.
+    #[test]
+    fn saving_without_a_title_is_refused_before_anything_is_sent() {
+        let err = save_from(&[]).expect_err("a save with no title must not parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--title"), "{err}");
+
+        let cli = save_from(&["--title", "Deploys use ArgoCD"]).expect("a titled save parses");
+        let Command::Save(args) = cli.command else {
+            panic!("expected save")
+        };
+        assert_eq!(args.title, "Deploys use ArgoCD");
     }
 }

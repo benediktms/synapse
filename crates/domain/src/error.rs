@@ -13,6 +13,9 @@ pub enum Error {
     InvalidScope(String),
     NotFound(MemoryId),
     Conflict(MemoryId),
+    /// A new memory arrived without a title. Restoring a dump is exempt: memories written
+    /// before titles existed keep deriving one, and a backup has to stay importable.
+    MissingTitle(MemoryId),
     /// A supersession edge would close a cycle in the supersession relation.
     Cycle(MemoryId, MemoryId),
     /// Retyping an edge between two memories was ambiguous because several typed edges coexist.
@@ -33,6 +36,11 @@ impl fmt::Display for Error {
             Error::InvalidScope(scope) => write!(f, "invalid scope: {scope:?}"),
             Error::NotFound(id) => write!(f, "memory {id} not found"),
             Error::Conflict(id) => write!(f, "memory {id} already exists with different payload"),
+            Error::MissingTitle(id) => write!(
+                f,
+                "memory {id} needs a title: one line that states the fact, written by whoever \
+                 knows it rather than cut from the content"
+            ),
             Error::Cycle(source, target) => {
                 write!(f, "{source} supersedes {target} would create a cycle")
             }

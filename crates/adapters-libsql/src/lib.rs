@@ -6,7 +6,7 @@ use domain::{
 };
 use libsql::{Builder, Connection, Database, Value, params};
 
-/// Final consolidated schema, equivalent to adapters-sqlite's sqlx migrations 0001-0004.
+/// Final consolidated schema, equivalent to adapters-sqlite's sqlx migrations 0001-0005.
 const SCHEMA: &str = r#"
 CREATE TABLE memories (
     id              TEXT PRIMARY KEY NOT NULL,
@@ -18,7 +18,8 @@ CREATE TABLE memories (
     embedding       BLOB NOT NULL,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
-    importance      INTEGER NOT NULL DEFAULT 1
+    importance      INTEGER NOT NULL DEFAULT 1,
+    title           TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE meta (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -186,7 +187,7 @@ impl Store for LibsqlStore {
         let conn = self.conn()?;
         let stmt = conn
             .prepare(
-                "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at \
+                "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at, title \
                  FROM memories WHERE id = ?",
             )
             .await
@@ -203,7 +204,7 @@ impl Store for LibsqlStore {
         let conn = self.conn()?;
         let stmt = conn
             .prepare(
-                "SELECT id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at \
+                "SELECT id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at, title \
                  FROM memories WHERE id = ?",
             )
             .await
@@ -222,6 +223,7 @@ impl Store for LibsqlStore {
                 importance: domain::Importance::from_rank(row.get::<i64>(6).map_err(store_err)?),
                 created_at: Timestamp::new(row.get::<String>(8).map_err(store_err)?),
                 updated_at: Timestamp::new(row.get::<String>(9).map_err(store_err)?),
+                title: row.get::<String>(10).map_err(store_err)?,
             };
             Ok(Some((memory, embedding)))
         } else {
@@ -235,8 +237,8 @@ impl Store for LibsqlStore {
         let tags = serde_json::to_string(&memory.tags).map_err(store_err)?;
         let affected = conn
             .execute(
-                "INSERT INTO memories (id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO memories (id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at, title) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
                 params![
                     memory.id.as_str(),
                     memory.content.as_str(),
@@ -248,6 +250,7 @@ impl Store for LibsqlStore {
                     blob,
                     memory.created_at.as_str(),
                     memory.updated_at.as_str(),
+                    memory.title.as_str(),
                 ],
             )
             .await
@@ -260,6 +263,7 @@ impl Store for LibsqlStore {
             .await?
             .ok_or_else(|| Error::Store(format!("memory {} vanished during insert", memory.id)))?;
         let same_payload = existing.content == memory.content
+            && existing.title == memory.title
             && existing.kind == memory.kind
             && existing.scope == memory.scope
             && existing.tags == memory.tags
@@ -281,6 +285,7 @@ impl Store for LibsqlStore {
     ) -> Result<Memory, Error> {
         let conn = self.conn()?;
         let content = patch.content.as_deref().map(|s| Value::Text(s.to_string()));
+        let title = patch.title.as_deref().map(|s| Value::Text(s.to_string()));
         let tags = patch
             .tags
             .as_ref()
@@ -299,12 +304,14 @@ impl Store for LibsqlStore {
         let updated_at = Value::Text(now.to_string());
         let affected = conn
             .execute(
-                r#"UPDATE memories SET content = COALESCE(?, content), tags = COALESCE(?, tags),
+                r#"UPDATE memories SET content = COALESCE(?, content), title = COALESCE(?, title),
+                       tags = COALESCE(?, tags),
                        pinned = COALESCE(?, pinned), importance = COALESCE(?, importance),
                        embedding = COALESCE(?, embedding), updated_at = ?
                    WHERE id = ?"#,
                 libsql::params_from_iter([
                     content.unwrap_or(Value::Null),
+                    title.unwrap_or(Value::Null),
                     tags.unwrap_or(Value::Null),
                     pinned.unwrap_or(Value::Null),
                     importance.unwrap_or(Value::Null),
@@ -336,7 +343,7 @@ impl Store for LibsqlStore {
         let conn = self.conn()?;
         let stmt = conn
             .prepare(
-                "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at \
+                "SELECT id, content, kind, scope, tags, pinned, importance, created_at, updated_at, title \
                  FROM memories",
             )
             .await
@@ -467,6 +474,7 @@ struct MemoryRow {
     importance: i64,
     created_at: String,
     updated_at: String,
+    title: String,
 }
 
 impl TryFrom<MemoryRow> for Memory {
@@ -476,6 +484,7 @@ impl TryFrom<MemoryRow> for Memory {
         Ok(Memory {
             id: MemoryId::parse(&row.id)?,
             content: row.content,
+            title: row.title,
             kind: MemoryKind::parse(&row.kind)?,
             scope: Scope::parse(&row.scope)?,
             tags: serde_json::from_str(&row.tags).map_err(store_err)?,
@@ -487,7 +496,7 @@ impl TryFrom<MemoryRow> for Memory {
     }
 }
 
-/// Read the 9 non-embedding memory columns (indices 0-8) from a plain SELECT row.
+/// Read the 10 non-embedding memory columns (indices 0-9) from a plain SELECT row.
 fn memory_from_row(row: &libsql::Row) -> Result<Memory, Error> {
     MemoryRow {
         id: row.get::<String>(0).map_err(store_err)?,
@@ -499,6 +508,7 @@ fn memory_from_row(row: &libsql::Row) -> Result<Memory, Error> {
         importance: row.get::<i64>(6).map_err(store_err)?,
         created_at: row.get::<String>(7).map_err(store_err)?,
         updated_at: row.get::<String>(8).map_err(store_err)?,
+        title: row.get::<String>(9).map_err(store_err)?,
     }
     .try_into()
 }
@@ -524,6 +534,37 @@ async fn ensure_schema(conn: &Connection) -> Result<(), Error> {
     .map_err(store_err)?;
     if tables == 0 {
         conn.execute_batch(SCHEMA).await.map_err(store_err)?;
+        return Ok(());
+    }
+    add_missing_columns(conn).await
+}
+
+/// Replicas created before a column existed already hold the `memories` table, so the schema
+/// batch above never runs for them. Each additive column is applied once, here.
+///
+/// Writes are remote-first, so this ALTER is a primary write and the local replica only
+/// reflects it. That leaves one way to fail: the primary is unreachable, or it already carries
+/// the column while this replica is too stale to show it. Both want the same answer, so the
+/// error says so rather than surfacing a bare connection failure from an ALTER nobody asked for.
+async fn add_missing_columns(conn: &Connection) -> Result<(), Error> {
+    for (column, ddl) in [(
+        "title",
+        "ALTER TABLE memories ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+    )] {
+        let present = scalar(
+            conn,
+            &format!("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = '{column}'"),
+        )
+        .await?;
+        if present > 0 {
+            continue;
+        }
+        conn.execute(ddl, params![]).await.map_err(|e| {
+            Error::Store(format!(
+                "this replica predates the {column} column and the primary did not add it ({e}); \
+                 connect once and retry"
+            ))
+        })?;
     }
     Ok(())
 }
@@ -737,10 +778,28 @@ impl TursoPlatform {
         group: &str,
         name: &str,
     ) -> Result<TursoDb, Error> {
+        self.create(org, token, group, name, None).await
+    }
+
+    /// `seed` names a database to branch from: the new database opens as a copy of it, and the
+    /// source never sees the branch. Only the migration test passes one — nothing `syn` does at
+    /// runtime creates a database from another.
+    async fn create(
+        &self,
+        org: &str,
+        token: &str,
+        group: &str,
+        name: &str,
+        seed: Option<&str>,
+    ) -> Result<TursoDb, Error> {
         #[derive(serde::Deserialize)]
         struct CreateResp {
             #[serde(rename = "database")]
             database: serde_json::Value,
+        }
+        let mut body = serde_json::json!({ "name": name, "group": group });
+        if let Some(from) = seed {
+            body["seed"] = serde_json::json!({ "type": "database", "name": from });
         }
         let resp = self
             .client
@@ -748,7 +807,7 @@ impl TursoPlatform {
                 "https://api.turso.tech/v1/organizations/{org}/databases"
             ))
             .bearer_auth(token)
-            .json(&serde_json::json!({ "name": name, "group": group }))
+            .json(&body)
             .send()
             .await
             .map_err(store_err)?;
@@ -840,6 +899,7 @@ mod tests {
         let memory = Memory {
             id: MemoryId::parse("m_0000000000000000000000").unwrap(),
             content: "deploy staging offers".to_string(),
+            title: String::new(),
             kind: MemoryKind::parse("reference").unwrap(),
             scope: Scope::parse("workspace").unwrap(),
             tags: vec!["deploy".to_string()],
@@ -859,6 +919,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits, vec![memory.id.clone()]);
+    }
+
+    /// Build a replica holding one memory and no `title` column, as the live replicas did
+    /// before it existed. The column's absence is asserted rather than assumed, so a reworded
+    /// `SCHEMA` turns this into a failure instead of a test that quietly proves nothing.
+    async fn pre_title_replica(path: &Path) -> Database {
+        let db = libsql::Builder::new_local(path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let old_schema = SCHEMA.replace(",\n    title           TEXT NOT NULL DEFAULT ''", "");
+        conn.execute_batch(&old_schema).await.unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, content, kind, scope, tags, pinned, importance, embedding, \
+             created_at, updated_at) VALUES (?, ?, 'reference', 'workspace', '[]', 0, 1, ?, ?, ?)",
+            params![
+                "m_0000000000000000000000",
+                "an old fact",
+                Value::Blob(vec![0u8; 16]),
+                "2026-08-07T00:00:00Z",
+                "2026-08-07T00:00:00Z",
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta (id, embedding_model, embedding_dim) VALUES (1, 'test-model', 4)",
+            params![],
+        )
+        .await
+        .unwrap();
+        let title_columns = scalar(
+            &conn,
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'title'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            title_columns, 0,
+            "the fixture must predate the title column"
+        );
+        db
+    }
+
+    /// The live replicas were created before `title` existed, and `ensure_schema` skips the
+    /// schema batch whenever `memories` is already there — so the additive column is the only
+    /// thing standing between an old replica and a store that cannot read its own rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replica_predating_the_title_column_gains_it_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.db");
+        let db = pre_title_replica(&path).await;
+
+        let store = LibsqlStore::init(db, "test-model", 4).await.unwrap();
+        let id = MemoryId::parse("m_0000000000000000000000").unwrap();
+        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.content, "an old fact");
+        assert_eq!(got.title, "", "a pre-existing row has no title");
+
+        let patch = EditRequest {
+            title: Some("Old fact".to_string()),
+            ..EditRequest::default()
+        };
+        let updated = store
+            .update(&id, &patch, None, &Timestamp::new("2026-08-11T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(updated.title, "Old fact");
+
+        // Opening again must not re-issue the ALTER: every daemon boot runs this path.
+        drop(store);
+        let db = libsql::Builder::new_local(&path).build().await.unwrap();
+        let reopened = LibsqlStore::init(db, "test-model", 4).await.unwrap();
+        assert_eq!(reopened.get(&id).await.unwrap().unwrap().title, "Old fact");
     }
 
     #[test]
@@ -922,6 +1054,119 @@ mod tests {
         );
     }
 
+    /// The title migration against real rows. A branch of a live database is a copy the
+    /// source never sees, so this runs the ALTER over the same shape and volume of data the
+    /// real replicas hold — the thing a local fixture cannot tell you — and then proves the
+    /// column reached the primary rather than only the replica that wrote it.
+    ///
+    /// `SYNAPSE_TURSO_TEST_SOURCE_DB` names the database to branch, and its embedding meta
+    /// must be described by `SYNAPSE_TURSO_TEST_MODEL` / `_DIM`, since `open` refuses a
+    /// database whose meta disagrees with the runtime it is handed.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Turso Cloud credentials, a source database, and network"]
+    async fn a_branch_of_a_live_database_survives_the_title_migration() {
+        let Some(token) = std::env::var("SYNAPSE_TURSO_TEST_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+        else {
+            eprintln!("skipping: SYNAPSE_TURSO_TEST_TOKEN is not set");
+            return;
+        };
+        let org =
+            std::env::var("SYNAPSE_TURSO_TEST_ORG").unwrap_or_else(|_| "benediktms".to_string());
+        let source =
+            std::env::var("SYNAPSE_TURSO_TEST_SOURCE_DB").unwrap_or_else(|_| "work".to_string());
+        let model = std::env::var("SYNAPSE_TURSO_TEST_MODEL")
+            .unwrap_or_else(|_| "bge-small-en-v1.5".to_string());
+        let dim: usize = std::env::var("SYNAPSE_TURSO_TEST_DIM")
+            .unwrap_or_else(|_| "384".to_string())
+            .parse()
+            .expect("SYNAPSE_TURSO_TEST_DIM must be a number");
+
+        let platform = TursoPlatform::new();
+        let group = platform.ensure_group(&org, &token).await.unwrap();
+        let name = format!("synapse-migration-{}", std::process::id());
+        let db = platform
+            .create(&org, &token, &group, &name, Some(&source))
+            .await
+            .unwrap();
+        let db_token = platform.mint_db_token(&org, &token, &group).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let scenario = migration_scenario(&dir, &db.url, &db_token, &model, dim).await;
+        let cleanup = platform.delete_database(&org, &token, &name).await;
+        scenario.unwrap();
+        cleanup.unwrap();
+    }
+
+    async fn migration_scenario(
+        dir: &tempfile::TempDir,
+        url: &str,
+        token: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<(), domain::Error> {
+        let open = |name: &str| {
+            LibsqlStore::open(
+                dir.path().join(name),
+                url.to_string(),
+                token.to_string(),
+                model,
+                dim,
+            )
+        };
+
+        // The branch predates the column, so opening it runs the ALTER and every existing
+        // row must still read back — with an empty title and a short form derived from it.
+        let store_a = open("a.db").await?;
+        let before = store_a.list().await?;
+        assert!(!before.is_empty(), "branch a database that holds memories");
+        for memory in &before {
+            assert_eq!(memory.title, "", "{} gained a title", memory.id);
+            assert!(
+                !domain::short_form(&memory.title, &memory.content).is_empty(),
+                "{} derives an empty short form",
+                memory.id
+            );
+        }
+
+        // Setting a title is a normal write, so it has to survive the round trip.
+        let id = before[0].id.clone();
+        let patch = EditRequest {
+            title: Some("A title written after the migration".to_string()),
+            ..EditRequest::default()
+        };
+        store_a
+            .update(&id, &patch, None, &Timestamp::new("2026-08-11T00:00:00Z"))
+            .await?;
+        store_a.sync().await?;
+
+        // The migration is only real if it reached the primary. Reading the fresh replica's
+        // schema straight after its first pull, before any schema work of our own, is the
+        // proof: the column can only be there because the primary carries it.
+        let db_b = Builder::new_remote_replica(dir.path().join("b.db"), url.into(), token.into())
+            .read_your_writes(true)
+            .build()
+            .await
+            .map_err(store_err)?;
+        db_b.sync().await.map_err(store_err)?;
+        let title_columns = scalar(
+            &db_b.connect().map_err(store_err)?,
+            "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'title'",
+        )
+        .await?;
+        assert_eq!(title_columns, 1, "the migration did not reach the primary");
+
+        let store_b = LibsqlStore::init(db_b, model, dim).await?;
+        assert_eq!(
+            store_b.get(&id).await?.map(|m| m.title),
+            Some("A title written after the migration".to_string()),
+            "the second replica did not pull the migrated column and title"
+        );
+        assert_eq!(store_b.list().await?.len(), before.len());
+        Ok(())
+    }
+
     async fn turso_scenario(
         dir: &tempfile::TempDir,
         url: &str,
@@ -957,6 +1202,7 @@ mod tests {
         Memory {
             id: MemoryId::parse(id).unwrap(),
             content: content.to_string(),
+            title: String::new(),
             kind: MemoryKind::parse("reference").unwrap(),
             scope: Scope::parse("workspace").unwrap(),
             tags: vec![],

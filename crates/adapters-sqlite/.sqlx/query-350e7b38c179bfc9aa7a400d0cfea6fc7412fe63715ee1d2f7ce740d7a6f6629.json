@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO memories (id, content, kind, scope, tags, pinned, importance, embedding, created_at, updated_at, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "350e7b38c179bfc9aa7a400d0cfea6fc7412fe63715ee1d2f7ce740d7a6f6629"
+}

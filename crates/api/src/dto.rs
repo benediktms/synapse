@@ -41,6 +41,10 @@ impl Origin {
 pub struct MemoryDto {
     pub id: String,
     pub content: String,
+    /// The stored title, empty when the memory has none. Clients derive the short form from
+    /// the content in that case; the field never carries a derived value.
+    #[serde(default)]
+    pub title: String,
     pub kind: String,
     pub scope: String,
     pub tags: Vec<String>,
@@ -56,6 +60,7 @@ impl From<&Memory> for MemoryDto {
         Self {
             id: memory.id.to_string(),
             content: memory.content.clone(),
+            title: memory.title.clone(),
             kind: memory.kind.as_str().to_string(),
             scope: memory.scope.as_str().to_string(),
             tags: memory.tags.clone(),
@@ -72,6 +77,7 @@ impl MemoryDto {
         Ok(Memory {
             id: MemoryId::parse(&self.id)?,
             content: self.content.clone(),
+            title: self.title.clone(),
             kind: MemoryKind::parse(&self.kind)?,
             scope: Scope::parse(&self.scope)?,
             tags: self.tags.clone(),
@@ -86,6 +92,8 @@ impl MemoryDto {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PutMemoryBody {
     pub content: String,
+    #[serde(default)]
+    pub title: Option<String>,
     pub kind: String,
     pub scope: String,
     #[serde(default)]
@@ -97,6 +105,8 @@ pub struct PutMemoryBody {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PutPreferenceBody {
     pub content: String,
+    #[serde(default)]
+    pub title: Option<String>,
     pub kind: String,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -125,6 +135,8 @@ pub struct MoveResponse {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PatchMemoryBody {
     pub content: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
     pub tags: Option<Vec<String>>,
     pub pinned: Option<bool>,
     #[serde(default)]
@@ -399,6 +411,7 @@ mod tests {
         MemoryDto {
             id: "m_0000000000000000000001".into(),
             content: "a fact".into(),
+            title: String::new(),
             kind: "user".into(),
             scope: "workspace".into(),
             tags: vec![],
@@ -453,6 +466,7 @@ mod tests {
             memory: Memory {
                 id: mid(n),
                 content: format!("memory {n}"),
+                title: String::new(),
                 kind: MemoryKind::Project,
                 scope: Scope::Workspace,
                 tags: vec![],

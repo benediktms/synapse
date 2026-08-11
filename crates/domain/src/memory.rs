@@ -195,10 +195,16 @@ impl Importance {
     }
 }
 
+/// The character cap on a title, and on the summary derived for a memory that has none.
+pub const TITLE_MAX_CHARS: usize = 120;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Memory {
     pub id: MemoryId,
     pub content: String,
+    /// The short level-of-detail form. Empty means the memory carries no title, and
+    /// `short_form` derives one from the content instead.
+    pub title: String,
     pub kind: MemoryKind,
     pub scope: Scope,
     pub tags: Vec<String>,
@@ -206,6 +212,64 @@ pub struct Memory {
     pub importance: Importance,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+}
+
+/// The shortest level of detail: the stored title, or one derived from the content when there
+/// is none. The derived form is the content's first sentence on one line. A trailing ellipsis
+/// marks whatever the derivation dropped — a later sentence as much as an over-long cut — so a
+/// short line never reads as the whole fact. The result never exceeds `TITLE_MAX_CHARS`, which
+/// is also the cap a hand-written title is held to.
+pub fn short_form(title: &str, content: &str) -> String {
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    let single_line = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sentence = first_sentence(&single_line);
+    let dropped_text = sentence.len() < single_line.len();
+    let over_cap = sentence.chars().count() > TITLE_MAX_CHARS;
+    if !dropped_text && !over_cap {
+        return sentence.to_string();
+    }
+    let kept = match sentence.char_indices().nth(TITLE_MAX_CHARS - 1) {
+        Some((byte, _)) => &sentence[..byte],
+        None => sentence,
+    };
+    format!("{}…", kept.trim_end().trim_end_matches('.'))
+}
+
+/// The text a memory is embedded from. A hand-written title summarises rather than quotes, so
+/// its words need not appear in the body — and recall is the surface that shows the title, so
+/// a title the vector lane cannot match is a fact the reader is shown but cannot find.
+pub fn embed_text(title: &str, content: &str) -> String {
+    if title.is_empty() {
+        content.to_string()
+    } else {
+        format!("{title}\n{content}")
+    }
+}
+
+fn first_sentence(text: &str) -> &str {
+    for (byte, ch) in text.char_indices() {
+        if matches!(ch, '.' | '?' | '!') && ends_a_sentence(text, byte) {
+            return &text[..byte + ch.len_utf8()];
+        }
+    }
+    text
+}
+
+/// A terminator ends a sentence when whitespace follows it and the next word opens with a
+/// capital. What separates a full stop from `argocd.yaml`, `1.38.0` or `e.g.` is what comes
+/// after it, not what comes before — a technical fact is full of dotted tokens, and a rule
+/// that reads backwards either splits the abbreviations or swallows the filenames.
+fn ends_a_sentence(text: &str, byte: usize) -> bool {
+    let rest = &text[byte + 1..];
+    if !rest.starts_with(char::is_whitespace) {
+        return false;
+    }
+    rest.trim_start()
+        .chars()
+        .next()
+        .is_some_and(char::is_uppercase)
 }
 
 #[cfg(test)]
@@ -315,6 +379,86 @@ mod tests {
         assert_eq!(
             Importance::parse("urgent"),
             Err(Error::InvalidImportance("urgent".to_string()))
+        );
+    }
+
+    #[test]
+    fn short_form_takes_the_first_sentence_on_one_line() {
+        assert_eq!(
+            short_form("", "Deploys go through ArgoCD. That is all."),
+            "Deploys go through ArgoCD…"
+        );
+        assert_eq!(short_form("", "No terminator here"), "No terminator here");
+        assert_eq!(
+            short_form("", "Deploys go through  ArgoCD.\nAlways."),
+            "Deploys go through ArgoCD…"
+        );
+        assert_eq!(
+            short_form("", "Why does it retry? Because of Oban."),
+            "Why does it retry?…"
+        );
+    }
+
+    #[test]
+    fn a_sentence_that_is_the_whole_content_carries_no_ellipsis() {
+        assert_eq!(
+            short_form("", "Deploys go through ArgoCD."),
+            "Deploys go through ArgoCD."
+        );
+    }
+
+    /// The dotted tokens a technical fact is full of, on both sides of the rule: an
+    /// abbreviation must not split the sentence, and a filename must not swallow it.
+    #[test]
+    fn short_form_reads_through_dotted_tokens() {
+        for (content, want) in [
+            (
+                "Scoped per repo, e.g. fresha/offers. The rest is workspace-wide.",
+                "Scoped per repo, e.g. fresha/offers…",
+            ),
+            (
+                "Deploys are configured in argocd.yaml. The staging lane is separate.",
+                "Deploys are configured in argocd.yaml…",
+            ),
+            (
+                "Dashboards live on grafana.fresha.com. Ask before changing them.",
+                "Dashboards live on grafana.fresha.com…",
+            ),
+            (
+                "The chart is pinned to 1.38.0. Bumping it needs a review.",
+                "The chart is pinned to 1.38.0…",
+            ),
+            (
+                "The cutoff is 0.6 for cosine similarity.",
+                "The cutoff is 0.6 for cosine similarity.",
+            ),
+        ] {
+            assert_eq!(short_form("", content), want, "{content}");
+        }
+    }
+
+    #[test]
+    fn short_form_never_exceeds_the_cap_a_title_is_held_to() {
+        for content in [
+            format!("{} and then some more", "word ".repeat(40)),
+            format!("{}. A second sentence.", "x".repeat(TITLE_MAX_CHARS)),
+            format!("{}. A second sentence.", "y".repeat(TITLE_MAX_CHARS - 1)),
+        ] {
+            let short = short_form("", &content);
+            assert!(
+                short.chars().count() <= TITLE_MAX_CHARS,
+                "{} chars: {short}",
+                short.chars().count()
+            );
+            assert!(short.ends_with('…'), "{short}");
+        }
+    }
+
+    #[test]
+    fn short_form_prefers_a_stored_title_over_the_derived_one() {
+        assert_eq!(
+            short_form("ArgoCD owns deploys", "Deploys go through ArgoCD."),
+            "ArgoCD owns deploys"
         );
     }
 

@@ -334,6 +334,7 @@ impl Backend for App {
         for memory in memories {
             if let Some(existing) = store.get(&memory.id).await? {
                 let same_payload = existing.content == memory.content
+                    && existing.title == memory.title
                     && existing.kind == memory.kind
                     && existing.scope == memory.scope
                     && existing.tags == memory.tags;
@@ -343,7 +344,11 @@ impl Backend for App {
                 }
                 return Err(BackendError::Domain(Error::Conflict(memory.id)));
             }
-            let embedding = self.inner.embedder.embed(&memory.content).await?;
+            let embedding = self
+                .inner
+                .embedder
+                .embed(&domain::embed_text(&memory.title, &memory.content))
+                .await?;
             store.insert(&memory, &embedding).await?;
             report.imported += 1;
         }

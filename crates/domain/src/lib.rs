@@ -14,7 +14,10 @@ pub mod fakes;
 pub use error::Error;
 pub use fusion::{RRF_K, rrf_scores};
 pub use links::{Link, Relation};
-pub use memory::{Importance, Memory, MemoryId, MemoryKind, Scope, Timestamp};
+pub use memory::{
+    Importance, Memory, MemoryId, MemoryKind, Scope, TITLE_MAX_CHARS, Timestamp, embed_text,
+    short_form,
+};
 pub use ports::{Embedder, ScopeFilter, Store};
 pub use similarity::cosine_similarity;
 pub use usecases::{

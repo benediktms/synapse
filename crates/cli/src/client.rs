@@ -22,6 +22,7 @@ fn err(e: impl std::fmt::Display) -> String {
 fn preference_body(body: PutPreferenceBody) -> PutMemoryBody {
     PutMemoryBody {
         content: body.content,
+        title: body.title,
         kind: body.kind,
         scope: Scope::Workspace.as_str().to_string(),
         tags: body.tags,
