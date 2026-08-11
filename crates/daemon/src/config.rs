@@ -101,9 +101,9 @@ fn workspace_named(name: &str) -> Option<Workspace> {
     }
 }
 
-/// Offline bindings authenticate with the database JWT cached from the last online boot;
-/// without one the replica still opens for local reads and writes, and syncs start
-/// failing-open until a boot that can mint.
+/// Offline bindings authenticate with the database JWT cached from the last online boot.
+/// Without a usable token, an existing replica still serves cached reads; mutations fail
+/// and CLI saves remain in the client's durable outbox until connectivity returns.
 fn cached_bindings_for_org(
     dir: &Path,
     manifest: &Manifest,
@@ -211,9 +211,9 @@ pub async fn resolve_bindings(dir: &Path, config: &Config) -> (Vec<WorkspaceBind
     (bindings, problems)
 }
 
-/// Open a workspace's replica, online or offline. Offline opens use the cached manifest (url +
-/// org) and work once the replica has synced at least once; the very first open of a workspace
-/// requires the network (it must reach the primary to bootstrap).
+/// Open a workspace's replica online or as a read cache. Cached manifest bindings keep
+/// existing reads available while offline; the first open requires the primary to
+/// bootstrap, and every mutation requires the primary to acknowledge it.
 pub async fn open_binding(binding: &WorkspaceBinding) -> Result<LibsqlStore, String> {
     LibsqlStore::open(
         &binding.replica,

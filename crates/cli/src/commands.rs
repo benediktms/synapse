@@ -1051,15 +1051,11 @@ fn print_statuses(statuses: Vec<api::rpc::WorkspaceStatus>) {
             format!("synced {}", age(now, ws.last_synced_at * 1000))
         };
         let connectivity = if ws.online { "online" } else { "offline" };
-        let pending = match ws.pending_outbox {
-            0 => String::new(),
-            n => format!(", {n} pending"),
-        };
         let error = ws
             .error
             .map(|error| format!(" ({error})"))
             .unwrap_or_default();
-        println!("{}: {connectivity}, {freshness}{pending}{error}", ws.name);
+        println!("{}: {connectivity}, {freshness}{error}", ws.name);
     }
 }
 
