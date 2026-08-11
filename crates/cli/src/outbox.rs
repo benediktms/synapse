@@ -15,6 +15,7 @@ use crate::config::{private_dir, state_dir, sync_parent, write_private};
 pub struct SendFailure {
     pub message: String,
     pub retryable: bool,
+    pub invalid: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,6 +53,7 @@ pub struct PendingSave {
 pub struct FlushReport {
     pub sent: Vec<String>,
     pub dead_lettered: Vec<(String, String)>,
+    pub rejected: Vec<(String, String)>,
     pub deferred: Option<String>,
     pub still_queued: usize,
     pub oldest_queued_at: Option<u64>,
@@ -123,6 +125,10 @@ impl Outbox {
                 Err(err) if err.retryable => {
                     report.deferred = Some(err.message);
                     break;
+                }
+                Err(err) if err.invalid => {
+                    remove(&path)?;
+                    report.rejected.push((item.id, err.message));
                 }
                 Err(err) => {
                     let dead = PendingSave {

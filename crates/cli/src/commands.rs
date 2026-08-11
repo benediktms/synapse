@@ -157,6 +157,9 @@ fn flush_before_read(ctx: &Context) {
     for (id, failure) in &report.dead_lettered {
         eprintln!("note: {id} moved to dead-letter: {failure}");
     }
+    for (id, failure) in &report.rejected {
+        eprintln!("note: {id} dropped, the server refused it: {failure}");
+    }
     if report.still_queued > 0 {
         let reason = report.deferred.as_deref().unwrap_or("still unsent");
         eprintln!(
@@ -280,6 +283,9 @@ fn queue_and_flush(ctx: &Context, target: SaveTarget) -> Result<(), String> {
         println!("saved {id} ({where_to})");
         return Ok(());
     }
+    if let Some((_, failure)) = report.rejected.iter().find(|(rejected, _)| *rejected == id) {
+        return Err(failure.clone());
+    }
     if let Some((_, failure)) = report.dead_lettered.iter().find(|(dead, _)| *dead == id) {
         return Err(format!("{failure} (see: syn list --pending)"));
     }
@@ -308,6 +314,9 @@ fn report_backlog(report: &FlushReport) {
     }
     for (id, failure) in &report.dead_lettered {
         eprintln!("note: {id} moved to dead-letter: {failure}");
+    }
+    for (id, failure) in &report.rejected {
+        eprintln!("note: {id} dropped, the server refused it: {failure}");
     }
 }
 

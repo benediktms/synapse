@@ -34,6 +34,12 @@ impl ClientError {
             Self::Status { status, .. } => *status >= 500 || *status == 408 || *status == 429,
         }
     }
+
+    /// The request itself is the problem, so replaying it unchanged can never succeed and
+    /// keeping it queued only accumulates work nobody can drain.
+    pub fn is_invalid_request(&self) -> bool {
+        matches!(self, Self::Status { status: 400, .. })
+    }
 }
 
 impl fmt::Display for ClientError {

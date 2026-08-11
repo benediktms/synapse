@@ -358,19 +358,16 @@ fn queued_saves_flush_oldest_first_once_the_server_returns() {
 #[test]
 fn a_non_retryable_rejection_dead_letters_the_save() {
     let stub = Stub::start();
-    stub.script(vec![Behavior::Status(
-        400,
-        "content exceeds token window".into(),
-    )]);
+    stub.script(vec![Behavior::Status(409, "id already taken".into())]);
     let machine = Machine::new(&stub.url());
 
     let output = machine.run(&[
-        "save", "--body", "too big", "--title", "A title", "--type", "project",
+        "save", "--body", "a fact", "--title", "A title", "--type", "project",
     ]);
 
     assert!(!output.status.success());
     assert!(
-        stderr(&output).contains("content exceeds token window"),
+        stderr(&output).contains("id already taken"),
         "{}",
         stderr(&output)
     );
@@ -379,7 +376,7 @@ fn a_non_retryable_rejection_dead_letters_the_save() {
 
     let pending = machine.run(&["list", "--pending"]);
     assert!(
-        stdout(&pending).contains("dead-letter: server returned 400"),
+        stdout(&pending).contains("dead-letter: server returned 409"),
         "{}",
         stdout(&pending)
     );
@@ -400,6 +397,39 @@ fn a_non_retryable_rejection_dead_letters_the_save() {
         stdout(&discarded)
     );
     assert!(json_files(&machine.outbox()).is_empty());
+}
+
+#[test]
+fn a_400_drops_the_draft_instead_of_dead_lettering_it() {
+    let stub = Stub::start();
+    stub.script(vec![Behavior::Status(
+        400,
+        "content is 533 tokens, model window is 512".into(),
+    )]);
+    let machine = Machine::new(&stub.url());
+
+    let output = machine.run(&[
+        "save",
+        "--body",
+        "prose the tokenizer counts higher than the byte cap suggests",
+        "--title",
+        "A title",
+        "--type",
+        "project",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("model window is 512"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(json_files(&machine.outbox()).is_empty());
+    assert!(
+        json_files(&machine.outbox().join("dead-letter")).is_empty(),
+        "a rejection nothing can drain was kept as work to drain"
+    );
+    assert_eq!(stdout(&machine.run(&["list", "--pending"])), "");
 }
 
 #[test]
