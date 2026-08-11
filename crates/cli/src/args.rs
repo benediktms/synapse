@@ -53,7 +53,7 @@ pub enum Command {
     Export(WorkspaceArgs),
     /// Restore a workspace dump from stdin
     Import(ImportArgs),
-    /// Configure the replication daemon: the Turso orgs this machine replicates
+    /// Configure Turso replication and local workspace routing
     Setup,
     /// Force a replica sync (daemon transport)
     Sync(SyncArgs),
