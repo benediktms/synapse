@@ -72,7 +72,7 @@ impl LibsqlStore {
     /// returning and then reflected locally, so an acknowledged write is visible to
     /// every machine after its next pull. The CLI's durable outbox owns offline saves.
     ///
-    /// A replica that fails `corruption` is discarded and pulled again rather than served.
+    /// A replica that fails `corruption` is set aside and pulled again rather than served.
     /// Remote-first writes are what make that safe: the file holds nothing the primary does
     /// not already have, so the rebuild costs a pull and never data.
     pub async fn open(
@@ -83,27 +83,29 @@ impl LibsqlStore {
         embedding_dim: usize,
     ) -> Result<Self, Error> {
         let path = path.as_ref();
-        let build = async |path: &Path| {
+        let existed = path.exists();
+        let build = async || {
             Builder::new_remote_replica(path, url.clone(), auth_token.clone())
                 .read_your_writes(true)
                 .build()
                 .await
                 .map_err(store_err)
         };
-        let db = build(path).await?;
+
+        let db = build().await?;
         // Fail open for an existing replica: reads remain available and the background
         // sync retries. A fresh replica still needs the primary to initialize its schema.
         let _ = db.sync().await;
 
-        if let Some(damage) = corruption(&db).await {
+        if let Some(damage) = corruption(&db, existed).await {
             tracing::warn!("rebuilding {}: {damage}", path.display());
             drop(db);
-            remove_replica_files(path)?;
-            let db = build(path).await?;
+            quarantine_replica_files(path)?;
+            let db = build().await?;
             db.sync().await.map_err(|e| {
                 store_err(format!(
                     "replica {} is corrupt ({damage}) and the primary could not be \
-                     reached to rebuild it: {e}",
+                     reached to rebuild it: {e} — the corrupt files are kept beside it",
                     path.display()
                 ))
             })?;
@@ -548,42 +550,83 @@ async fn links_from_rows(rows: &mut libsql::Rows) -> Result<Vec<Link>, Error> {
     Ok(out)
 }
 
-/// What `PRAGMA quick_check` complains about, or None when the replica is sound. Cheaper than
-/// `integrity_check` — it skips the index-versus-table cross-check — and it still catches the
-/// out-of-order rowids that make a whole-table scan repeat and skip rows. A replica too broken
-/// to answer the pragma at all counts as damaged, which is the point.
-async fn corruption(db: &Database) -> Option<String> {
+/// What is wrong with the replica on disk, or None when it can be served.
+///
+/// The probe is a read, so the replica connection answers it from the local file. `PRAGMA
+/// quick_check` cannot be used: libsql's parser classifies it as a write (`StmtKind::Write`),
+/// so a replica connection proxies it to the primary, which reports on the primary's file
+/// instead of ours. A plain local handle would answer honestly but would recover and
+/// checkpoint the WAL that libsql's sync layer owns.
+///
+/// A full scan of the table b-tree is what the pragma was reaching for anyway. `NOT INDEXED`
+/// keeps the planner off the primary-key index, so damaged pages surface as a malformed-image
+/// error and out-of-order rowids — the shape the real damage took — surface as a row count
+/// that disagrees with the number of distinct ids it yielded.
+///
+/// `existed` says whether the replica file was on disk before this open. A replica that has
+/// lost its schema is damage; a machine that has never opened one is not. Losing the schema is
+/// how WAL damage presents under sync protocol v2: SQLite discards the unreadable WAL, and
+/// because the replica keeps its pages there, what is left is a sound and empty database.
+async fn corruption(db: &Database, existed: bool) -> Option<String> {
     let conn = match db.connect() {
         Ok(conn) => conn,
         Err(e) => return Some(e.to_string()),
     };
-    let mut rows = match conn.query("PRAGMA quick_check(1)", params![]).await {
+    let scan = conn
+        .query(
+            "SELECT COUNT(*), COUNT(DISTINCT id) FROM memories NOT INDEXED",
+            params![],
+        )
+        .await;
+    let mut rows = match scan {
         Ok(rows) => rows,
+        Err(e) if e.to_string().contains("no such table") => {
+            return existed.then(|| "the replica has no memories table".to_string());
+        }
         Err(e) => return Some(e.to_string()),
     };
-    match rows.next().await {
-        Ok(Some(row)) => match row.get::<String>(0) {
-            Ok(verdict) if verdict == "ok" => None,
-            Ok(verdict) => Some(verdict),
-            Err(e) => Some(e.to_string()),
-        },
-        Ok(None) => Some("quick_check returned no verdict".to_string()),
-        Err(e) => Some(e.to_string()),
+    let row = match rows.next().await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Some("the replica did not answer a count of its memories".to_string()),
+        Err(e) => return Some(e.to_string()),
+    };
+    match (row.get::<i64>(0), row.get::<i64>(1)) {
+        (Ok(scanned), Ok(distinct)) if scanned == distinct => None,
+        (Ok(scanned), Ok(distinct)) => Some(format!(
+            "a scan of {scanned} memories yielded {distinct} distinct ids"
+        )),
+        (Err(e), _) | (_, Err(e)) => Some(e.to_string()),
     }
 }
 
-fn remove_replica_files(path: &Path) -> Result<(), Error> {
-    for suffix in ["", "-wal", "-shm", "-journal", "-info"] {
-        let mut name = path.as_os_str().to_os_string();
-        name.push(suffix);
-        let file = std::path::PathBuf::from(name);
-        match std::fs::remove_file(&file) {
+fn sibling(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
+/// Move every file the replica owns out of libsql's way so the next build bootstraps from the
+/// primary. The files are renamed rather than deleted: a rebuild that cannot reach the primary
+/// must not be the moment the only local copy disappears.
+///
+/// The replication metadata goes first and the database last. libsql refuses to open metadata
+/// without a database, so a rename that fails part-way leaves the tolerated half, not the
+/// rejected one.
+fn quarantine_replica_files(path: &Path) -> Result<(), Error> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for suffix in ["-info", "-client_wal_index", "-journal", "-shm", "-wal", ""] {
+        let from = sibling(path, suffix);
+        let to = sibling(path, &format!("{suffix}.corrupt-{stamp}"));
+        match std::fs::rename(&from, &to) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 return Err(store_err(format!(
-                    "cannot remove corrupt replica {}: {e}",
-                    file.display()
+                    "cannot set aside corrupt replica {}: {e}",
+                    from.display()
                 )));
             }
         }
@@ -1064,12 +1107,10 @@ mod tests {
     /// real damage took. The WAL is overwritten rather than deleted on purpose: a missing WAL
     /// reads as a clean replica, and a corrupt one is the case under test.
     fn damage_pages(path: &Path) {
-        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::io::{Seek, SeekFrom, Write};
         let mut damaged_any = false;
         for suffix in ["", "-wal"] {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(suffix);
-            let file_path = std::path::PathBuf::from(name);
+            let file_path = sibling(path, suffix);
             let Ok(mut file) = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1077,25 +1118,21 @@ mod tests {
             else {
                 continue;
             };
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).unwrap();
-            let from = 4096.min(bytes.len() / 2);
-            if bytes.len() <= from + 512 {
+            let len = file.metadata().unwrap().len() as usize;
+            let from = 4096.min(len / 2);
+            if len <= from + 512 {
                 continue;
             }
             file.seek(SeekFrom::Start(from as u64)).unwrap();
-            file.write_all(&vec![0x5A; bytes.len() - from]).unwrap();
+            file.write_all(&vec![0x5A; len - from]).unwrap();
             file.flush().unwrap();
             damaged_any = true;
         }
         assert!(damaged_any, "nothing to damage at {}", path.display());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn quick_check_names_the_damage_and_passes_a_sound_replica() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("replica.db");
-        let db = libsql::Builder::new_local(&path).build().await.unwrap();
+    async fn populated_replica(path: &Path) {
+        let db = libsql::Builder::new_local(path).build().await.unwrap();
         let store = LibsqlStore::init(db, "test-model", 4).await.unwrap();
         for n in 0..40 {
             let memory = test_memory(&format!("m_{n:022}"), &format!("fact number {n}"));
@@ -1104,18 +1141,77 @@ mod tests {
                 .await
                 .unwrap();
         }
-        drop(store);
+    }
 
-        let sound = libsql::Builder::new_local(&path).build().await.unwrap();
-        assert_eq!(corruption(&sound).await, None, "a sound replica must pass");
-        drop(sound);
+    async fn verdict(path: &Path, existed: bool) -> Option<String> {
+        let db = libsql::Builder::new_local(path).build().await.unwrap();
+        corruption(&db, existed).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_names_the_damage_and_passes_a_sound_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.db");
+        populated_replica(&path).await;
+        assert_eq!(
+            verdict(&path, true).await,
+            None,
+            "a sound replica must pass"
+        );
 
         damage_pages(&path);
-        let broken = libsql::Builder::new_local(&path).build().await.unwrap();
         assert!(
-            corruption(&broken).await.is_some(),
+            verdict(&path, true).await.is_some(),
             "a damaged replica must be reported, not served"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replica_that_lost_its_schema_is_damage_but_a_first_open_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.db");
+        assert_eq!(
+            verdict(&path, false).await,
+            None,
+            "a machine opening its first replica has nothing to rebuild"
+        );
+        assert_eq!(
+            verdict(&path, true).await,
+            Some("the replica has no memories table".to_string()),
+            "an existing replica without a schema lost it and must be rebuilt"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_corrupt_replica_is_set_aside_rather_than_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.db");
+        populated_replica(&path).await;
+        std::fs::write(sibling(&path, "-info"), b"stale v2 metadata").unwrap();
+        std::fs::write(sibling(&path, "-client_wal_index"), b"stale v1 offset").unwrap();
+        damage_pages(&path);
+
+        quarantine_replica_files(&path).unwrap();
+
+        for suffix in ["", "-wal", "-shm", "-info", "-client_wal_index"] {
+            assert!(
+                !sibling(&path, suffix).exists(),
+                "libsql would still find {suffix:?} and resume from it"
+            );
+        }
+        let kept: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".corrupt-"))
+            .collect();
+        for stem in ["replica.db.corrupt-", "replica.db-info.corrupt-"] {
+            assert!(
+                kept.iter().any(|name| name.starts_with(stem)),
+                "{stem} must survive for recovery, got {kept:?}"
+            );
+        }
+        assert!(!path.exists(), "the next build must see no replica at all");
     }
 
     #[test]
@@ -1321,7 +1417,7 @@ mod tests {
         assert_eq!(got.content, memory.content);
 
         drop(store_b);
-        remove_replica_files(&dir.path().join("b.db"))?;
+        damage_pages(&dir.path().join("b.db"));
         let rebuilt = open("b.db").await?;
         assert_eq!(
             rebuilt.get(&memory.id).await?.map(|m| m.content),
