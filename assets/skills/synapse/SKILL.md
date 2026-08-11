@@ -35,10 +35,10 @@ syn recall "<topic>" --all-workspaces
 syn recall "<topic>" --detail short   # titles only, when scanning for which one
 ```
 
-**The digest is not the store.** A session-start hook injects `syn context` —
-four or five lines, pinned and recent, chosen before anyone knew what this session
-would be about. It prints titles only, never the facts themselves: it tells you
-synapses exist; it does not tell you what they say.
+**The digest is not the store.** A session-start hook injects `syn context` — every
+pinned synapse plus the highest-importance remainder, up to 100 lines, chosen before
+anyone knew what this session would be about. It prints titles only, never the facts
+themselves: it tells you synapses exist; it does not tell you what they say.
 Having seen the digest is the most common reason recall gets skipped, and it is
 not a reason.
 

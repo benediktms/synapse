@@ -14,9 +14,7 @@ use crate::workspace::Workspace;
 pub const MIN_VECTOR_SIMILARITY: f32 = 0.6;
 pub const RECALL_LIMIT_CAP: usize = 20;
 pub const RECALL_NEIGHBOUR_CAP: usize = 5;
-pub const DIGEST_PINNED_CAP: usize = 10;
-pub const DIGEST_RECENT_PROJECT_CAP: usize = 5;
-pub const DIGEST_SHARED_USER_CAP: usize = 5;
+pub const DIGEST_ENTRY_BUDGET: usize = 100;
 
 const CANDIDATE_DEPTH: usize = 50;
 
@@ -776,11 +774,12 @@ pub struct DigestEntry {
     pub memory: Memory,
 }
 
+/// One ordered list: every effectively-pinned memory first, then the highest-importance
+/// remainder up to `DIGEST_ENTRY_BUDGET`. The digest prints one line per entry, so the
+/// budget is an entry count, not a section count.
 #[derive(Clone, Debug)]
 pub struct ContextDigest {
-    pub pinned: Vec<DigestEntry>,
-    pub recent_project: Vec<DigestEntry>,
-    pub preferences: Vec<DigestEntry>,
+    pub entries: Vec<DigestEntry>,
 }
 
 pub async fn context_digest<S: Store>(
@@ -826,53 +825,29 @@ pub async fn context_digest<S: Store>(
             .then_with(|| a.memory.id.cmp(&b.memory.id))
     });
 
-    let mut taken: HashSet<MemoryId> = HashSet::new();
-    let pinned: Vec<DigestEntry> = pool
+    let mut entries: Vec<DigestEntry> = pool
         .iter()
         .filter(|entry| effectively_pinned.contains(&entry.memory.id))
-        .take(DIGEST_PINNED_CAP)
         .cloned()
         .collect();
-    taken.extend(pinned.iter().map(|entry| entry.memory.id.clone()));
 
     let target_scope = match project {
         Some(slug) => Scope::Project(slug.to_string()),
         None => Scope::Workspace,
     };
-    let recent_project: Vec<DigestEntry> = pool
-        .iter()
-        .filter(|entry| {
-            !effectively_pinned.contains(&entry.memory.id)
-                && entry.memory.scope == target_scope
-                && !taken.contains(&entry.memory.id)
-        })
-        .take(DIGEST_RECENT_PROJECT_CAP)
-        .cloned()
-        .collect();
-    taken.extend(recent_project.iter().map(|entry| entry.memory.id.clone()));
-
-    let shared_workspace = shared
-        .map(|(workspace, _)| workspace.clone())
-        .or_else(|| active.0.is_shared().then(|| active.0.clone()));
-    let preferences: Vec<DigestEntry> = match shared_workspace {
-        Some(workspace) => pool
-            .iter()
+    let remaining = DIGEST_ENTRY_BUDGET.saturating_sub(entries.len());
+    entries.extend(
+        pool.iter()
             .filter(|entry| {
-                entry.workspace == workspace
-                    && entry.memory.kind == MemoryKind::User
-                    && !taken.contains(&entry.memory.id)
+                !effectively_pinned.contains(&entry.memory.id)
+                    && (entry.memory.scope == Scope::Workspace
+                        || entry.memory.scope == target_scope)
             })
-            .take(DIGEST_SHARED_USER_CAP)
-            .cloned()
-            .collect(),
-        None => Vec::new(),
-    };
+            .take(remaining)
+            .cloned(),
+    );
 
-    Ok(ContextDigest {
-        pinned,
-        recent_project,
-        preferences,
-    })
+    Ok(ContextDigest { entries })
 }
 
 #[cfg(test)]
@@ -1630,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_selects_pinned_recent_project_and_preferences() {
+    fn digest_puts_every_pinned_first_then_fills_the_budget() {
         let work_ws = Workspace::new("work").unwrap();
         let shared_ws = Workspace::shared();
         let work = FakeStore::new();
@@ -1701,6 +1676,16 @@ mod tests {
             ),
             vec![1.0],
         );
+        work.seed(
+            mem(
+                45,
+                "another project's fact",
+                MemoryKind::Project,
+                Scope::Project("fresha/other".to_string()),
+                false,
+            ),
+            vec![1.0],
+        );
 
         let digest = block_on(context_digest(
             (&work_ws, &work),
@@ -1710,7 +1695,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            entry_ids(&digest.pinned),
+            entry_ids(&digest.entries),
             vec![
                 mid(36),
                 mid(11),
@@ -1721,17 +1706,56 @@ mod tests {
                 mid(6),
                 mid(5),
                 mid(4),
-                mid(3)
+                mid(3),
+                mid(2),
+                mid(1),
+                mid(50),
+                mid(40),
+                mid(35),
+                mid(34),
+                mid(33),
+                mid(32),
+                mid(31),
+                mid(30),
+                mid(26),
+                mid(25),
+                mid(24),
+                mid(23),
+                mid(22),
+                mid(21),
+                mid(20),
             ]
         );
-        assert_eq!(
-            entry_ids(&digest.recent_project),
-            vec![mid(26), mid(25), mid(24), mid(23), mid(22)]
-        );
-        assert_eq!(
-            entry_ids(&digest.preferences),
-            vec![mid(35), mid(34), mid(33), mid(32), mid(31)]
-        );
+    }
+
+    #[test]
+    fn digest_budget_caps_the_unpinned_tail_but_never_the_pinned_head() {
+        let ws = Workspace::new("work").unwrap();
+        let store = FakeStore::new();
+        for n in 1..=DIGEST_ENTRY_BUDGET as u32 + 20 {
+            store.seed(
+                mem(n, "fact", MemoryKind::Project, Scope::Workspace, false),
+                vec![1.0],
+            );
+        }
+        let digest = block_on(context_digest((&ws, &store), None, None)).unwrap();
+        assert_eq!(digest.entries.len(), DIGEST_ENTRY_BUDGET);
+
+        let pinned = FakeStore::new();
+        for n in 1..=DIGEST_ENTRY_BUDGET as u32 + 20 {
+            pinned.seed(
+                mem(
+                    n,
+                    "pinned fact",
+                    MemoryKind::Project,
+                    Scope::Workspace,
+                    true,
+                ),
+                vec![1.0],
+            );
+        }
+        let digest = block_on(context_digest((&ws, &pinned), None, None)).unwrap();
+        assert_eq!(digest.entries.len(), DIGEST_ENTRY_BUDGET + 20);
     }
 
     #[test]
@@ -1763,7 +1787,7 @@ mod tests {
 
         let digest = block_on(context_digest((&ws, &store), None, None)).unwrap();
         // 1 is not itself pinned but supersedes pinned 2, so it inherits the pin slot.
-        assert_eq!(entry_ids(&digest.pinned), vec![mid(1)]);
+        assert_eq!(entry_ids(&digest.entries), vec![mid(1)]);
     }
 
     #[test]
@@ -1821,14 +1845,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            entry_ids(&digest.recent_project),
-            vec![mid(1), mid(2), mid(3)]
+            entry_ids(&digest.entries),
+            vec![mid(5), mid(6), mid(1), mid(2), mid(3)]
         );
-        assert_eq!(entry_ids(&digest.pinned), vec![mid(5), mid(6)]);
     }
 
     #[test]
-    fn digest_without_project_uses_workspace_scope_recents() {
+    fn digest_without_project_excludes_project_scoped_memories() {
         let work_ws = Workspace::new("work").unwrap();
         let work = FakeStore::new();
         work.seed(
@@ -1852,12 +1875,11 @@ mod tests {
             vec![1.0],
         );
         let digest = block_on(context_digest((&work_ws, &work), None, None)).unwrap();
-        assert_eq!(entry_ids(&digest.recent_project), vec![mid(1)]);
-        assert!(digest.preferences.is_empty());
+        assert_eq!(entry_ids(&digest.entries), vec![mid(1)]);
     }
 
     #[test]
-    fn digest_on_shared_workspace_fills_user_section_from_active() {
+    fn digest_on_shared_workspace_takes_every_preference() {
         let shared_ws = Workspace::shared();
         let shared = FakeStore::new();
         for n in 1..=6 {
@@ -1874,10 +1896,9 @@ mod tests {
         }
         let digest = block_on(context_digest((&shared_ws, &shared), None, None)).unwrap();
         assert_eq!(
-            entry_ids(&digest.recent_project),
-            vec![mid(6), mid(5), mid(4), mid(3), mid(2)]
+            entry_ids(&digest.entries),
+            vec![mid(6), mid(5), mid(4), mid(3), mid(2), mid(1)]
         );
-        assert_eq!(entry_ids(&digest.preferences), vec![mid(1)]);
     }
 
     #[test]

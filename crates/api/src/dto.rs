@@ -226,25 +226,13 @@ impl From<&DigestEntry> for DigestEntryDto {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextResponse {
-    pub pinned: Vec<DigestEntryDto>,
-    pub recent_project: Vec<DigestEntryDto>,
-    pub preferences: Vec<DigestEntryDto>,
+    pub entries: Vec<DigestEntryDto>,
 }
 
 impl From<&ContextDigest> for ContextResponse {
     fn from(digest: &ContextDigest) -> Self {
         Self {
-            pinned: digest.pinned.iter().map(DigestEntryDto::from).collect(),
-            recent_project: digest
-                .recent_project
-                .iter()
-                .map(DigestEntryDto::from)
-                .collect(),
-            preferences: digest
-                .preferences
-                .iter()
-                .map(DigestEntryDto::from)
-                .collect(),
+            entries: digest.entries.iter().map(DigestEntryDto::from).collect(),
         }
     }
 }
