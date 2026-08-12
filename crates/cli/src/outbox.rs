@@ -4,7 +4,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use api::{PutMemoryBody, PutPreferenceBody};
+use api::{LinkCandidateDto, PutMemoryBody, PutPreferenceBody};
 use serde::{Deserialize, Serialize};
 
 use crate::client::Client;
@@ -52,6 +52,8 @@ pub struct PendingSave {
 #[derive(Debug, Default)]
 pub struct FlushReport {
     pub sent: Vec<String>,
+    /// Per sent memory, the memories already stored that closely resemble it. Advisory.
+    pub candidates: Vec<(String, Vec<LinkCandidateDto>)>,
     pub dead_lettered: Vec<(String, String)>,
     pub rejected: Vec<(String, String)>,
     pub deferred: Option<String>,
@@ -118,8 +120,11 @@ impl Outbox {
                 break;
             }
             match client.send_save(&item.id, &item.target) {
-                Ok(()) => {
+                Ok(candidates) => {
                     remove(&path)?;
+                    if !candidates.is_empty() {
+                        report.candidates.push((item.id.clone(), candidates));
+                    }
                     report.sent.push(item.id);
                 }
                 Err(err) if err.retryable => {

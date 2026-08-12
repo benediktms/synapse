@@ -281,6 +281,7 @@ fn queue_and_flush(ctx: &Context, target: SaveTarget) -> Result<(), String> {
     let report = outbox.flush(&client, None)?;
     if report.sent.contains(&id) {
         println!("saved {id} ({where_to})");
+        report_candidates(&report, &id);
         return Ok(());
     }
     if let Some((_, failure)) = report.rejected.iter().find(|(rejected, _)| *rejected == id) {
@@ -292,6 +293,22 @@ fn queue_and_flush(ctx: &Context, target: SaveTarget) -> Result<(), String> {
     report_backlog(&report);
     println!("queued {id} ({where_to}) — queued locally, not yet recallable");
     Ok(())
+}
+
+/// Names the stored memories that closely resemble the one just written, so the writer can
+/// record the relation it alone can name. Nothing is linked here.
+fn report_candidates(report: &FlushReport, id: &str) {
+    let Some((_, candidates)) = report.candidates.iter().find(|(sent, _)| sent == id) else {
+        return;
+    };
+    eprintln!("similar memories already stored:");
+    for candidate in candidates {
+        eprintln!(
+            "  {} ({:.2}) {}",
+            candidate.id, candidate.similarity, candidate.title
+        );
+    }
+    eprintln!("link one with: syn relate|support|contradict|supersede {id} <id>");
 }
 
 /// Rejected here, a bad draft never reaches the outbox, so it cannot dead-letter. The daemon

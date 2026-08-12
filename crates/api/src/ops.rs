@@ -10,8 +10,8 @@ use domain::{
 use crate::backend::Backend;
 use crate::dto::{
     ContextResponse, EXPORT_VERSION, ExportDoc, GraphDto, HitDto, HitGroupDto, ImportReport,
-    LinkDto, ListResponse, MemoryDto, MoveBody, MoveResponse, Origin, PatchMemoryBody,
-    PutMemoryBody, SearchResponse, WorkspaceDto, WorkspacesResponse,
+    LinkCandidateDto, LinkDto, ListResponse, MemoryDto, MoveBody, MoveResponse, Origin,
+    PatchMemoryBody, PutMemoryBody, SearchResponse, WorkspaceDto, WorkspacesResponse,
 };
 use crate::error::ApiError;
 use crate::validate::{
@@ -52,6 +52,10 @@ pub fn parse_project(value: Option<&str>) -> Result<Option<String>, ApiError> {
 pub struct Saved {
     pub created: bool,
     pub memory: MemoryDto,
+    /// Memories the store already held that closely resemble this one. Advisory only — nothing
+    /// is linked, because only the writer can name the relation.
+    #[serde(default)]
+    pub candidates: Vec<LinkCandidateDto>,
 }
 
 pub async fn create_workspace<B: Backend>(
@@ -106,13 +110,15 @@ pub async fn save<B: Backend>(
             .transpose()?,
     };
     match backend.save(ws, request).await? {
-        SaveOutcome::Created(memory) => Ok(Saved {
+        SaveOutcome::Created(memory, candidates) => Ok(Saved {
             created: true,
             memory: MemoryDto::from(&memory),
+            candidates: candidates.iter().map(LinkCandidateDto::from).collect(),
         }),
         SaveOutcome::Unchanged(memory) => Ok(Saved {
             created: false,
             memory: MemoryDto::from(&memory),
+            candidates: Vec::new(),
         }),
     }
 }

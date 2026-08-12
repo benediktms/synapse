@@ -1,6 +1,6 @@
 use api::{
-    ContextResponse, ExportDoc, GraphDto, ImportReport, MemoryDto, MoveBody, MoveResponse, Origin,
-    PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse,
+    ContextResponse, ExportDoc, GraphDto, ImportReport, LinkCandidateDto, MemoryDto, MoveBody,
+    MoveResponse, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse,
 };
 use api_client::SynapseApiClient;
 use daemon_client::DaemonClient;
@@ -33,25 +33,32 @@ fn preference_body(body: PutPreferenceBody) -> PutMemoryBody {
 impl Client {
     /// The outbox's send hook: every transport classifies its own failures, so the
     /// queue's keep-or-dead-letter call survives the transport switch.
-    pub fn send_save(&self, id: &str, target: &SaveTarget) -> Result<(), SendFailure> {
+    /// The HTTP transport answers a save with the memory alone, so it reports no candidates.
+    pub fn send_save(
+        &self,
+        id: &str,
+        target: &SaveTarget,
+    ) -> Result<Vec<LinkCandidateDto>, SendFailure> {
         match self {
             Self::Http(c) => match target {
                 SaveTarget::Memory { workspace, body } => c.save(workspace, id, body).map(drop),
                 SaveTarget::Preference { body } => c.save_preference(id, body).map(drop),
             }
+            .map(|()| Vec::new())
             .map_err(|e| SendFailure {
                 retryable: e.is_retryable(),
                 invalid: e.is_invalid_request(),
                 message: e.to_string(),
             }),
             Self::Daemon(d) => match target {
-                SaveTarget::Memory { workspace, body } => d
-                    .save(Origin::Workspace(workspace.clone()), id, body.clone())
-                    .map(drop),
-                SaveTarget::Preference { body } => d
-                    .save(Origin::Preference, id, preference_body(body.clone()))
-                    .map(drop),
+                SaveTarget::Memory { workspace, body } => {
+                    d.save(Origin::Workspace(workspace.clone()), id, body.clone())
+                }
+                SaveTarget::Preference { body } => {
+                    d.save(Origin::Preference, id, preference_body(body.clone()))
+                }
             }
+            .map(|saved| saved.candidates)
             .map_err(|e| SendFailure {
                 retryable: e.is_retryable(),
                 invalid: e.is_invalid_request(),
@@ -74,28 +81,43 @@ impl Client {
         }
     }
 
+    /// The HTTP transport answers a save with the memory alone, so it reports no candidates.
     pub fn save(
         &self,
         workspace: &str,
         id: &str,
         body: &PutMemoryBody,
-    ) -> Result<MemoryDto, String> {
+    ) -> Result<(MemoryDto, Vec<LinkCandidateDto>), String> {
         match self {
-            Self::Http(c) => c.save(workspace, id, body).map_err(err),
-            Self::Daemon(d) => Ok(d
-                .save(Origin::Workspace(workspace.to_string()), id, body.clone())
-                .map_err(err)?
-                .memory),
+            Self::Http(c) => c
+                .save(workspace, id, body)
+                .map_err(err)
+                .map(|m| (m, vec![])),
+            Self::Daemon(d) => {
+                let saved = d
+                    .save(Origin::Workspace(workspace.to_string()), id, body.clone())
+                    .map_err(err)?;
+                Ok((saved.memory, saved.candidates))
+            }
         }
     }
 
-    pub fn save_preference(&self, id: &str, body: &PutPreferenceBody) -> Result<MemoryDto, String> {
+    pub fn save_preference(
+        &self,
+        id: &str,
+        body: &PutPreferenceBody,
+    ) -> Result<(MemoryDto, Vec<LinkCandidateDto>), String> {
         match self {
-            Self::Http(c) => c.save_preference(id, body).map_err(err),
-            Self::Daemon(d) => Ok(d
-                .save(Origin::Preference, id, preference_body(body.clone()))
-                .map_err(err)?
-                .memory),
+            Self::Http(c) => c
+                .save_preference(id, body)
+                .map_err(err)
+                .map(|m| (m, vec![])),
+            Self::Daemon(d) => {
+                let saved = d
+                    .save(Origin::Preference, id, preference_body(body.clone()))
+                    .map_err(err)?;
+                Ok((saved.memory, saved.candidates))
+            }
         }
     }
 
