@@ -55,6 +55,24 @@ fn all() -> ScopeFilter {
     ScopeFilter { project: None }
 }
 
+/// bm25 weighs a term by how rare it is, so a store of one or two rows scores every match at
+/// roughly zero. A test that asserts on keyword ranking needs a corpus wide enough to separate.
+async fn fill_unrelated(store: &SqliteStore, rows: usize) {
+    for n in 0..rows {
+        store
+            .insert(
+                &mem(
+                    &MemoryId::generate(),
+                    &format!("unrelated note {n} about postgres, kafka and elixir"),
+                    Scope::Workspace,
+                ),
+                &vec4(0.9),
+            )
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn insert_get_roundtrip_preserves_all_fields() {
     let dir = TempDir::new().unwrap();
@@ -282,10 +300,104 @@ async fn fts_stays_in_sync_through_save_edit_delete() {
 }
 
 #[tokio::test]
+async fn keyword_search_drops_rows_matching_only_one_term_of_many() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let strong = MemoryId::generate();
+    let weak = MemoryId::generate();
+    fill_unrelated(&store, 8).await;
+    store
+        .insert(
+            &mem(
+                &strong,
+                "zero downtime migrations run one phase per deployment",
+                Scope::Workspace,
+            ),
+            &vec4(0.1),
+        )
+        .await
+        .unwrap();
+    store
+        .insert(
+            &mem(
+                &weak,
+                "team apollo owns gift cards, rewards, packages, memberships and their migrations",
+                Scope::Workspace,
+            ),
+            &vec4(0.2),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .keyword_search("zero downtime migrations", &all(), 10)
+            .await
+            .unwrap(),
+        vec![strong.clone()],
+        "a row matching one term of three is noise, not a hit"
+    );
+    assert_eq!(
+        store.keyword_search("packages", &all(), 10).await.unwrap(),
+        vec![weak],
+        "a single-term query keeps its exact-token recall"
+    );
+}
+
+#[tokio::test]
+async fn keyword_search_finds_a_memory_by_words_only_its_title_holds() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = MemoryId::generate();
+    fill_unrelated(&store, 8).await;
+    let mut memory = mem(&id, "the body says nothing about this", Scope::Workspace);
+    memory.title = "Marmalade quokka telemetry".to_string();
+    store.insert(&memory, &vec4(0.1)).await.unwrap();
+
+    assert_eq!(
+        store
+            .keyword_search("marmalade quokka", &all(), 10)
+            .await
+            .unwrap(),
+        vec![id.clone()]
+    );
+
+    store
+        .update(
+            &id,
+            &EditRequest {
+                title: Some("Rhubarb axolotl ledger".to_string()),
+                ..EditRequest::default()
+            },
+            None,
+            &ts(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .keyword_search("rhubarb axolotl", &all(), 10)
+            .await
+            .unwrap(),
+        vec![id],
+        "an edited title must reach the index"
+    );
+    assert!(
+        store
+            .keyword_search("marmalade quokka", &all(), 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the replaced title must leave the index"
+    );
+}
+
+#[tokio::test]
 async fn keyword_search_accepts_code_shaped_queries() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir).await;
     let id = MemoryId::generate();
+    fill_unrelated(&store, 8).await;
     store
         .insert(
             &mem(

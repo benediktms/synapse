@@ -12,7 +12,7 @@ mod workspace;
 pub mod fakes;
 
 pub use error::Error;
-pub use fusion::{RRF_K, rrf_scores};
+pub use fusion::{KEYWORD_RANK_RATIO, RRF_K, rrf_scores, trim_keyword_tail};
 pub use links::{Link, Relation};
 pub use memory::{
     Importance, Memory, MemoryId, MemoryKind, Scope, TITLE_MAX_CHARS, Timestamp, embed_text,
