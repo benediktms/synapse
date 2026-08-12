@@ -2,11 +2,11 @@ use std::path::Path;
 
 use domain::{
     EditRequest, Error, Link, Memory, MemoryId, MemoryKind, Relation, Scope, ScopeFilter, Store,
-    Timestamp,
+    Timestamp, trim_keyword_tail,
 };
 use libsql::{Builder, Connection, Database, Value, params};
 
-/// Final consolidated schema, equivalent to adapters-sqlite's sqlx migrations 0001-0005.
+/// Final consolidated schema, equivalent to adapters-sqlite's sqlx migrations 0001-0006.
 const SCHEMA: &str = r#"
 CREATE TABLE memories (
     id              TEXT PRIMARY KEY NOT NULL,
@@ -27,19 +27,21 @@ CREATE TABLE meta (
     embedding_dim   INTEGER NOT NULL
 );
 CREATE VIRTUAL TABLE memories_fts USING fts5(
-    content, content='memories', content_rowid='rowid'
+    title, content, content='memories', content_rowid='rowid'
 );
 CREATE TRIGGER memories_fts_after_insert AFTER INSERT ON memories BEGIN
-    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+    INSERT INTO memories_fts(rowid, title, content)
+    VALUES (new.rowid, new.title, new.content);
 END;
 CREATE TRIGGER memories_fts_after_delete AFTER DELETE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, content)
-    VALUES ('delete', old.rowid, old.content);
+    INSERT INTO memories_fts(memories_fts, rowid, title, content)
+    VALUES ('delete', old.rowid, old.title, old.content);
 END;
-CREATE TRIGGER memories_fts_after_update AFTER UPDATE OF content ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, content)
-    VALUES ('delete', old.rowid, old.content);
-    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+CREATE TRIGGER memories_fts_after_update AFTER UPDATE OF title, content ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, title, content)
+    VALUES ('delete', old.rowid, old.title, old.content);
+    INSERT INTO memories_fts(rowid, title, content)
+    VALUES (new.rowid, new.title, new.content);
 END;
 CREATE TABLE links (
     low_id     TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -50,6 +52,32 @@ CREATE TABLE links (
 );
 CREATE INDEX links_low  ON links(low_id);
 CREATE INDEX links_high ON links(high_id);
+"#;
+
+/// Rebuild of `memories_fts` over both indexed columns, for replicas that predate the change.
+const FTS_TITLE_DDL: &str = r#"
+DROP TRIGGER IF EXISTS memories_fts_after_insert;
+DROP TRIGGER IF EXISTS memories_fts_after_delete;
+DROP TRIGGER IF EXISTS memories_fts_after_update;
+DROP TABLE IF EXISTS memories_fts;
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+    title, content, content='memories', content_rowid='rowid'
+);
+CREATE TRIGGER memories_fts_after_insert AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, title, content)
+    VALUES (new.rowid, new.title, new.content);
+END;
+CREATE TRIGGER memories_fts_after_delete AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, title, content)
+    VALUES ('delete', old.rowid, old.title, old.content);
+END;
+CREATE TRIGGER memories_fts_after_update AFTER UPDATE OF title, content ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, title, content)
+    VALUES ('delete', old.rowid, old.title, old.content);
+    INSERT INTO memories_fts(rowid, title, content)
+    VALUES (new.rowid, new.title, new.content);
+END;
+INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
 "#;
 
 #[derive(Debug)]
@@ -412,7 +440,7 @@ impl Store for LibsqlStore {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let stmt = conn
             .prepare(
-                r#"SELECT m.id FROM memories_fts
+                r#"SELECT m.id, memories_fts.rank FROM memories_fts
                    JOIN memories m ON m.rowid = memories_fts.rowid
                    WHERE memories_fts MATCH ? AND (m.scope = 'workspace' OR m.scope = ?)
                    ORDER BY memories_fts.rank
@@ -424,11 +452,13 @@ impl Store for LibsqlStore {
             .query(params![fts_query, project, limit])
             .await
             .map_err(store_err)?;
-        let mut out = Vec::new();
+        let mut hits = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
-            out.push(MemoryId::parse(&row.get::<String>(0).map_err(store_err)?)?);
+            let id = MemoryId::parse(&row.get::<String>(0).map_err(store_err)?)?;
+            hits.push((id, row.get::<f64>(1).map_err(store_err)?));
         }
-        Ok(out)
+        trim_keyword_tail(&mut hits, query);
+        Ok(hits.into_iter().map(|(id, _)| id).collect())
     }
 
     async fn insert_link(&self, link: &Link) -> Result<(), Error> {
@@ -645,7 +675,29 @@ async fn ensure_schema(conn: &Connection) -> Result<(), Error> {
         conn.execute_batch(SCHEMA).await.map_err(store_err)?;
         return Ok(());
     }
-    add_missing_columns(conn).await
+    add_missing_columns(conn).await?;
+    widen_fts_to_title(conn).await
+}
+
+/// Replicas built before the index covered titles carry a one-column `memories_fts`. FTS5 cannot
+/// gain a column in place, so the table and its triggers are rebuilt and the index repopulated
+/// from `memories`.
+async fn widen_fts_to_title(conn: &Connection) -> Result<(), Error> {
+    let present = scalar(
+        conn,
+        "SELECT COUNT(*) FROM pragma_table_info('memories_fts') WHERE name = 'title'",
+    )
+    .await?;
+    if present > 0 {
+        return Ok(());
+    }
+    conn.execute_batch(FTS_TITLE_DDL).await.map_err(|e| {
+        Error::Store(format!(
+            "this replica indexes only the memory content and the primary did not widen it ({e}); \
+             connect once and retry"
+        ))
+    })?;
+    Ok(())
 }
 
 /// Replicas created before a column existed already hold the `memories` table, so the schema
@@ -1028,16 +1080,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits, vec![memory.id.clone()]);
+
+        let unrelated = Memory {
+            id: MemoryId::parse("m_0000000000000000000001").unwrap(),
+            content: "gift cards and rewards ship behind their own offers".to_string(),
+            ..memory.clone()
+        };
+        store.insert(&unrelated, &embedding).await.unwrap();
+        let rows_needed_before_bm25_can_rank = 2..8;
+        for n in rows_needed_before_bm25_can_rank {
+            let filler = Memory {
+                id: MemoryId::parse(&format!("m_{n:022}")).unwrap(),
+                content: format!("unrelated note {n} about postgres, kafka and elixir"),
+                ..memory.clone()
+            };
+            store.insert(&filler, &embedding).await.unwrap();
+        }
+        let hits = store
+            .keyword_search("deploy staging offers", &ScopeFilter::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits,
+            vec![memory.id.clone()],
+            "a row matching one term of three is noise, not a hit"
+        );
     }
 
-    /// Build a replica holding one memory and no `title` column, as the live replicas did
-    /// before it existed. The column's absence is asserted rather than assumed, so a reworded
-    /// `SCHEMA` turns this into a failure instead of a test that quietly proves nothing.
+    /// The schema the live replicas were created with, frozen. It is spelled out rather than
+    /// derived from `SCHEMA` because it must keep describing the past whatever `SCHEMA` becomes.
+    const LEGACY_SCHEMA: &str = r#"
+CREATE TABLE memories (
+    id              TEXT PRIMARY KEY NOT NULL,
+    content         TEXT NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('user','feedback','project','reference')),
+    scope           TEXT NOT NULL,
+    tags            TEXT NOT NULL DEFAULT '[]',
+    pinned          INTEGER NOT NULL DEFAULT 0,
+    embedding       BLOB NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    importance      INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    embedding_model TEXT NOT NULL,
+    embedding_dim   INTEGER NOT NULL
+);
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+    content, content='memories', content_rowid='rowid'
+);
+CREATE TRIGGER memories_fts_after_insert AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER memories_fts_after_delete AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content)
+    VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER memories_fts_after_update AFTER UPDATE OF content ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content)
+    VALUES ('delete', old.rowid, old.content);
+    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TABLE links (
+    low_id     TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    high_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relation   TEXT NOT NULL CHECK (relation IN ('relation','support','contradiction','supersession')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    PRIMARY KEY (low_id, high_id, relation)
+);
+CREATE INDEX links_low  ON links(low_id);
+CREATE INDEX links_high ON links(high_id);
+"#;
+
+    /// Build a replica holding one memory, with neither the `title` column nor a title in the
+    /// index, as the live replicas did. Both absences are asserted rather than assumed, so this
+    /// cannot decay into a test that quietly proves nothing.
     async fn pre_title_replica(path: &Path) -> Database {
         let db = libsql::Builder::new_local(path).build().await.unwrap();
         let conn = db.connect().unwrap();
-        let old_schema = SCHEMA.replace(",\n    title           TEXT NOT NULL DEFAULT ''", "");
-        conn.execute_batch(&old_schema).await.unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).await.unwrap();
         conn.execute(
             "INSERT INTO memories (id, content, kind, scope, tags, pinned, importance, embedding, \
              created_at, updated_at) VALUES (?, ?, 'reference', 'workspace', '[]', 0, 1, ?, ?, ?)",
@@ -1067,6 +1189,13 @@ mod tests {
             title_columns, 0,
             "the fixture must predate the title column"
         );
+        let indexed_title = scalar(
+            &conn,
+            "SELECT COUNT(*) FROM pragma_table_info('memories_fts') WHERE name = 'title'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(indexed_title, 0, "the fixture must predate the wider index");
         db
     }
 

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use domain::{
     EditRequest, Embedder, Error, Link, Memory, MemoryId, MemoryKind, Relation, Scope, ScopeFilter,
-    Store, Timestamp,
+    Store, Timestamp, trim_keyword_tail,
 };
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -331,7 +331,7 @@ impl Store for SqliteStore {
         let project = filter.project.as_deref().unwrap_or("");
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = sqlx::query!(
-            r#"SELECT m.id AS "id!" FROM memories_fts
+            r#"SELECT m.id AS "id!", memories_fts.rank AS "rank!: f64" FROM memories_fts
                JOIN memories m ON m.rowid = memories_fts.rowid
                WHERE memories_fts MATCH ? AND (m.scope = 'workspace' OR m.scope = ?)
                ORDER BY memories_fts.rank
@@ -343,9 +343,12 @@ impl Store for SqliteStore {
         .fetch_all(&self.pool)
         .await
         .map_err(store_err)?;
-        rows.into_iter()
-            .map(|row| MemoryId::parse(&row.id))
-            .collect()
+        let mut hits = rows
+            .into_iter()
+            .map(|row| Ok((MemoryId::parse(&row.id)?, row.rank)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        trim_keyword_tail(&mut hits, query);
+        Ok(hits.into_iter().map(|(id, _)| id).collect())
     }
 
     async fn insert_link(&self, link: &Link) -> Result<(), Error> {
