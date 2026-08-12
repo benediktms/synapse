@@ -147,6 +147,25 @@ async fn get_with_embedding_returns_the_stored_vector_verbatim() {
 }
 
 #[tokio::test]
+async fn set_embedding_replaces_the_vector_and_leaves_updated_at_alone() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir).await;
+    let id = MemoryId::generate();
+    let memory = mem(&id, "a fact worth re-embedding", Scope::Workspace);
+    store.insert(&memory, &vec4(0.3)).await.unwrap();
+
+    store.set_embedding(&id, &vec4(0.9)).await.unwrap();
+
+    let (fetched, embedding) = store.get_with_embedding(&id).await.unwrap().unwrap();
+    assert_eq!(embedding, vec4(0.9));
+    assert_eq!(fetched, memory);
+    assert!(matches!(
+        store.set_embedding(&MemoryId::generate(), &vec4(0.9)).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[tokio::test]
 async fn insert_same_payload_is_noop_different_payload_conflicts() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir).await;

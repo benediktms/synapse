@@ -383,6 +383,22 @@ impl Store for LibsqlStore {
             .ok_or_else(|| Error::NotFound(id.clone()))
     }
 
+    async fn set_embedding(&self, id: &MemoryId, embedding: &[f32]) -> Result<(), Error> {
+        let conn = self.conn()?;
+        let blob = Value::Blob(encode_embedding(embedding, self.dim)?);
+        let affected = conn
+            .execute(
+                "UPDATE memories SET embedding = ? WHERE id = ?",
+                params![blob, id.as_str()],
+            )
+            .await
+            .map_err(store_err)?;
+        if affected == 0 {
+            return Err(Error::NotFound(id.clone()));
+        }
+        Ok(())
+    }
+
     async fn delete(&self, id: &MemoryId) -> Result<bool, Error> {
         let conn = self.conn()?;
         let affected = conn

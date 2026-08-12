@@ -27,7 +27,7 @@ pub use usecases::{
     RECALL_LIMIT_CAP, RECALL_NEIGHBOUR_CAP, RecallHit, RecallLink, RecallRequest, SaveOutcome,
     SaveRequest, WorkspaceHits, check_import_acyclic, context_digest, edit, effective_pinned,
     forget, graph_subgraph, is_superseded, link, list_memories, move_memory, recall,
-    recall_grouped, retype_link, save, superseders_of, unlink,
+    recall_grouped, reembed, retype_link, save, superseders_of, unlink,
 };
 pub use workspace::Workspace;
 
