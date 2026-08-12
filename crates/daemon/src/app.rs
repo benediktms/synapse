@@ -11,7 +11,7 @@ use domain::{
     MoveOutcome, RecallHit, RecallRequest, Relation, SaveOutcome, SaveRequest, Timestamp,
     Workspace, WorkspaceHits,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::config::{
     Config, Manifest, WorkspaceBinding, open_binding, replica_path, resolve_bindings,
@@ -40,6 +40,7 @@ struct DaemonInner {
     /// Serializes link mutations (cycle check + insert) so two concurrent supersessions can't
     /// both observe an acyclic graph and then both insert, closing the TOCTOU race.
     links_mutation: Mutex<()>,
+    shutdown: Notify,
 }
 
 impl DaemonApp {
@@ -91,6 +92,7 @@ impl DaemonApp {
                 platform: TursoPlatform::new(),
                 ready,
                 links_mutation: Mutex::new(()),
+                shutdown: Notify::new(),
             }),
         })
     }
@@ -111,6 +113,7 @@ impl DaemonApp {
                 platform: TursoPlatform::new(),
                 ready: Ok(()),
                 links_mutation: Mutex::new(()),
+                shutdown: Notify::new(),
             }),
         }
     }
@@ -202,9 +205,18 @@ impl DaemonApp {
     pub async fn workspace_count(&self) -> usize {
         self.inner.stores.read().await.len()
     }
+
+    /// Resolves once a client has asked the daemon to exit.
+    pub async fn shutdown_requested(&self) {
+        self.inner.shutdown.notified().await;
+    }
 }
 
 impl RpcHost for DaemonApp {
+    fn request_shutdown(&self) {
+        self.inner.shutdown.notify_one();
+    }
+
     async fn statuses(&self) -> Vec<WorkspaceStatus> {
         let stores = self.inner.stores.read().await;
         let mut out: Vec<WorkspaceStatus> = stores

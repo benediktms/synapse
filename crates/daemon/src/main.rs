@@ -3,6 +3,10 @@ use daemon::config::{Config, config_path};
 use daemon::{rpc, single_instance};
 use daemon_client::state_dir;
 
+/// How long the run loop lingers after a shutdown request, so the connection task that
+/// serves it can flush its reply before the process goes away.
+const REPLY_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     tracing_subscriber::fmt()
@@ -86,5 +90,11 @@ async fn main() {
         });
     }
 
-    rpc::serve(listener, app).await;
+    tokio::select! {
+        () = rpc::serve(listener, app.clone()) => {}
+        () = app.shutdown_requested() => {
+            tokio::time::sleep(REPLY_FLUSH_GRACE).await;
+            tracing::info!("shutdown requested; exiting");
+        }
+    }
 }

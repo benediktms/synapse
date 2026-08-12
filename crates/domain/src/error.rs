@@ -5,7 +5,7 @@ use crate::memory::MemoryId;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     InvalidWorkspaceName(String),
-    ReservedWorkspaceName,
+    ReservedWorkspaceName(String),
     InvalidMemoryId(String),
     InvalidKind(String),
     InvalidImportance(String),
@@ -28,7 +28,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::InvalidWorkspaceName(name) => write!(f, "invalid workspace name: {name:?}"),
-            Error::ReservedWorkspaceName => write!(f, "workspace name \"shared\" is reserved"),
+            Error::ReservedWorkspaceName(name) => {
+                write!(f, "workspace name {name:?} is reserved")
+            }
             Error::InvalidMemoryId(id) => write!(f, "invalid memory id: {id:?}"),
             Error::InvalidKind(kind) => write!(f, "invalid memory kind: {kind:?}"),
             Error::InvalidImportance(tier) => write!(f, "invalid importance tier: {tier:?}"),
