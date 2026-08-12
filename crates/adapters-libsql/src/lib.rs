@@ -1386,10 +1386,13 @@ CREATE INDEX links_high ON links(high_id);
         let db_token = platform.mint_db_token(&org, &token, &group).await.unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        let scenario = turso_scenario(&dir, &db.url, &db_token).await;
-        let cleanup = platform.delete_database(&org, &token, &name).await;
-        let store = scenario.unwrap();
-        cleanup.unwrap();
+        let path = dir.path().to_path_buf();
+        let url = db.url.clone();
+        let store = without_stranding(&platform, &org, &token, &name, async move {
+            turso_scenario(&path, &url, &db_token).await
+        })
+        .await
+        .unwrap();
 
         // Once the primary is gone, a rejected mutation must not be acknowledged or
         // appear in the local read replica.
@@ -1443,14 +1446,34 @@ CREATE INDEX links_high ON links(high_id);
         let db_token = platform.mint_db_token(&org, &token, &group).await.unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        let scenario = migration_scenario(&dir, &db.url, &db_token, &model, dim).await;
-        let cleanup = platform.delete_database(&org, &token, &name).await;
-        scenario.unwrap();
-        cleanup.unwrap();
+        let path = dir.path().to_path_buf();
+        let url = db.url.clone();
+        without_stranding(&platform, &org, &token, &name, async move {
+            migration_scenario(&path, &url, &db_token, &model, dim).await
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Delete the throwaway database whatever the scenario did, including panicking: a failed
+    /// assertion must not strand a database that every later daemon boot then has to explain.
+    async fn without_stranding<T: Send + 'static>(
+        platform: &TursoPlatform,
+        org: &str,
+        token: &str,
+        name: &str,
+        scenario: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> T {
+        let outcome = tokio::spawn(scenario).await;
+        platform.delete_database(org, token, name).await.unwrap();
+        match outcome {
+            Ok(value) => value,
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
     }
 
     async fn migration_scenario(
-        dir: &tempfile::TempDir,
+        dir: &std::path::Path,
         url: &str,
         token: &str,
         model: &str,
@@ -1458,7 +1481,7 @@ CREATE INDEX links_high ON links(high_id);
     ) -> Result<(), domain::Error> {
         let open = |name: &str| {
             LibsqlStore::open(
-                dir.path().join(name),
+                dir.join(name),
                 url.to_string(),
                 token.to_string(),
                 model,
@@ -1494,7 +1517,7 @@ CREATE INDEX links_high ON links(high_id);
         // The migration is only real if it reached the primary. Reading the fresh replica's
         // schema straight after its first pull, before any schema work of our own, is the
         // proof: the column can only be there because the primary carries it.
-        let db_b = Builder::new_remote_replica(dir.path().join("b.db"), url.into(), token.into())
+        let db_b = Builder::new_remote_replica(dir.join("b.db"), url.into(), token.into())
             .read_your_writes(true)
             .build()
             .await
@@ -1518,13 +1541,13 @@ CREATE INDEX links_high ON links(high_id);
     }
 
     async fn turso_scenario(
-        dir: &tempfile::TempDir,
+        dir: &std::path::Path,
         url: &str,
         token: &str,
     ) -> Result<LibsqlStore, domain::Error> {
         let open = |name: &str| {
             LibsqlStore::open(
-                dir.path().join(name),
+                dir.join(name),
                 url.to_string(),
                 token.to_string(),
                 "test-model",
@@ -1546,7 +1569,7 @@ CREATE INDEX links_high ON links(high_id);
         assert_eq!(got.content, memory.content);
 
         drop(store_b);
-        damage_pages(&dir.path().join("b.db"));
+        damage_pages(&dir.join("b.db"));
         let rebuilt = open("b.db").await?;
         assert_eq!(
             rebuilt.get(&memory.id).await?.map(|m| m.content),
