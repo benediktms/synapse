@@ -22,11 +22,12 @@ pub use ports::{Embedder, ScopeFilter, Store};
 pub use similarity::cosine_similarity;
 pub use usecases::{
     ContextDigest, DIGEST_ENTRY_BUDGET, DigestEntry, EditRequest, GRAPH_EDGE_BUDGET,
-    GRAPH_NODE_BUDGET, GraphEdge, GraphNode, GraphSubgraph, MAX_GRAPH_DEPTH, MIN_VECTOR_SIMILARITY,
-    MoveOutcome, RECALL_LIMIT_CAP, RECALL_NEIGHBOUR_CAP, RecallHit, RecallLink, RecallRequest,
-    SaveOutcome, SaveRequest, WorkspaceHits, check_import_acyclic, context_digest, edit,
-    effective_pinned, forget, graph_subgraph, is_superseded, link, list_memories, move_memory,
-    recall, recall_grouped, retype_link, save, superseders_of, unlink,
+    GRAPH_NODE_BUDGET, GraphEdge, GraphNode, GraphSubgraph, LINK_CANDIDATE_CAP,
+    LINK_CANDIDATE_SIMILARITY, LinkCandidate, MAX_GRAPH_DEPTH, MIN_VECTOR_SIMILARITY, MoveOutcome,
+    RECALL_LIMIT_CAP, RECALL_NEIGHBOUR_CAP, RecallHit, RecallLink, RecallRequest, SaveOutcome,
+    SaveRequest, WorkspaceHits, check_import_acyclic, context_digest, edit, effective_pinned,
+    forget, graph_subgraph, is_superseded, link, list_memories, move_memory, recall,
+    recall_grouped, retype_link, save, superseders_of, unlink,
 };
 pub use workspace::Workspace;
 

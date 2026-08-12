@@ -10,6 +10,8 @@ use crate::similarity::cosine_similarity;
 use crate::workspace::Workspace;
 
 pub const MIN_VECTOR_SIMILARITY: f32 = 0.65;
+pub const LINK_CANDIDATE_SIMILARITY: f32 = 0.8;
+pub const LINK_CANDIDATE_CAP: usize = 3;
 pub const RECALL_LIMIT_CAP: usize = 20;
 pub const RECALL_NEIGHBOUR_CAP: usize = 5;
 pub const DIGEST_ENTRY_BUDGET: usize = 100;
@@ -31,9 +33,19 @@ pub struct SaveRequest {
     pub importance: Option<Importance>,
 }
 
+/// A memory the store already holds that closely resembles one just written. Cosine finds it;
+/// only the writer can say whether the relation is a supersession, a contradiction or nothing,
+/// so nothing is linked on its behalf.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkCandidate {
+    pub id: MemoryId,
+    pub title: String,
+    pub similarity: f32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SaveOutcome {
-    Created(Memory),
+    Created(Memory, Vec<LinkCandidate>),
     Unchanged(Memory),
 }
 
@@ -80,8 +92,53 @@ pub async fn save<S: Store, E: Embedder>(
         created_at: now.clone(),
         updated_at: now,
     };
+    let candidates = link_candidates(store, &memory, &embedding).await?;
     store.insert(&memory, &embedding).await?;
-    Ok(SaveOutcome::Created(memory))
+    Ok(SaveOutcome::Created(memory, candidates))
+}
+
+/// The memories already in reach of `memory` that most resemble it, strongest first. Run before
+/// the write, so the new memory cannot match itself.
+async fn link_candidates<S: Store>(
+    store: &S,
+    memory: &Memory,
+    embedding: &[f32],
+) -> Result<Vec<LinkCandidate>, Error> {
+    let filter = ScopeFilter {
+        project: match &memory.scope {
+            Scope::Project(slug) => Some(slug.clone()),
+            Scope::Workspace => None,
+        },
+    };
+    let mut scored: Vec<(MemoryId, f32)> = store
+        .embeddings(&filter)
+        .await?
+        .into_iter()
+        .map(|(id, other)| {
+            let similarity = cosine_similarity(embedding, &other);
+            (id, similarity)
+        })
+        .filter(|(id, similarity)| *similarity >= LINK_CANDIDATE_SIMILARITY && *id != memory.id)
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    scored.truncate(LINK_CANDIDATE_CAP);
+
+    let mut candidates = Vec::new();
+    for (id, similarity) in scored {
+        let Some(existing) = store.get(&id).await? else {
+            continue;
+        };
+        candidates.push(LinkCandidate {
+            id,
+            title: crate::memory::short_form(&existing.title, &existing.content),
+            similarity,
+        });
+    }
+    Ok(candidates)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -951,12 +1008,82 @@ mod tests {
         let store = FakeStore::new();
         let embedder = FakeEmbedder::new().with(&saved_text("fact"), vec![1.0, 0.0]);
         let outcome = block_on(save(&store, &embedder, save_req(1, "fact"), ts(1))).unwrap();
-        let SaveOutcome::Created(memory) = outcome else {
+        let SaveOutcome::Created(memory, candidates) = outcome else {
             panic!("expected Created");
         };
+        assert!(candidates.is_empty(), "an empty store has no candidates");
         assert_eq!(memory.id, mid(1));
         assert!(!memory.pinned);
         assert_eq!(store.embedding_of(&mid(1)), Some(vec![1.0, 0.0]));
+    }
+
+    #[test]
+    fn save_reports_the_nearest_existing_memories_without_linking_them() {
+        let store = FakeStore::new();
+        store.seed(
+            mem(
+                1,
+                "a near twin",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![0.99, 0.1411],
+        );
+        store.seed(
+            mem(
+                2,
+                "also close",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![0.9, 0.4359],
+        );
+        store.seed(
+            mem(3, "unrelated", MemoryKind::Project, Scope::Workspace, false),
+            vec![0.2, 0.9798],
+        );
+        let embedder = FakeEmbedder::new().with(&saved_text("fact"), vec![1.0, 0.0]);
+        let outcome = block_on(save(&store, &embedder, save_req(4, "fact"), ts(1))).unwrap();
+        let SaveOutcome::Created(_, candidates) = outcome else {
+            panic!("expected Created");
+        };
+
+        assert_eq!(
+            candidates.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            vec![mid(1), mid(2)],
+            "only memories above the candidate bar, strongest first"
+        );
+        assert!(candidates[0].similarity > candidates[1].similarity);
+        assert!(
+            block_on(store.links_of(&mid(4))).unwrap().is_empty(),
+            "surfacing a candidate must not create an edge"
+        );
+    }
+
+    #[test]
+    fn save_candidates_stay_inside_the_new_memorys_reach() {
+        let store = FakeStore::new();
+        store.seed(
+            mem(
+                1,
+                "a near twin in another project",
+                MemoryKind::Project,
+                Scope::Project("other/repo".into()),
+                false,
+            ),
+            vec![1.0, 0.0],
+        );
+        let embedder = FakeEmbedder::new().with(&saved_text("fact"), vec![1.0, 0.0]);
+        let outcome = block_on(save(&store, &embedder, save_req(2, "fact"), ts(1))).unwrap();
+        let SaveOutcome::Created(_, candidates) = outcome else {
+            panic!("expected Created");
+        };
+        assert!(
+            candidates.is_empty(),
+            "a workspace-scoped save cannot reach another project's memory"
+        );
     }
 
     #[test]

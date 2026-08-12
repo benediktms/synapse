@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::dto::{ExportDoc, MemoryDto, MoveBody, Origin, PatchMemoryBody, PutMemoryBody};
+use crate::dto::{
+    ExportDoc, LinkCandidateDto, MemoryDto, MoveBody, Origin, PatchMemoryBody, PutMemoryBody,
+};
 
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -254,6 +256,9 @@ pub struct UnlinkResponse {
 pub struct SaveResponse {
     pub created: bool,
     pub memory: MemoryDto,
+    /// Memories the store already held that closely resemble this one. Nothing is linked.
+    #[serde(default)]
+    pub candidates: Vec<LinkCandidateDto>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

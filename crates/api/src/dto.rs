@@ -1,6 +1,6 @@
 use domain::{
-    ContextDigest, DigestEntry, GraphEdge, GraphNode, GraphSubgraph, Memory, MemoryId, MemoryKind,
-    RecallHit, RecallLink, Scope, Timestamp, Workspace, WorkspaceHits,
+    ContextDigest, DigestEntry, GraphEdge, GraphNode, GraphSubgraph, LinkCandidate, Memory,
+    MemoryId, MemoryKind, RecallHit, RecallLink, Scope, Timestamp, Workspace, WorkspaceHits,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -53,6 +53,25 @@ pub struct MemoryDto {
     pub importance: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// A memory the store already held that closely resembles one just written. Advisory: the write
+/// succeeded whether or not the caller acts on it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LinkCandidateDto {
+    pub id: String,
+    pub title: String,
+    pub similarity: f32,
+}
+
+impl From<&LinkCandidate> for LinkCandidateDto {
+    fn from(candidate: &LinkCandidate) -> Self {
+        Self {
+            id: candidate.id.to_string(),
+            title: candidate.title.clone(),
+            similarity: candidate.similarity,
+        }
+    }
 }
 
 impl From<&Memory> for MemoryDto {
