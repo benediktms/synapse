@@ -50,6 +50,17 @@ impl Relation {
         matches!(self, Self::Supersession)
     }
 
+    /// Surfacing order, lowest first: a relation that changes how the reader should treat the
+    /// memory outranks one that only says two memories are related.
+    pub fn priority(self) -> u8 {
+        match self {
+            Self::Supersession => 0,
+            Self::Contradiction => 1,
+            Self::Support => 2,
+            Self::Relation => 3,
+        }
+    }
+
     /// Recall display phrase as seen from the *this* endpoint of the edge.
     pub fn phrase_from(self, directed: bool, this_is_source: bool) -> &'static str {
         match (self, directed, this_is_source) {
@@ -132,6 +143,21 @@ mod tests {
         assert_eq!(
             Relation::Supersession.phrase_from(true, false),
             "is superseded by"
+        );
+    }
+
+    #[test]
+    fn priority_puts_the_relations_that_change_trust_first() {
+        let mut all = Relation::ALL;
+        all.sort_by_key(|r| r.priority());
+        assert_eq!(
+            all,
+            [
+                Relation::Supersession,
+                Relation::Contradiction,
+                Relation::Support,
+                Relation::Relation,
+            ]
         );
     }
 
