@@ -771,8 +771,9 @@ async fn hybrid_search<S: Store>(
 /// memory, emits the other endpoint with a display phrase relative to `memory`. When
 /// `links_in_scope` is set, edges whose neighbor's scope doesn't match `filter` are dropped
 /// (cross-scope links otherwise surface, per Q17). At most `RECALL_NEIGHBOUR_CAP` neighbours are
-/// hydrated, lowest id first, so a hub memory cannot turn one recall into an unbounded fan-out;
-/// the flag says the rest exist.
+/// hydrated, by relation priority and then lowest id, so a hub memory cannot turn one recall into
+/// an unbounded fan-out; the flag says the rest exist. Ranking by anything about the neighbour
+/// itself would mean loading every one of them before the cut.
 async fn build_recall_links<S: Store>(
     store: &S,
     memory: &Memory,
@@ -791,7 +792,10 @@ async fn build_recall_links<S: Store>(
         } else {
             &b.source
         };
-        left.cmp(right).then(a.relation.cmp(&b.relation))
+        a.relation
+            .priority()
+            .cmp(&b.relation.priority())
+            .then(left.cmp(right))
     });
     let mut out = Vec::new();
     let mut truncated = false;
@@ -2273,6 +2277,67 @@ mod tests {
         assert_eq!(hub.links.len(), RECALL_NEIGHBOUR_CAP);
         assert!(hub.links_truncated, "the cut neighbours must be announced");
         assert_eq!(hub.links[0].id, mid(2));
+    }
+
+    #[test]
+    fn recall_keeps_a_contradiction_over_plain_relations_when_it_cuts() {
+        let store = FakeStore::new();
+        store.seed(
+            mem(1, "hub fact", MemoryKind::Project, Scope::Workspace, false),
+            vec![1.0, 0.0],
+        );
+        let spokes = RECALL_NEIGHBOUR_CAP as u32 + 3;
+        for n in 2..2 + spokes {
+            store.seed(
+                mem(
+                    n,
+                    &format!("spoke {n}"),
+                    MemoryKind::Project,
+                    Scope::Workspace,
+                    false,
+                ),
+                vec![0.0, n as f32],
+            );
+            block_on(link(&store, &mid(1), &mid(n), Relation::Relation)).unwrap();
+        }
+        let contradiction_with_the_highest_id = 2 + spokes;
+        store.seed(
+            mem(
+                contradiction_with_the_highest_id,
+                "hub fact is wrong",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![0.0, 1.0],
+        );
+        block_on(link(
+            &store,
+            &mid(1),
+            &mid(contradiction_with_the_highest_id),
+            Relation::Contradiction,
+        ))
+        .unwrap();
+
+        let ws = Workspace::new("work").unwrap();
+        let embedder = FakeEmbedder::new().with("hub fact", vec![1.0, 0.0]);
+        let hits = block_on(recall(
+            &embedder,
+            (&ws, &store),
+            None,
+            &RecallRequest {
+                query: "hub fact".to_string(),
+                project: None,
+                limit: 10,
+                links_in_scope: false,
+            },
+        ))
+        .unwrap();
+
+        let hub = hits.iter().find(|h| h.memory.id == mid(1)).unwrap();
+        assert_eq!(hub.links.len(), RECALL_NEIGHBOUR_CAP);
+        assert_eq!(hub.links[0].id, mid(contradiction_with_the_highest_id));
+        assert_eq!(hub.links[0].phrase, "contradicted by");
     }
 
     #[test]
