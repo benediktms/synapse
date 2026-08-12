@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use daemon_client::DaemonClient;
 
@@ -16,9 +16,9 @@ pub fn run(cmd: DaemonCommand) -> Result<(), String> {
         DaemonCommand::Install => install(),
         DaemonCommand::Uninstall => uninstall(),
         DaemonCommand::Start => start(),
-        DaemonCommand::Stop => stop(),
+        DaemonCommand::Stop => stop(Autostart::Disable),
         DaemonCommand::Restart => {
-            stop()?;
+            stop(Autostart::Keep)?;
             start()
         }
         DaemonCommand::Logs { follow, lines } => logs(follow, lines),
@@ -40,6 +40,7 @@ fn install() -> Result<(), String> {
     let binary = installed_synd()?;
 
     let state_override = state_dir_override();
+    quiesce()?;
 
     if cfg!(target_os = "macos") {
         let path = plist_path()?;
@@ -93,6 +94,7 @@ fn report_install(path: &Path, changed: bool) -> Result<(), String> {
 }
 
 fn uninstall() -> Result<(), String> {
+    quiesce()?;
     if cfg!(target_os = "macos") {
         let path = plist_path()?;
         let path_str = path_str(&path)?;
@@ -167,42 +169,71 @@ fn start() -> Result<(), String> {
     Ok(())
 }
 
-fn stop() -> Result<(), String> {
+/// Whether a stop also revokes the unit's right to start at login.
+#[derive(Clone, Copy, PartialEq)]
+enum Autostart {
+    Disable,
+    Keep,
+}
+
+fn stop(autostart: Autostart) -> Result<(), String> {
+    quiesce()?;
     if cfg!(target_os = "macos") {
         let domain = gui_domain();
         let target = format!("{domain}/{LABEL}");
         let path_str = path_str(&plist_path()?)?;
         tolerate_missing(
-            "launchctl disable",
-            run_tool(&["launchctl", "disable", &target])?,
-        )?;
-        tolerate_missing(
             "launchctl bootout",
             run_tool(&["launchctl", "bootout", &domain, &path_str])?,
         )?;
+        if autostart == Autostart::Disable {
+            tolerate_missing(
+                "launchctl disable",
+                run_tool(&["launchctl", "disable", &target])?,
+            )?;
+        }
     } else if cfg!(target_os = "linux") {
-        tolerate_missing(
-            "systemctl --user disable --now",
-            run_tool(&["systemctl", "--user", "disable", "--now", UNIT_NAME])?,
-        )?;
+        let argv: &[&str] = match autostart {
+            Autostart::Disable => &["systemctl", "--user", "disable", "--now", UNIT_NAME],
+            Autostart::Keep => &["systemctl", "--user", "stop", UNIT_NAME],
+        };
+        tolerate_missing("systemctl --user stop", run_tool(argv)?)?;
     } else {
         return Err(unsupported());
     }
-    println!("daemon unit stopped");
-    warn_if_socket_still_answers();
+    println!("daemon stopped");
     Ok(())
 }
 
-/// A daemon spawned on demand by the CLI is not under the unit's control, so a
-/// unit stop can leave one answering; say so instead of implying the socket is dead.
-fn warn_if_socket_still_answers() {
-    let Ok(state) = daemon_client::state_dir() else {
-        return;
-    };
-    let client = DaemonClient::new(daemon_client::socket_path(&state), Duration::from_secs(1));
-    if client.ping().is_ok() {
-        eprintln!("note: a daemon started outside the unit still answers on the socket");
+const QUIESCE_DEADLINE: Duration = Duration::from_secs(10);
+const QUIESCE_POLL: Duration = Duration::from_millis(100);
+
+/// Ask whatever answers the socket to exit, and wait until nothing does. The unit does not own
+/// the daemon's lifetime — any CLI call spawns one on demand — so stopping the unit alone can
+/// leave the previous binary serving, and a newly installed unit would lose the single-instance
+/// race to it. Failing here leaves the unit untouched on purpose. The shutdown call itself is
+/// allowed to fail: the daemon may drop the connection as it goes, which is the wanted outcome.
+fn quiesce() -> Result<(), String> {
+    let state = daemon_client::state_dir()?;
+    let socket = daemon_client::socket_path(&state);
+    let client = DaemonClient::new(socket.clone(), Duration::from_secs(2));
+    if client.ping().is_err() {
+        return Ok(());
     }
+    let _ = client.shutdown();
+    let deadline = Instant::now() + QUIESCE_DEADLINE;
+    while Instant::now() < deadline {
+        if client.ping().is_err() {
+            return Ok(());
+        }
+        std::thread::sleep(QUIESCE_POLL);
+    }
+    Err(format!(
+        "a daemon still answers on {} after {}s, so nothing was changed; it may predate the \
+         shutdown method — stop it with `pkill -x synd` and retry",
+        socket.display(),
+        QUIESCE_DEADLINE.as_secs()
+    ))
 }
 
 fn logs(follow: bool, lines: usize) -> Result<(), String> {

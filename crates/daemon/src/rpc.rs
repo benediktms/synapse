@@ -21,6 +21,9 @@ use domain::Workspace;
 /// freshness introspection and forced sync. Tests drive `dispatch` with any Backend.
 pub trait RpcHost: Backend {
     fn statuses(&self) -> impl Future<Output = Vec<WorkspaceStatus>> + Send;
+    /// Ask the daemon to exit. A CLI call spawns a daemon outside the unit, so stopping the
+    /// unit alone cannot stop whatever holds the socket — only the socket-holder can.
+    fn request_shutdown(&self);
     /// Sync one replica, or every open replica when `only` is None.
     fn sync_replicas(
         &self,
@@ -161,13 +164,19 @@ async fn call<H: RpcHost>(method: Method, params: Value, host: &H) -> Result<Val
             });
         }
         Method::Status => return encode(&host.statuses().await),
+        Method::Shutdown => {
+            host.request_shutdown();
+            return Ok(Value::from("stopping"));
+        }
         _ => {}
     }
     if let Err(reason) = host.ready() {
         return Err(ApiError::Unready(reason).into());
     }
     match method {
-        Method::Ping | Method::Ready | Method::Status => unreachable!("handled above"),
+        Method::Ping | Method::Ready | Method::Status | Method::Shutdown => {
+            unreachable!("handled above")
+        }
         Method::Sync => {
             let p: SyncParams = parse(params)?;
             let ws = p.origin.as_ref().map(ops::workspace_of).transpose()?;
@@ -406,6 +415,12 @@ mod tests {
         assert_eq!(resp["result"]["created"], true, "{resp}");
         let resp = call(&app, "memory.list", json!({"origin": "preference"})).await;
         assert_eq!(resp["result"]["memories"][0]["content"], "prefers rebase");
+
+        let resp = call(&app, "shutdown", Value::Null).await;
+        assert_eq!(resp["result"], "stopping", "{resp}");
+        tokio::time::timeout(std::time::Duration::from_secs(1), app.shutdown_requested())
+            .await
+            .expect("shutdown must reach the daemon's run loop");
 
         let resp = call(&app, "nope", Value::Null).await;
         assert_eq!(resp["error"]["code"], -32601);

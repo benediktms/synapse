@@ -188,6 +188,12 @@ impl DaemonClient {
         self.call(Method::Status, Value::Null)
     }
 
+    /// Ask the daemon that answers this socket to exit, whoever started it.
+    pub fn shutdown(&self) -> Result<(), DaemonError> {
+        let _: String = self.call(Method::Shutdown, Value::Null)?;
+        Ok(())
+    }
+
     /// Forces a sync and returns the post-sync per-replica status: an unreachable
     /// primary fails open, so `online` is the field that says whether anything moved.
     pub fn sync(&self, origin: Option<Origin>) -> Result<Vec<WorkspaceStatus>, DaemonError> {
