@@ -7,7 +7,7 @@ pub struct DaemonLock {
 }
 
 pub fn acquire(dir: &Path) -> Result<DaemonLock, std::io::Error> {
-    let path = dir.join("daemon.lock");
+    let path = daemon_client::lock_path(dir);
     let file = File::options()
         .create(true)
         .truncate(true)
