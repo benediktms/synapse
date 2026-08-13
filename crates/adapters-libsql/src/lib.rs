@@ -189,6 +189,64 @@ impl LibsqlStore {
         })
     }
 
+    /// Open a replica whose `meta` row `init` would reject, for maintenance — disagreeing with
+    /// the runtime model is the whole reason a store needs re-embedding.
+    ///
+    /// `target_dim` is the width being converted *to*, so writes take new vectors while `meta`
+    /// still describes the old ones. Reads that decode a vector are wrong on this handle until
+    /// the walk finishes and `set_embedding_meta` records it.
+    pub async fn open_maintenance(
+        path: impl AsRef<Path>,
+        url: String,
+        auth_token: String,
+        target_dim: usize,
+    ) -> Result<Self, Error> {
+        let db = Builder::new_remote_replica(path, url, auth_token)
+            .read_your_writes(true)
+            .build()
+            .await
+            .map_err(store_err)?;
+        db.sync().await.map_err(store_err)?;
+        Self::init_maintenance(db, target_dim).await
+    }
+
+    /// `open_maintenance` over an already-built Database.
+    pub async fn init_maintenance(db: Database, target_dim: usize) -> Result<Self, Error> {
+        let conn = db.connect().map_err(store_err)?;
+        ensure_schema(&conn).await?;
+        if !meta_exists(&conn).await? {
+            return Err(Error::Store(
+                "no embedding meta; boot the daemon once to initialize".into(),
+            ));
+        }
+        Ok(Self {
+            db,
+            dim: target_dim,
+            last_sync_ok: std::sync::atomic::AtomicU64::new(0),
+            connected: std::sync::atomic::AtomicBool::new(false),
+            last_error: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The model and dimension the store's vectors were built with.
+    pub async fn embedding_meta(&self) -> Result<(String, usize), Error> {
+        let (model, dim) = embedding_meta(&self.conn()?).await?;
+        Ok((model, usize::try_from(dim).map_err(store_err)?))
+    }
+
+    /// Record the model a re-embed converted the store to. Widening `dim` invalidates every
+    /// vector, so this must run after the walk, never before it.
+    pub async fn set_embedding_meta(&self, model: &str, dim: usize) -> Result<(), Error> {
+        self.conn()?
+            .execute(
+                "UPDATE meta SET embedding_model = ?, embedding_dim = ? WHERE id = 1",
+                params![model, i64::try_from(dim).map_err(store_err)?],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
     /// Pull committed primary frames into the local read replica.
     /// Mutations already reached the primary before their Store operation returned.
     pub async fn sync(&self) -> Result<(), Error> {
@@ -1181,6 +1239,40 @@ mod tests {
                 .await,
             Err(Error::NotFound(_))
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_maintenance_handle_converts_a_store_to_a_wider_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.db");
+        let memory = seeded("m_0000000000000000000000");
+        {
+            let store = local_store(&path).await;
+            store.insert(&memory, &[0.1, 0.2, 0.3, 0.4]).await.unwrap();
+        }
+
+        let db = libsql::Builder::new_local(&path).build().await.unwrap();
+        let store = LibsqlStore::init_maintenance(db, 6).await.unwrap();
+        assert_eq!(
+            store.embedding_meta().await.unwrap(),
+            ("test-model".to_string(), 4),
+            "meta still describes the old model until the walk finishes"
+        );
+
+        store
+            .set_embedding(&memory.id, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .await
+            .unwrap();
+        store.set_embedding_meta("wider-model", 6).await.unwrap();
+
+        let db = libsql::Builder::new_local(&path).build().await.unwrap();
+        let reopened = LibsqlStore::init(db, "wider-model", 6).await.unwrap();
+        let (_, embedding) = reopened
+            .get_with_embedding(&memory.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(embedding, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     async fn indexed_rows(store: &LibsqlStore) -> i64 {
