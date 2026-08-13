@@ -278,6 +278,20 @@ impl Store for SqliteStore {
         .and_then(Memory::try_from)
     }
 
+    async fn set_embedding(&self, id: &MemoryId, embedding: &[f32]) -> Result<(), Error> {
+        let blob = encode_embedding(embedding, self.dim)?;
+        let result = sqlx::query("UPDATE memories SET embedding = ? WHERE id = ?")
+            .bind(blob)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(store_err)?;
+        if result.rows_affected() == 0 {
+            return Err(Error::NotFound(id.clone()));
+        }
+        Ok(())
+    }
+
     async fn delete(&self, id: &MemoryId) -> Result<bool, Error> {
         let id = id.as_str();
         let result = sqlx::query!("DELETE FROM memories WHERE id = ?", id)

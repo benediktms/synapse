@@ -28,6 +28,9 @@ pub trait Store {
         embedding: Option<&[f32]>,
         now: &Timestamp,
     ) -> Result<Memory, Error>;
+    /// Replace a memory's vector and nothing else. Separate from `update` because a re-embed
+    /// is not a semantic edit: `updated_at` must survive it.
+    async fn set_embedding(&self, id: &MemoryId, embedding: &[f32]) -> Result<(), Error>;
     async fn delete(&self, id: &MemoryId) -> Result<bool, Error>;
     async fn list(&self) -> Result<Vec<Memory>, Error>;
     async fn embeddings(&self, filter: &ScopeFilter) -> Result<Vec<(MemoryId, Vec<f32>)>, Error>;

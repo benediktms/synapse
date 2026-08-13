@@ -69,7 +69,11 @@ impl DaemonApp {
 
         // Partial failure must not brick the daemon: healthy workspaces keep serving, and
         // unready blocks everything only when no replica opened at all.
-        let ready = if stores.is_empty() {
+        let ready = if let Some(target) = crate::maintenance::pending_target(&state_dir) {
+            Err(format!(
+                "a reembed towards {target} did not finish; run `synd reembed` to completion"
+            ))
+        } else if stores.is_empty() {
             Err(if problems.is_empty() {
                 "no replicas available: the first run needs the network to bootstrap".to_string()
             } else {

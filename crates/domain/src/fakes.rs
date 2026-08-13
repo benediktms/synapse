@@ -109,6 +109,15 @@ impl Store for FakeStore {
         Ok(memory.clone())
     }
 
+    async fn set_embedding(&self, id: &MemoryId, embedding: &[f32]) -> Result<(), Error> {
+        let mut rows = self.rows.lock().unwrap();
+        let Some((_, stored)) = rows.get_mut(id) else {
+            return Err(Error::NotFound(id.clone()));
+        };
+        *stored = embedding.to_vec();
+        Ok(())
+    }
+
     async fn delete(&self, id: &MemoryId) -> Result<bool, Error> {
         let removed = self.rows.lock().unwrap().remove(id).is_some();
         if removed {

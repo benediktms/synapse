@@ -32,6 +32,13 @@ async fn main() {
             .expect("restrict state dir");
     }
 
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(command) = args.get(1).map(String::as_str)
+        && command != "serve"
+    {
+        std::process::exit(maintenance(command, &args[2..], &dir).await);
+    }
+
     // Single instance: flock the lock file; a second daemon exits 0 immediately. The binding is
     // held for the process lifetime (dropping it would release the lock).
     let _lock = match single_instance::acquire(&dir) {
@@ -97,4 +104,83 @@ async fn main() {
             tracing::info!("shutdown requested; exiting");
         }
     }
+}
+
+/// Offline upkeep over the replica files. It takes the same lock the daemon holds, because a
+/// conversion rewrites vectors the daemon would otherwise be serving mid-walk.
+async fn maintenance(command: &str, args: &[String], dir: &std::path::Path) -> i32 {
+    if !matches!(command, "reembed" | "fts-rebuild") {
+        eprintln!(
+            "error: unknown command {command:?}; \
+             usage: synd [serve | reembed --model <name> | fts-rebuild]"
+        );
+        return 1;
+    }
+    let _lock = match single_instance::acquire(dir) {
+        Ok(lock) => lock,
+        Err(_) => {
+            eprintln!("error: the daemon is running; stop it with `syn daemon stop` first");
+            return 1;
+        }
+    };
+    let config = match Config::load(&config_path(dir)) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!(
+                "error: no daemon config at {}; run `syn setup` first",
+                config_path(dir).display()
+            );
+            return 1;
+        }
+    };
+    let result = match command {
+        "reembed" => run_reembed(args, dir, &config).await,
+        "fts-rebuild" => daemon::maintenance::fts_rebuild(dir, &config)
+            .await
+            .map(|rebuilt| format!("rebuilt the keyword index of {rebuilt} workspace(s)")),
+        other => unreachable!("unknown command {other:?} is rejected before the lock"),
+    };
+    match result {
+        Ok(message) => {
+            println!("{message}");
+            0
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            1
+        }
+    }
+}
+
+async fn run_reembed(
+    args: &[String],
+    dir: &std::path::Path,
+    config: &Config,
+) -> Result<String, String> {
+    let model = match args {
+        [flag, model] if flag == "--model" => model.as_str(),
+        _ => return Err("usage: synd reembed --model <name>".into()),
+    };
+    if model != adapters_fastembed::MODEL_NAME {
+        return Err(format!(
+            "unsupported model {model:?}; this binary embeds with {:?}",
+            adapters_fastembed::MODEL_NAME
+        ));
+    }
+    let embedder = adapters_fastembed::FastEmbedder::with_cache_dir(dir.join("models"))
+        .map_err(|e| format!("embedder: {e}"))?;
+    let report = daemon::maintenance::reembed(
+        dir,
+        config,
+        adapters_fastembed::MODEL_NAME,
+        adapters_fastembed::DIMENSION,
+        &embedder,
+    )
+    .await?;
+    Ok(format!(
+        "converted {} workspace(s), skipped {} already on {}",
+        report.converted,
+        report.skipped,
+        adapters_fastembed::MODEL_NAME
+    ))
 }

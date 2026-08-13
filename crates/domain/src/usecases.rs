@@ -193,6 +193,26 @@ pub async fn edit<S: Store, E: Embedder>(
     store.update(id, &patch, embedding.as_deref(), &now).await
 }
 
+/// Re-embed every memory in the store with `embedder`, returning how many vectors were written.
+/// A memory deleted while the walk is in flight is skipped, not an error.
+///
+/// The walk is not atomic: a crash leaves some vectors on the new model and some on the old, and
+/// the caller's resume marker is what makes the store unreadable until a later run finishes it.
+pub async fn reembed<S: Store, E: Embedder>(store: &S, embedder: &E) -> Result<usize, Error> {
+    let mut written = 0;
+    for memory in store.list().await? {
+        let embedding = embedder
+            .embed(&crate::memory::embed_text(&memory.title, &memory.content))
+            .await?;
+        match store.set_embedding(&memory.id, &embedding).await {
+            Ok(()) => written += 1,
+            Err(Error::NotFound(_)) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(written)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MoveOutcome {
     pub memory: Memory,
@@ -1214,6 +1234,35 @@ mod tests {
         .unwrap();
         assert!(edited.pinned);
         assert_eq!(store.embedding_of(&mid(1)), Some(vec![1.0, 0.0]));
+    }
+
+    #[test]
+    fn reembed_rewrites_every_vector_and_leaves_updated_at_alone() {
+        let store = FakeStore::new();
+        seed_pair(&store, 1, 2);
+        let before = get_mem(&store, &mid(1)).updated_at;
+        let embedder = FakeEmbedder::new()
+            .with("fact 1", vec![9.0, 1.0])
+            .with("fact 2", vec![9.0, 2.0]);
+
+        let written = block_on(reembed(&store, &embedder)).unwrap();
+
+        assert_eq!(written, 2);
+        assert_eq!(store.embedding_of(&mid(1)), Some(vec![9.0, 1.0]));
+        assert_eq!(store.embedding_of(&mid(2)), Some(vec![9.0, 2.0]));
+        assert_eq!(get_mem(&store, &mid(1)).updated_at, before);
+    }
+
+    #[test]
+    fn reembed_covers_a_titled_memory_by_its_embed_text() {
+        let store = FakeStore::new();
+        let mut memory = mem(1, "fact", MemoryKind::Project, Scope::Workspace, false);
+        memory.title = TEST_TITLE.to_string();
+        store.seed(memory, vec![1.0, 0.0]);
+        let embedder = FakeEmbedder::new().with(&saved_text("fact"), vec![4.0, 2.0]);
+
+        assert_eq!(block_on(reembed(&store, &embedder)).unwrap(), 1);
+        assert_eq!(store.embedding_of(&mid(1)), Some(vec![4.0, 2.0]));
     }
 
     #[test]

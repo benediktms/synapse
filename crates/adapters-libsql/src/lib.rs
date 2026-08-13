@@ -189,6 +189,64 @@ impl LibsqlStore {
         })
     }
 
+    /// Open a replica whose `meta` row `init` would reject, for maintenance — disagreeing with
+    /// the runtime model is the whole reason a store needs re-embedding.
+    ///
+    /// `target_dim` is the width being converted *to*, so writes take new vectors while `meta`
+    /// still describes the old ones. Reads that decode a vector are wrong on this handle until
+    /// the walk finishes and `set_embedding_meta` records it.
+    pub async fn open_maintenance(
+        path: impl AsRef<Path>,
+        url: String,
+        auth_token: String,
+        target_dim: usize,
+    ) -> Result<Self, Error> {
+        let db = Builder::new_remote_replica(path, url, auth_token)
+            .read_your_writes(true)
+            .build()
+            .await
+            .map_err(store_err)?;
+        db.sync().await.map_err(store_err)?;
+        Self::init_maintenance(db, target_dim).await
+    }
+
+    /// `open_maintenance` over an already-built Database.
+    pub async fn init_maintenance(db: Database, target_dim: usize) -> Result<Self, Error> {
+        let conn = db.connect().map_err(store_err)?;
+        ensure_schema(&conn).await?;
+        if !meta_exists(&conn).await? {
+            return Err(Error::Store(
+                "no embedding meta; boot the daemon once to initialize".into(),
+            ));
+        }
+        Ok(Self {
+            db,
+            dim: target_dim,
+            last_sync_ok: std::sync::atomic::AtomicU64::new(0),
+            connected: std::sync::atomic::AtomicBool::new(false),
+            last_error: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The model and dimension the store's vectors were built with.
+    pub async fn embedding_meta(&self) -> Result<(String, usize), Error> {
+        let (model, dim) = embedding_meta(&self.conn()?).await?;
+        Ok((model, usize::try_from(dim).map_err(store_err)?))
+    }
+
+    /// Record the model a re-embed converted the store to. Widening `dim` invalidates every
+    /// vector, so this must run after the walk, never before it.
+    pub async fn set_embedding_meta(&self, model: &str, dim: usize) -> Result<(), Error> {
+        self.conn()?
+            .execute(
+                "UPDATE meta SET embedding_model = ?, embedding_dim = ? WHERE id = 1",
+                params![model, i64::try_from(dim).map_err(store_err)?],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
     /// Pull committed primary frames into the local read replica.
     /// Mutations already reached the primary before their Store operation returned.
     pub async fn sync(&self) -> Result<(), Error> {
@@ -213,6 +271,20 @@ impl LibsqlStore {
                 Err(err)
             }
         }
+    }
+
+    /// Rebuild `memories_fts` from the `memories` table it shadows. The schema widening runs
+    /// once per replica and never again, so this is the only repair for an index that has
+    /// drifted from its content table.
+    pub async fn fts_rebuild(&self) -> Result<(), Error> {
+        self.conn()?
+            .execute(
+                "INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
     }
 
     /// Unix seconds of the last successful sync (0 if none).
@@ -381,6 +453,22 @@ impl Store for LibsqlStore {
         self.get(id)
             .await?
             .ok_or_else(|| Error::NotFound(id.clone()))
+    }
+
+    async fn set_embedding(&self, id: &MemoryId, embedding: &[f32]) -> Result<(), Error> {
+        let conn = self.conn()?;
+        let blob = Value::Blob(encode_embedding(embedding, self.dim)?);
+        let affected = conn
+            .execute(
+                "UPDATE memories SET embedding = ? WHERE id = ?",
+                params![blob, id.as_str()],
+            )
+            .await
+            .map_err(store_err)?;
+        if affected == 0 {
+            return Err(Error::NotFound(id.clone()));
+        }
+        Ok(())
     }
 
     async fn delete(&self, id: &MemoryId) -> Result<bool, Error> {
@@ -1104,6 +1192,127 @@ mod tests {
             hits,
             vec![memory.id.clone()],
             "a row matching one term of three is noise, not a hit"
+        );
+    }
+
+    async fn local_store(path: &Path) -> LibsqlStore {
+        let db = libsql::Builder::new_local(path).build().await.unwrap();
+        LibsqlStore::init(db, "test-model", 4).await.unwrap()
+    }
+
+    fn seeded(id: &str) -> Memory {
+        Memory {
+            id: MemoryId::parse(id).unwrap(),
+            content: "deploy staging offers".to_string(),
+            title: String::new(),
+            kind: MemoryKind::parse("reference").unwrap(),
+            scope: Scope::parse("workspace").unwrap(),
+            tags: Vec::new(),
+            pinned: false,
+            importance: domain::Importance::from_rank(1),
+            created_at: Timestamp::new("2026-08-07T00:00:00Z".to_string()),
+            updated_at: Timestamp::new("2026-08-07T00:00:00Z".to_string()),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_embedding_replaces_the_vector_and_leaves_updated_at_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(&dir.path().join("replica.db")).await;
+        let memory = seeded("m_0000000000000000000000");
+        store.insert(&memory, &[0.1, 0.2, 0.3, 0.4]).await.unwrap();
+
+        store
+            .set_embedding(&memory.id, &[0.9, 0.8, 0.7, 0.6])
+            .await
+            .unwrap();
+
+        let (got, embedding) = store.get_with_embedding(&memory.id).await.unwrap().unwrap();
+        assert_eq!(embedding, vec![0.9, 0.8, 0.7, 0.6]);
+        assert_eq!(got, memory);
+        assert!(matches!(
+            store
+                .set_embedding(
+                    &MemoryId::parse("m_0000000000000000000009").unwrap(),
+                    &[0.0; 4]
+                )
+                .await,
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_maintenance_handle_converts_a_store_to_a_wider_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica.db");
+        let memory = seeded("m_0000000000000000000000");
+        {
+            let store = local_store(&path).await;
+            store.insert(&memory, &[0.1, 0.2, 0.3, 0.4]).await.unwrap();
+        }
+
+        let db = libsql::Builder::new_local(&path).build().await.unwrap();
+        let store = LibsqlStore::init_maintenance(db, 6).await.unwrap();
+        assert_eq!(
+            store.embedding_meta().await.unwrap(),
+            ("test-model".to_string(), 4),
+            "meta still describes the old model until the walk finishes"
+        );
+
+        store
+            .set_embedding(&memory.id, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .await
+            .unwrap();
+        store.set_embedding_meta("wider-model", 6).await.unwrap();
+
+        let db = libsql::Builder::new_local(&path).build().await.unwrap();
+        let reopened = LibsqlStore::init(db, "wider-model", 6).await.unwrap();
+        let (_, embedding) = reopened
+            .get_with_embedding(&memory.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(embedding, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    async fn indexed_rows(store: &LibsqlStore) -> i64 {
+        let conn = store.conn().unwrap();
+        let stmt = conn
+            .prepare("SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'deploy'")
+            .await
+            .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fts_rebuild_restores_a_keyword_index_that_lost_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(&dir.path().join("replica.db")).await;
+        let memory = seeded("m_0000000000000000000000");
+        store.insert(&memory, &[0.1, 0.2, 0.3, 0.4]).await.unwrap();
+        assert_eq!(indexed_rows(&store).await, 1);
+
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO memories_fts(memories_fts) VALUES ('delete-all')",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(indexed_rows(&store).await, 0);
+
+        store.fts_rebuild().await.unwrap();
+
+        assert_eq!(indexed_rows(&store).await, 1);
+        assert_eq!(
+            store
+                .keyword_search("deploy", &ScopeFilter::default(), 10)
+                .await
+                .unwrap(),
+            vec![memory.id]
         );
     }
 

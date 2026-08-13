@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod maintenance;
 pub mod rpc;
 pub mod single_instance;
 pub mod update;
