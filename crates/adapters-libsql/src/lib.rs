@@ -1588,16 +1588,20 @@ CREATE INDEX links_high ON links(high_id);
         let platform = TursoPlatform::new();
         let group = platform.ensure_group(&org, &token).await.unwrap();
         let name = format!("synapse-test-{}", std::process::id());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
         let db = platform
             .create_database(&org, &token, &group, &name)
             .await
             .unwrap();
-        let db_token = platform.mint_db_token(&org, &token, &group).await.unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
         let url = db.url.clone();
+        let (minting_org, minting_token, minting_group) =
+            (org.clone(), token.clone(), group.clone());
         let store = without_stranding(&platform, &org, &token, &name, async move {
+            let db_token = TursoPlatform::new()
+                .mint_db_token(&minting_org, &minting_token, &minting_group)
+                .await
+                .unwrap();
             turso_scenario(&path, &url, &db_token).await
         })
         .await
@@ -1648,16 +1652,20 @@ CREATE INDEX links_high ON links(high_id);
         let platform = TursoPlatform::new();
         let group = platform.ensure_group(&org, &token).await.unwrap();
         let name = format!("synapse-migration-{}", std::process::id());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
         let db = platform
             .create(&org, &token, &group, &name, Some(&source))
             .await
             .unwrap();
-        let db_token = platform.mint_db_token(&org, &token, &group).await.unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
         let url = db.url.clone();
+        let (minting_org, minting_token, minting_group) =
+            (org.clone(), token.clone(), group.clone());
         without_stranding(&platform, &org, &token, &name, async move {
+            let db_token = TursoPlatform::new()
+                .mint_db_token(&minting_org, &minting_token, &minting_group)
+                .await
+                .unwrap();
             migration_scenario(&path, &url, &db_token, &model, dim).await
         })
         .await

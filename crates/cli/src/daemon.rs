@@ -147,20 +147,31 @@ fn start() -> Result<(), String> {
                 return Err(format!("launchctl print failed (exit {code}): {stderr}"));
             }
         };
+        quiesce()?;
         require_success(
             "launchctl enable",
             run_tool(&["launchctl", "enable", &target])?,
         )?;
-        if !loaded {
+        if loaded {
+            require_success(
+                "launchctl kickstart",
+                run_tool(&["launchctl", "kickstart", "-k", &target])?,
+            )?;
+        } else {
             require_success(
                 "launchctl bootstrap",
                 run_tool(&["launchctl", "bootstrap", &domain, &path_str])?,
             )?;
         }
     } else if cfg!(target_os = "linux") {
+        quiesce()?;
         require_success(
-            "systemctl --user enable --now",
-            run_tool(&["systemctl", "--user", "enable", "--now", UNIT_NAME])?,
+            "systemctl --user enable",
+            run_tool(&["systemctl", "--user", "enable", UNIT_NAME])?,
+        )?;
+        require_success(
+            "systemctl --user restart",
+            run_tool(&["systemctl", "--user", "restart", UNIT_NAME])?,
         )?;
     } else {
         return Err(unsupported());
@@ -208,32 +219,63 @@ fn stop(autostart: Autostart) -> Result<(), String> {
 const QUIESCE_DEADLINE: Duration = Duration::from_secs(10);
 const QUIESCE_POLL: Duration = Duration::from_millis(100);
 
-/// Ask whatever answers the socket to exit, and wait until nothing does. The unit does not own
-/// the daemon's lifetime — any CLI call spawns one on demand — so stopping the unit alone can
-/// leave the previous binary serving, and a newly installed unit would lose the single-instance
-/// race to it. Failing here leaves the unit untouched on purpose. The shutdown call itself is
-/// allowed to fail: the daemon may drop the connection as it goes, which is the wanted outcome.
+/// Ask whatever answers the socket to exit, and wait until nothing does and nothing holds the
+/// lock. The unit does not own the daemon's lifetime — any CLI call spawns one on demand — so
+/// stopping the unit alone can leave the previous binary serving, and a freshly started unit
+/// would lose the single-instance race to it. Failing here leaves the unit untouched on purpose.
+///
+/// A daemon stops answering the socket before it releases the lock, so waiting on the socket
+/// alone hands the caller a window in which a replacement still loses that race and exits.
 fn quiesce() -> Result<(), String> {
     let state = daemon_client::state_dir()?;
     let socket = daemon_client::socket_path(&state);
     let client = DaemonClient::new(socket.clone(), Duration::from_secs(2));
-    if client.ping().is_err() {
-        return Ok(());
-    }
-    let _ = client.shutdown();
     let deadline = Instant::now() + QUIESCE_DEADLINE;
-    while Instant::now() < deadline {
-        if client.ping().is_err() {
+    if client.ping().is_ok() {
+        let _ = client.shutdown();
+        loop {
+            if client.ping().is_err() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "a daemon still answers on {} after {}s, so nothing was changed; it may \
+                     predate the shutdown method — stop it with `pkill -x synd` and retry",
+                    socket.display(),
+                    QUIESCE_DEADLINE.as_secs()
+                ));
+            }
+            std::thread::sleep(QUIESCE_POLL);
+        }
+    }
+    let lock = daemon_client::lock_path(&state);
+    loop {
+        if lock_is_free(&lock) {
             return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "nothing answers the socket but {} is still held after {}s, so nothing was \
+                 changed; a daemon is shutting down or wedged — check `pgrep -x synd`",
+                lock.display(),
+                QUIESCE_DEADLINE.as_secs()
+            ));
         }
         std::thread::sleep(QUIESCE_POLL);
     }
-    Err(format!(
-        "a daemon still answers on {} after {}s, so nothing was changed; it may predate the \
-         shutdown method — stop it with `pkill -x synd` and retry",
-        socket.display(),
-        QUIESCE_DEADLINE.as_secs()
-    ))
+}
+
+fn lock_is_free(path: &Path) -> bool {
+    match std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file.try_lock().is_ok(),
+        Err(_) => true,
+    }
 }
 
 fn logs(follow: bool, lines: usize) -> Result<(), String> {
@@ -449,6 +491,29 @@ fn write_if_changed(path: &Path, desired: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_lock_reads_as_taken_and_a_released_one_as_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = daemon_client::lock_path(dir.path());
+        assert!(lock_is_free(&path), "an absent lock file is free");
+
+        let holder = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+        assert!(
+            !lock_is_free(&path),
+            "a daemon holding the lock is not free"
+        );
+
+        drop(holder);
+        assert!(lock_is_free(&path), "the lock frees when its holder exits");
+    }
 
     #[test]
     fn plist_substitutes_every_placeholder_and_escapes_xml() {

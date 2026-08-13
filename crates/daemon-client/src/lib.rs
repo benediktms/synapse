@@ -55,6 +55,11 @@ pub fn config_path(state_dir: &Path) -> PathBuf {
     state_dir.join("daemon.toml")
 }
 
+/// The file whose advisory lock admits exactly one daemon.
+pub fn lock_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("daemon.lock")
+}
+
 /// One org this machine replicates, with its org-scoped Turso token.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ScopedOrg {
