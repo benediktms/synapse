@@ -215,6 +215,20 @@ impl LibsqlStore {
         }
     }
 
+    /// Rebuild `memories_fts` from the `memories` table it shadows. The schema widening runs
+    /// once per replica and never again, so this is the only repair for an index that has
+    /// drifted from its content table.
+    pub async fn fts_rebuild(&self) -> Result<(), Error> {
+        self.conn()?
+            .execute(
+                "INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
     /// Unix seconds of the last successful sync (0 if none).
     pub fn last_synced_at(&self) -> u64 {
         self.last_sync_ok.load(std::sync::atomic::Ordering::Relaxed)
@@ -1120,6 +1134,93 @@ mod tests {
             hits,
             vec![memory.id.clone()],
             "a row matching one term of three is noise, not a hit"
+        );
+    }
+
+    async fn local_store(path: &Path) -> LibsqlStore {
+        let db = libsql::Builder::new_local(path).build().await.unwrap();
+        LibsqlStore::init(db, "test-model", 4).await.unwrap()
+    }
+
+    fn seeded(id: &str) -> Memory {
+        Memory {
+            id: MemoryId::parse(id).unwrap(),
+            content: "deploy staging offers".to_string(),
+            title: String::new(),
+            kind: MemoryKind::parse("reference").unwrap(),
+            scope: Scope::parse("workspace").unwrap(),
+            tags: Vec::new(),
+            pinned: false,
+            importance: domain::Importance::from_rank(1),
+            created_at: Timestamp::new("2026-08-07T00:00:00Z".to_string()),
+            updated_at: Timestamp::new("2026-08-07T00:00:00Z".to_string()),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_embedding_replaces_the_vector_and_leaves_updated_at_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(&dir.path().join("replica.db")).await;
+        let memory = seeded("m_0000000000000000000000");
+        store.insert(&memory, &[0.1, 0.2, 0.3, 0.4]).await.unwrap();
+
+        store
+            .set_embedding(&memory.id, &[0.9, 0.8, 0.7, 0.6])
+            .await
+            .unwrap();
+
+        let (got, embedding) = store.get_with_embedding(&memory.id).await.unwrap().unwrap();
+        assert_eq!(embedding, vec![0.9, 0.8, 0.7, 0.6]);
+        assert_eq!(got, memory);
+        assert!(matches!(
+            store
+                .set_embedding(
+                    &MemoryId::parse("m_0000000000000000000009").unwrap(),
+                    &[0.0; 4]
+                )
+                .await,
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    async fn indexed_rows(store: &LibsqlStore) -> i64 {
+        let conn = store.conn().unwrap();
+        let stmt = conn
+            .prepare("SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'deploy'")
+            .await
+            .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fts_rebuild_restores_a_keyword_index_that_lost_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(&dir.path().join("replica.db")).await;
+        let memory = seeded("m_0000000000000000000000");
+        store.insert(&memory, &[0.1, 0.2, 0.3, 0.4]).await.unwrap();
+        assert_eq!(indexed_rows(&store).await, 1);
+
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO memories_fts(memories_fts) VALUES ('delete-all')",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(indexed_rows(&store).await, 0);
+
+        store.fts_rebuild().await.unwrap();
+
+        assert_eq!(indexed_rows(&store).await, 1);
+        assert_eq!(
+            store
+                .keyword_search("deploy", &ScopeFilter::default(), 10)
+                .await
+                .unwrap(),
+            vec![memory.id]
         );
     }
 
