@@ -44,14 +44,6 @@ agents *args:
 agents-dry:
     @just agents --dry-run
 
-# rebuild the server image and restart it (data in ./data survives)
-serve:
-    docker compose up -d --build
-    @sleep 6; curl -sf localhost:8737/health && echo
-
-logs:
-    docker compose logs -f --tail 50
-
-# end-to-end drills against the built image — WIPES ./data
-verify *args:
-    ./scripts/verify.sh {{ args }}
+# tail the daemon's log
+logs *args:
+    syn daemon logs {{ args }}

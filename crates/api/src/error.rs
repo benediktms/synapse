@@ -1,8 +1,3 @@
-use axum::Json;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use serde_json::json;
-
 use crate::backend::BackendError;
 
 #[derive(Clone, Debug)]
@@ -13,20 +8,6 @@ pub enum ApiError {
     Conflict(String),
     Unready(String),
     Internal(String),
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
-            Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-            Self::Conflict(msg) => (StatusCode::CONFLICT, msg),
-            Self::Unready(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
-            Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-        };
-        (status, Json(json!({ "error": message }))).into_response()
-    }
 }
 
 impl From<BackendError> for ApiError {

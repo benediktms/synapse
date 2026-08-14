@@ -356,17 +356,30 @@ pub enum WorkspaceCommand {
     MapOrg { org: String, name: String },
 }
 
+/// All three verbs configured the retired HTTP server. They stay parseable so a script that
+/// still calls one is told what replaced it, rather than getting clap's "unrecognized
+/// subcommand" and a non-zero exit it cannot interpret.
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
-    /// Store the server bearer token
+    #[command(hide = true)]
     SetToken { token: String },
-    /// Store the server base URL
+    #[command(hide = true)]
     SetUrl { url: String },
-    /// Choose the backend: `http` (the axum server) or `daemon` (the replication daemon)
+    #[command(hide = true)]
     SetTransport {
         #[arg(value_parser = ["http", "daemon"])]
         transport: String,
     },
+}
+
+impl ConfigCommand {
+    pub fn retired_flag(&self) -> &'static str {
+        match self {
+            Self::SetToken { .. } => "set-token",
+            Self::SetUrl { .. } => "set-url",
+            Self::SetTransport { .. } => "set-transport",
+        }
+    }
 }
 
 #[cfg(test)]

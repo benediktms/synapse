@@ -14,7 +14,7 @@ struct Machine {
 
 impl Machine {
     fn new() -> Self {
-        Self::with_config("transport = \"daemon\"\ndefault_workspace = \"work\"\n")
+        Self::with_config("default_workspace = \"work\"\n")
     }
 
     /// Where `syn` will look for the daemon, given this machine's state dir.
@@ -600,28 +600,6 @@ fn a_read_says_so_when_it_may_predate_a_queued_save() {
 }
 
 #[test]
-fn a_url_that_can_never_reach_a_server_is_refused_where_it_is_set() {
-    let machine = Machine::with_config("");
-
-    for bad in ["127.0.0.1:8737", "htttp://127.0.0.1:8737", ""] {
-        let output = machine.run(&["config", "set-url", bad]);
-        assert!(!output.status.success(), "{bad:?} was accepted");
-        assert!(
-            stderr(&output).contains("is not a usable server url"),
-            "{bad:?}: {}",
-            stderr(&output)
-        );
-    }
-
-    assert!(
-        machine
-            .run(&["config", "set-url", "https://memory.example/"])
-            .status
-            .success()
-    );
-}
-
-#[test]
 fn a_read_stays_within_its_flush_budget_when_another_process_holds_the_lock() {
     let machine = Machine::new();
     assert!(
@@ -902,44 +880,17 @@ fn config_and_workspace_use_write_a_private_config() {
 
     assert!(
         machine
-            .run(&["config", "set-url", "https://memory.example/"])
-            .status
-            .success()
-    );
-    assert!(
-        machine
-            .run(&["config", "set-token", "sekret"])
-            .status
-            .success()
-    );
-    assert!(
-        machine
             .run(&["workspace", "use", "personal"])
             .status
             .success()
     );
 
     let text = std::fs::read_to_string(&config).unwrap();
-    assert!(text.contains("url = \"https://memory.example\""), "{text}");
-    assert!(text.contains("token = \"sekret\""), "{text}");
     assert!(text.contains("default_workspace = \"personal\""), "{text}");
 
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(&config).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-}
-
-#[test]
-fn a_missing_token_fails_with_one_actionable_line() {
-    let machine = Machine::with_config("default_workspace = \"work\"\n");
-
-    let output = machine.run(&["recall", "anything"]);
-
-    assert!(!output.status.success());
-    assert_eq!(
-        stderr(&output),
-        "error: no token configured; run: syn config set-token <token>\n"
-    );
 }
 
 #[test]
@@ -1193,7 +1144,7 @@ fn a_queued_everywhere_save_replays_as_one() {
 
 #[test]
 fn workspace_map_writes_a_path_rule_that_saves_resolve_against() {
-    let machine = Machine::with_config("transport = \"daemon\"\n");
+    let machine = Machine::with_config("");
     let _stub = machine.stub();
     machine.init_git_repo();
 
@@ -1239,10 +1190,10 @@ fn workspace_map_writes_a_path_rule_that_saves_resolve_against() {
 
 #[test]
 fn routing_free_commands_work_with_git_absent_from_path() {
-    let machine = Machine::with_config("token = \"t\"\n");
+    let machine = Machine::with_config("");
 
-    let set = machine.run_without_git(&["config", "set-token", "abc123"]);
-    assert!(set.status.success(), "{}", stderr(&set));
+    let chosen = machine.run_without_git(&["workspace", "use", "personal"]);
+    assert!(chosen.status.success(), "{}", stderr(&chosen));
 
     let pending = machine.run_without_git(&["list", "--pending"]);
     assert!(pending.status.success(), "{}", stderr(&pending));
@@ -1425,7 +1376,7 @@ fn map_org_round_trips_through_list_and_keeps_the_config_private() {
 
 #[test]
 fn re_mapping_an_org_under_a_different_case_replaces_the_old_rule() {
-    let machine = Machine::with_config("transport = \"daemon\"\n");
+    let machine = Machine::with_config("");
     let _stub = machine.stub();
 
     let first = machine.run(&["workspace", "map-org", "Acme", "one"]);
@@ -1473,7 +1424,7 @@ fn a_present_but_unusable_repo_refuses_the_save_instead_of_defaulting() {
 
 #[test]
 fn an_org_rule_routes_an_unmapped_repo_and_its_worktree() {
-    let machine = Machine::with_config("transport = \"daemon\"\n");
+    let machine = Machine::with_config("");
     let _stub = machine.stub();
     machine.init_git_repo_with_origin("git@github.com:acme/widgets.git");
 
@@ -1531,7 +1482,7 @@ fn an_org_rule_routes_an_unmapped_repo_and_its_worktree() {
 
 #[test]
 fn a_nested_path_rule_still_beats_an_org_rule_for_the_same_repo() {
-    let machine = Machine::with_config("transport = \"daemon\"\n");
+    let machine = Machine::with_config("");
     let _stub = machine.stub();
     machine.init_git_repo_with_origin("git@github.com:acme/widgets.git");
 
@@ -1559,7 +1510,7 @@ fn a_nested_path_rule_still_beats_an_org_rule_for_the_same_repo() {
 
 #[test]
 fn an_origin_less_repo_falls_through_org_rules_without_crashing() {
-    let machine = Machine::with_config("transport = \"daemon\"\n");
+    let machine = Machine::with_config("");
     let _stub = machine.stub();
     machine.init_git_repo();
 
