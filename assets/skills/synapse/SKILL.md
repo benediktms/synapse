@@ -276,7 +276,7 @@ Every command acts on one store, so say which — read it off the hit line:
 `--scope everywhere`. Omit the flag and it uses the workspace resolved for the
 current directory, which is right when acting on a hit from that same workspace.
 
-**When the server is down**, reads fail fast with a one-line error — carry on
+**When the daemon cannot be reached**, reads fail fast with a one-line error — carry on
 without synapses, do not retry in a loop. Writes queue locally and report
 `queued … not yet recallable`, flushing on the next successful command. Say so
 plainly rather than claiming it was stored. `syn list --pending` shows the queue.
