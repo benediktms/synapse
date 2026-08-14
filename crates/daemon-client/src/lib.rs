@@ -23,6 +23,15 @@ use api::{
     MoveResponse, Origin, PatchMemoryBody, PutMemoryBody, SearchResponse,
 };
 
+/// Set this to keep `ensure_running` from spawning `synd`, leaving a client to talk to
+/// whatever already answers the socket. For a test harness, and for anyone whose daemon is
+/// owned by launchd or systemd.
+pub const NO_AUTOSTART: &str = "SYNAPSE_NO_DAEMON_AUTOSTART";
+
+fn autostart_disabled() -> bool {
+    std::env::var_os(NO_AUTOSTART).is_some_and(|value| !value.is_empty())
+}
+
 /// The daemon's state directory: `$SYNAPSE_STATE_DIR/daemon`, or the XDG state home.
 /// The daemon binary and every client must derive the same path, and a cwd-relative
 /// fallback would scatter state wherever the process happened to start.
@@ -134,6 +143,10 @@ pub struct DaemonClient {
 impl DaemonClient {
     pub fn new(socket: PathBuf, timeout: Duration) -> Self {
         Self { socket, timeout }
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket
     }
 
     /// Connect, send one request line, read one response line, close.
@@ -422,6 +435,12 @@ pub fn log_path(state_dir: &Path) -> PathBuf {
 /// during the poll fails immediately with the log tail instead of running out the clock.
 pub fn ensure_running(client: &DaemonClient, state_dir: &Path) -> Result<(), String> {
     if client.ping().is_ok() {
+        return Ok(());
+    }
+    // Not an error: the caller's own call then fails with a Transport error, which the outbox
+    // classifies as retryable and queues. Refusing here instead would turn a write that should
+    // queue into a hard failure.
+    if autostart_disabled() {
         return Ok(());
     }
     std::fs::create_dir_all(state_dir)
