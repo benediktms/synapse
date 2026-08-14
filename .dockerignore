@@ -1,8 +1,0 @@
-*
-!Cargo.toml
-!Cargo.lock
-!crates
-!xtask
-crates/**/target
-crates/**/.fastembed_cache
-xtask/target

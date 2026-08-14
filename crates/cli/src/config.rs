@@ -5,30 +5,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Unknown keys are ignored rather than rejected, so a file written before the HTTP
+/// transport was removed — carrying `url`, `token` or `transport` — still loads.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Config {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    /// Which backend commands talk to: `http` (default, the axum server) or `daemon`
-    /// (the local replication daemon). The HTTP path is deleted at cutover.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transport: Option<Transport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_rules: Vec<WorkspaceRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub org_rules: Vec<OrgRule>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Transport {
-    #[default]
-    Http,
-    Daemon,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -68,21 +54,6 @@ impl Config {
         private_dir(dir)?;
         let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
         write_private(path, text.as_bytes())
-    }
-
-    pub fn url(&self) -> &str {
-        self.url.as_deref().unwrap_or(api_client::DEFAULT_BASE_URL)
-    }
-
-    pub fn token(&self) -> Result<&str, String> {
-        self.token
-            .as_deref()
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| "no token configured; run: syn config set-token <token>".to_string())
-    }
-
-    pub fn transport(&self) -> Transport {
-        self.transport.unwrap_or_default()
     }
 }
 
@@ -158,9 +129,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("config.toml");
         let config = Config {
-            url: Some("https://memory.example".into()),
-            token: Some("secret".into()),
-            transport: Some(Transport::Daemon),
             default_workspace: Some("personal".into()),
             workspace_rules: vec![WorkspaceRule {
                 path: "/Users/x/work".into(),
@@ -186,7 +154,7 @@ mod tests {
         assert!(text.contains("[[org_rules]]"), "{text}");
 
         let loaded = Config::load_from(&path).unwrap();
-        assert_eq!(loaded.token.as_deref(), Some("secret"));
+        assert_eq!(loaded.default_workspace.as_deref(), Some("personal"));
         assert_eq!(loaded.workspace_rules[0].workspace, "work");
         assert_eq!(loaded.org_rules[0].org, "freshaengineering");
     }
@@ -195,8 +163,37 @@ mod tests {
     fn missing_config_is_empty_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load_from(&dir.path().join("absent.toml")).unwrap();
-        assert!(config.token.is_none());
-        assert_eq!(config.url(), api_client::DEFAULT_BASE_URL);
-        assert!(config.token().is_err());
+        assert!(config.default_workspace.is_none());
+        assert!(config.workspace_rules.is_empty());
+        assert!(config.org_rules.is_empty());
+    }
+
+    /// A file written before the HTTP transport was removed still loads: its `url`, `token`
+    /// and `transport` keys are ignored rather than rejected, so no one has to hand-edit a
+    /// config to keep working.
+    #[test]
+    fn a_config_from_the_http_era_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "url = \"http://127.0.0.1:8737\"\ntoken = \"secret\"\ntransport = \"http\"\n\
+             default_workspace = \"work\"\n\n[[org_rules]]\norg = \"benediktms\"\n\
+             workspace = \"personal\"\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_from(&path).expect("an HTTP-era config must still load");
+        assert_eq!(loaded.default_workspace.as_deref(), Some("work"));
+        assert_eq!(loaded.org_rules[0].workspace, "personal");
+
+        loaded.save_to(&path).unwrap();
+        let rewritten = fs::read_to_string(&path).unwrap();
+        for retired in ["url", "token", "transport"] {
+            assert!(
+                !rewritten.contains(retired),
+                "a rewrite kept the retired {retired} key: {rewritten}"
+            );
+        }
     }
 }

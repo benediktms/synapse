@@ -2,18 +2,14 @@ use api::{
     ContextResponse, ExportDoc, GraphDto, ImportReport, LinkCandidateDto, MemoryDto, MoveBody,
     MoveResponse, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody, SearchResponse,
 };
-use api_client::SynapseApiClient;
 use daemon_client::DaemonClient;
 use domain::Scope;
 
 use crate::outbox::{SaveTarget, SendFailure};
 
-/// The backend a command talks to. Both transports expose the HTTP client's method
-/// surface, so commands stay transport-blind; only the outbox paths branch.
-pub enum Client {
-    Http(SynapseApiClient),
-    Daemon(DaemonClient),
-}
+/// The daemon, with the CLI's two-store vocabulary mapped onto the wire's `Origin`: a named
+/// workspace, or the preferences every workspace can reach.
+pub struct Client(DaemonClient);
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -31,75 +27,54 @@ fn preference_body(body: PutPreferenceBody) -> PutMemoryBody {
 }
 
 impl Client {
-    /// The outbox's send hook: every transport classifies its own failures, so the
-    /// queue's keep-or-dead-letter call survives the transport switch.
-    /// The HTTP transport answers a save with the memory alone, so it reports no candidates.
+    pub fn new(daemon: DaemonClient) -> Self {
+        Self(daemon)
+    }
+
+    /// The outbox's send hook: it classifies its own failures, so the queue's
+    /// keep-or-dead-letter call lives with the transport that produced the error.
     pub fn send_save(
         &self,
         id: &str,
         target: &SaveTarget,
     ) -> Result<Vec<LinkCandidateDto>, SendFailure> {
-        match self {
-            Self::Http(c) => match target {
-                SaveTarget::Memory { workspace, body } => c.save(workspace, id, body).map(drop),
-                SaveTarget::Preference { body } => c.save_preference(id, body).map(drop),
+        match target {
+            SaveTarget::Memory { workspace, body } => {
+                self.0
+                    .save(Origin::Workspace(workspace.clone()), id, body.clone())
             }
-            .map(|()| Vec::new())
-            .map_err(|e| SendFailure {
-                retryable: e.is_retryable(),
-                invalid: e.is_invalid_request(),
-                message: e.to_string(),
-            }),
-            Self::Daemon(d) => match target {
-                SaveTarget::Memory { workspace, body } => {
-                    d.save(Origin::Workspace(workspace.clone()), id, body.clone())
-                }
-                SaveTarget::Preference { body } => {
-                    d.save(Origin::Preference, id, preference_body(body.clone()))
-                }
+            SaveTarget::Preference { body } => {
+                self.0
+                    .save(Origin::Preference, id, preference_body(body.clone()))
             }
-            .map(|saved| saved.candidates)
-            .map_err(|e| SendFailure {
-                retryable: e.is_retryable(),
-                invalid: e.is_invalid_request(),
-                message: e.to_string(),
-            }),
         }
+        .map(|saved| saved.candidates)
+        .map_err(|e| SendFailure {
+            retryable: e.is_retryable(),
+            invalid: e.is_invalid_request(),
+            message: e.to_string(),
+        })
     }
 
     pub fn create_workspace(&self, name: &str) -> Result<String, String> {
-        match self {
-            Self::Http(c) => Ok(c.create_workspace(name).map_err(err)?.workspace),
-            Self::Daemon(d) => Ok(d.create_workspace(name).map_err(err)?.workspace),
-        }
+        Ok(self.0.create_workspace(name).map_err(err)?.workspace)
     }
 
     pub fn workspaces(&self) -> Result<Vec<String>, String> {
-        match self {
-            Self::Http(c) => c.workspaces().map_err(err),
-            Self::Daemon(d) => d.workspaces().map_err(err),
-        }
+        self.0.workspaces().map_err(err)
     }
 
-    /// The HTTP transport answers a save with the memory alone, so it reports no candidates.
     pub fn save(
         &self,
         workspace: &str,
         id: &str,
         body: &PutMemoryBody,
     ) -> Result<(MemoryDto, Vec<LinkCandidateDto>), String> {
-        match self {
-            Self::Http(c) => c
-                .save(workspace, id, body)
-                .map_err(err)
-                .map(|m| (m, vec![])),
-            Self::Daemon(d) => {
-                let saved = d
-                    .save(Origin::Workspace(workspace.to_string()), id, body.clone())
-                    .map_err(err)?;
-                Ok((saved.memory, saved.candidates))
-            }
-        }
+        let saved = self
+            .0
+            .save(Origin::Workspace(workspace.to_string()), id, body.clone())
+            .map_err(err)?;
+        Ok((saved.memory, saved.candidates))
     }
 
     pub fn save_preference(
@@ -107,18 +82,11 @@ impl Client {
         id: &str,
         body: &PutPreferenceBody,
     ) -> Result<(MemoryDto, Vec<LinkCandidateDto>), String> {
-        match self {
-            Self::Http(c) => c
-                .save_preference(id, body)
-                .map_err(err)
-                .map(|m| (m, vec![])),
-            Self::Daemon(d) => {
-                let saved = d
-                    .save(Origin::Preference, id, preference_body(body.clone()))
-                    .map_err(err)?;
-                Ok((saved.memory, saved.candidates))
-            }
-        }
+        let saved = self
+            .0
+            .save(Origin::Preference, id, preference_body(body.clone()))
+            .map_err(err)?;
+        Ok((saved.memory, saved.candidates))
     }
 
     pub fn edit(
@@ -127,67 +95,45 @@ impl Client {
         id: &str,
         body: &PatchMemoryBody,
     ) -> Result<MemoryDto, String> {
-        match self {
-            Self::Http(c) => c.edit(workspace, id, body).map_err(err),
-            Self::Daemon(d) => d
-                .edit(Origin::Workspace(workspace.to_string()), id, body.clone())
-                .map_err(err),
-        }
+        self.0
+            .edit(Origin::Workspace(workspace.to_string()), id, body.clone())
+            .map_err(err)
     }
 
     pub fn edit_preference(&self, id: &str, body: &PatchMemoryBody) -> Result<MemoryDto, String> {
-        match self {
-            Self::Http(c) => c.edit_preference(id, body).map_err(err),
-            Self::Daemon(d) => d.edit(Origin::Preference, id, body.clone()).map_err(err),
-        }
+        self.0
+            .edit(Origin::Preference, id, body.clone())
+            .map_err(err)
     }
 
     pub fn forget(&self, workspace: &str, id: &str) -> Result<(), String> {
-        match self {
-            Self::Http(c) => c.forget(workspace, id).map_err(err),
-            Self::Daemon(d) => d
-                .forget(Origin::Workspace(workspace.to_string()), id)
-                .map_err(err),
-        }
+        self.0
+            .forget(Origin::Workspace(workspace.to_string()), id)
+            .map_err(err)
     }
 
     pub fn forget_preference(&self, id: &str) -> Result<(), String> {
-        match self {
-            Self::Http(c) => c.forget_preference(id).map_err(err),
-            Self::Daemon(d) => d.forget(Origin::Preference, id).map_err(err),
-        }
+        self.0.forget(Origin::Preference, id).map_err(err)
     }
 
     pub fn get(&self, workspace: &str, id: &str) -> Result<MemoryDto, String> {
-        match self {
-            Self::Http(c) => c.get(workspace, id).map_err(err),
-            Self::Daemon(d) => d
-                .get(Origin::Workspace(workspace.to_string()), id)
-                .map_err(err),
-        }
+        self.0
+            .get(Origin::Workspace(workspace.to_string()), id)
+            .map_err(err)
     }
 
     pub fn get_preference(&self, id: &str) -> Result<MemoryDto, String> {
-        match self {
-            Self::Http(c) => c.get_preference(id).map_err(err),
-            Self::Daemon(d) => d.get(Origin::Preference, id).map_err(err),
-        }
+        self.0.get(Origin::Preference, id).map_err(err)
     }
 
     pub fn list(&self, workspace: &str) -> Result<Vec<MemoryDto>, String> {
-        match self {
-            Self::Http(c) => c.list(workspace).map_err(err),
-            Self::Daemon(d) => d
-                .list(Origin::Workspace(workspace.to_string()))
-                .map_err(err),
-        }
+        self.0
+            .list(Origin::Workspace(workspace.to_string()))
+            .map_err(err)
     }
 
     pub fn list_preferences(&self) -> Result<Vec<MemoryDto>, String> {
-        match self {
-            Self::Http(c) => c.list_preferences().map_err(err),
-            Self::Daemon(d) => d.list(Origin::Preference).map_err(err),
-        }
+        self.0.list(Origin::Preference).map_err(err)
     }
 
     pub fn search(
@@ -199,28 +145,16 @@ impl Client {
         all_workspaces: bool,
         links_in_scope: bool,
     ) -> Result<SearchResponse, String> {
-        match self {
-            Self::Http(c) => c
-                .search(
-                    workspace,
-                    query,
-                    scope,
-                    limit,
-                    all_workspaces,
-                    links_in_scope,
-                )
-                .map_err(err),
-            Self::Daemon(d) => d
-                .search(
-                    workspace,
-                    query,
-                    scope,
-                    limit,
-                    all_workspaces,
-                    links_in_scope,
-                )
-                .map_err(err),
-        }
+        self.0
+            .search(
+                workspace,
+                query,
+                scope,
+                limit,
+                all_workspaces,
+                links_in_scope,
+            )
+            .map_err(err)
     }
 
     pub fn context(
@@ -228,24 +162,15 @@ impl Client {
         workspace: &str,
         project: Option<&str>,
     ) -> Result<ContextResponse, String> {
-        match self {
-            Self::Http(c) => c.context(workspace, project).map_err(err),
-            Self::Daemon(d) => d.context(workspace, project).map_err(err),
-        }
+        self.0.context(workspace, project).map_err(err)
     }
 
     pub fn move_memory(&self, id: &str, body: &MoveBody) -> Result<MoveResponse, String> {
-        match self {
-            Self::Http(c) => c.move_memory(id, body).map_err(err),
-            Self::Daemon(d) => d.move_memory(id, body.clone()).map_err(err),
-        }
+        self.0.move_memory(id, body.clone()).map_err(err)
     }
 
     pub fn links(&self, workspace: &str, id: &str, depth: usize) -> Result<GraphDto, String> {
-        match self {
-            Self::Http(c) => c.links(workspace, id, depth).map_err(err),
-            Self::Daemon(d) => d.links(workspace, id, depth).map_err(err),
-        }
+        self.0.links(workspace, id, depth).map_err(err)
     }
 
     pub fn link(
@@ -255,10 +180,9 @@ impl Client {
         target: &str,
         relation: &str,
     ) -> Result<(), String> {
-        match self {
-            Self::Http(c) => c.link(workspace, source, target, relation).map_err(err),
-            Self::Daemon(d) => d.link(workspace, source, target, relation).map_err(err),
-        }
+        self.0
+            .link(workspace, source, target, relation)
+            .map_err(err)
     }
 
     pub fn retype_link(
@@ -268,33 +192,21 @@ impl Client {
         b: &str,
         relation: &str,
     ) -> Result<(), String> {
-        match self {
-            Self::Http(c) => c.retype_link(workspace, a, b, relation).map_err(err),
-            Self::Daemon(d) => d.retype_link(workspace, a, b, relation).map_err(err),
-        }
+        self.0.retype_link(workspace, a, b, relation).map_err(err)
     }
 
     pub fn unlink(&self, workspace: &str, a: &str, b: &str) -> Result<(), String> {
-        match self {
-            Self::Http(c) => c.unlink(workspace, a, b).map_err(err),
-            Self::Daemon(d) => d.unlink(workspace, a, b).map_err(err),
-        }
+        self.0.unlink(workspace, a, b).map_err(err)
     }
 
     pub fn export(&self, workspace: &str) -> Result<ExportDoc, String> {
-        match self {
-            Self::Http(c) => c.export(workspace).map_err(err),
-            Self::Daemon(d) => d
-                .export(Origin::Workspace(workspace.to_string()))
-                .map_err(err),
-        }
+        self.0
+            .export(Origin::Workspace(workspace.to_string()))
+            .map_err(err)
     }
 
     pub fn export_preferences(&self) -> Result<ExportDoc, String> {
-        match self {
-            Self::Http(c) => c.export_preferences().map_err(err),
-            Self::Daemon(d) => d.export(Origin::Preference).map_err(err),
-        }
+        self.0.export(Origin::Preference).map_err(err)
     }
 
     pub fn import(
@@ -303,20 +215,14 @@ impl Client {
         merge: bool,
         doc: &ExportDoc,
     ) -> Result<ImportReport, String> {
-        match self {
-            Self::Http(c) => c.import(workspace, merge, doc).map_err(err),
-            Self::Daemon(d) => d
-                .import(Origin::Workspace(workspace.to_string()), merge, doc.clone())
-                .map_err(err),
-        }
+        self.0
+            .import(Origin::Workspace(workspace.to_string()), merge, doc.clone())
+            .map_err(err)
     }
 
     pub fn import_preferences(&self, merge: bool, doc: &ExportDoc) -> Result<ImportReport, String> {
-        match self {
-            Self::Http(c) => c.import_preferences(merge, doc).map_err(err),
-            Self::Daemon(d) => d
-                .import(Origin::Preference, merge, doc.clone())
-                .map_err(err),
-        }
+        self.0
+            .import(Origin::Preference, merge, doc.clone())
+            .map_err(err)
     }
 }

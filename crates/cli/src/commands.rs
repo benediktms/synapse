@@ -7,7 +7,6 @@ use api::{
     ExportDoc, MemoryDto, MoveBody, Origin, PatchMemoryBody, PutMemoryBody, PutPreferenceBody,
     SearchResponse, limits,
 };
-use api_client::SynapseApiClient;
 use daemon_client::{DaemonClient, DaemonConfig, ScopedOrg};
 use domain::MemoryId;
 
@@ -17,7 +16,7 @@ use crate::args::{
     StoreArgs, SupersedeArgs, SyncArgs, WorkspaceArgs, WorkspaceCommand,
 };
 use crate::client::Client;
-use crate::config::{Config, OrgRule, Transport, WorkspaceRule};
+use crate::config::{Config, OrgRule, WorkspaceRule};
 use crate::git::GitFacts;
 use crate::outbox::{FlushReport, Outbox, PendingSave, SaveTarget, now_millis};
 use crate::output;
@@ -65,7 +64,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Command::Workspace(command) => workspace(&ctx, command),
         Command::Export(args) => export(&ctx, args),
         Command::Import(args) => import(&ctx, args),
-        Command::Config(command) => set_config(ctx.config, command),
+        Command::Config(command) => set_config(command),
         Command::Setup => setup(&ctx),
         Command::Sync(args) => sync(&ctx, args),
         Command::Status => status(&ctx),
@@ -83,15 +82,7 @@ struct Context {
 
 impl Context {
     fn client(&self, timeout: Duration) -> Result<Client, String> {
-        match self.config.transport() {
-            Transport::Http => Ok(Client::Http(self.http_client(timeout)?)),
-            Transport::Daemon => Ok(Client::Daemon(self.daemon_client(timeout, true)?)),
-        }
-    }
-
-    fn http_client(&self, timeout: Duration) -> Result<SynapseApiClient, String> {
-        SynapseApiClient::new(self.config.url(), self.config.token()?, timeout)
-            .map_err(|e| e.to_string())
+        Ok(Client::new(self.daemon_client(timeout, true)?))
     }
 
     /// Spawn-on-demand: a dead daemon is started detached and polled until it answers.
@@ -136,8 +127,6 @@ impl Context {
 /// Read commands drain the outbox first so a queued save becomes recallable at the first
 /// opportunity; an outage here must not fail the read, but it must not pass unmentioned
 /// either — whatever stays queued is missing from what the read is about to print.
-/// The flush targets whichever transport is active, so saves queued under one transport
-/// still land after a switch.
 fn flush_before_read(ctx: &Context) {
     let Ok(outbox) = Outbox::open() else {
         return;
@@ -790,32 +779,13 @@ fn import(ctx: &Context, args: ImportArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn set_config(mut config: Config, command: ConfigCommand) -> Result<(), String> {
-    match command {
-        ConfigCommand::SetToken { token } => {
-            config.token = Some(token);
-            config.save()?;
-            println!("token stored in {}", crate::config::config_path().display());
-        }
-        ConfigCommand::SetUrl { url } => {
-            config.url = Some(api_client::parse_base_url(&url)?);
-            config.save()?;
-            println!(
-                "server url set to {} in {}",
-                config.url(),
-                crate::config::config_path().display()
-            );
-        }
-        ConfigCommand::SetTransport { transport } => {
-            config.transport = Some(match transport.as_str() {
-                "daemon" => Transport::Daemon,
-                _ => Transport::Http,
-            });
-            config.save()?;
-            println!("transport set to {transport}");
-        }
-    }
-    Ok(())
+fn set_config(command: ConfigCommand) -> Result<(), String> {
+    Err(format!(
+        "syn config {} configured the retired HTTP server. The daemon needs no url, token or \
+         transport — it reaches Turso with the org tokens `syn setup` stores. Nothing to do; \
+         remove the call.",
+        command.retired_flag()
+    ))
 }
 
 /// `syn setup` — configure both sides of a replicated installation: the Turso orgs
@@ -920,7 +890,6 @@ fn configure_workspace_routing(
     mut ask: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<Config, String> {
     let mut config = existing.clone();
-    config.transport = Some(Transport::Daemon);
     let default = match existing
         .default_workspace
         .as_deref()
@@ -1050,14 +1019,7 @@ fn prompt_secret(label: &str) -> Result<String, String> {
     Ok(line.trim().to_string())
 }
 
-/// The transport check comes before any client is built, so a missing HTTP token can
-/// never hijack the error with a set-token hint for a transport the user is not on.
-fn require_daemon(ctx: &Context, what: &str) -> Result<DaemonClient, String> {
-    if ctx.config.transport() != Transport::Daemon {
-        return Err(format!(
-            "{what} acts on the replication daemon; run: syn config set-transport daemon"
-        ));
-    }
+fn require_daemon(ctx: &Context, _what: &str) -> Result<DaemonClient, String> {
     ctx.daemon_client(WRITE_TIMEOUT, true)
 }
 
@@ -1115,7 +1077,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::{age, configure_workspace_routing};
-    use crate::config::{Config, Transport};
+    use crate::config::Config;
 
     #[test]
     fn age_reads_in_the_largest_useful_unit() {
@@ -1147,7 +1109,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.transport, Some(Transport::Daemon));
         assert_eq!(config.default_workspace.as_deref(), Some("work"));
         let routes: Vec<_> = config
             .org_rules
@@ -1185,7 +1146,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.transport, Some(Transport::Daemon));
         assert_eq!(config.default_workspace.as_deref(), Some("personal"));
         assert_eq!(config.org_rules.len(), 1);
         assert_eq!(config.org_rules[0].org, "benediktms");
