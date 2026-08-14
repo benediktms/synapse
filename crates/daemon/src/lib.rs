@@ -1,6 +1,8 @@
 pub mod app;
 pub mod config;
 pub mod maintenance;
+#[cfg(test)]
+mod ops_tests;
 pub mod rpc;
 pub mod single_instance;
 pub mod update;
