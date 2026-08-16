@@ -1,0 +1,30 @@
+[package]
+name = "shell-bench"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+devtools = [
+    "dep:adapters-fastembed",
+    "dep:adapters-libsql",
+    "dep:clap",
+    "dep:domain",
+    "dep:libsql",
+    "dep:serde_json",
+    "dep:tokio",
+]
+
+[[bin]]
+name = "recall-bench"
+path = "src/main.rs"
+required-features = ["devtools"]
+
+[dependencies]
+adapters-fastembed = { path = "../adapters-fastembed", optional = true }
+adapters-libsql = { path = "../adapters-libsql", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+domain = { path = "../domain", optional = true }
+libsql = { version = "0.9", optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"], optional = true }
