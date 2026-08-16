@@ -9,11 +9,10 @@ const FILLER: &[&str] = &[
     "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "him", "his",
     "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just", "me", "more", "most",
     "my", "myself", "of", "off", "on", "once", "one", "only", "or", "other", "ought", "our",
-    "ours",
-    "out", "over", "she", "should", "so", "some", "such", "than", "that", "the", "their", "theirs",
-    "them", "then", "there", "these", "they", "this", "those", "through", "to", "too", "under",
-    "until", "up", "us", "very", "was", "we", "were", "what", "when", "where", "which", "while",
-    "who", "whom", "why", "will", "with", "would", "you", "your", "yours",
+    "ours", "out", "over", "she", "should", "so", "some", "such", "than", "that", "the", "their",
+    "theirs", "them", "then", "there", "these", "they", "this", "those", "through", "to", "too",
+    "under", "until", "up", "us", "very", "was", "we", "were", "what", "when", "where", "which",
+    "while", "who", "whom", "why", "will", "with", "would", "you", "your", "yours",
 ];
 
 /// The part of a query that can tell one memory from another.
