@@ -6,6 +6,7 @@ use crate::fusion::rrf_scores;
 use crate::links::{Link, Relation};
 use crate::memory::{Importance, Memory, MemoryId, MemoryKind, Scope, Timestamp};
 use crate::ports::{Embedder, ScopeFilter, Store};
+use crate::query::content_terms;
 use crate::workspace::Workspace;
 
 pub const MIN_VECTOR_SIMILARITY: f32 = 0.65;
@@ -660,7 +661,10 @@ pub async fn recall<S: Store, E: Embedder>(
     shared: Option<(&Workspace, &S)>,
     req: &RecallRequest,
 ) -> Result<Vec<RecallHit>, Error> {
-    let query_vec = embedder.embed(&req.query).await?;
+    let Some(query) = content_terms(&req.query) else {
+        return Ok(Vec::new());
+    };
+    let query_vec = embedder.embed(&query).await?;
     let filter = ScopeFilter {
         project: req.project.clone(),
     };
@@ -671,7 +675,7 @@ pub async fn recall<S: Store, E: Embedder>(
     hybrid_search(
         &sides,
         &query_vec,
-        &req.query,
+        &query,
         &filter,
         req.limit.clamp(1, RECALL_LIMIT_CAP),
         req.links_in_scope,
@@ -684,7 +688,10 @@ pub async fn recall_grouped<S: Store, E: Embedder>(
     workspaces: &[(Workspace, &S)],
     req: &RecallRequest,
 ) -> Result<Vec<WorkspaceHits>, Error> {
-    let query_vec = embedder.embed(&req.query).await?;
+    let Some(query) = content_terms(&req.query) else {
+        return Ok(Vec::new());
+    };
+    let query_vec = embedder.embed(&query).await?;
     let filter = ScopeFilter {
         project: req.project.clone(),
     };
@@ -696,7 +703,7 @@ pub async fn recall_grouped<S: Store, E: Embedder>(
         let hits = hybrid_search(
             &[(workspace, *store)],
             &query_vec,
-            &req.query,
+            &query,
             &filter,
             limit,
             req.links_in_scope,
@@ -1570,6 +1577,35 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(hit_ids(&hits), vec![mid(1), mid(2), mid(3), mid(4)]);
+    }
+
+    #[test]
+    fn a_query_of_pure_filler_recalls_nothing_without_reaching_the_store() {
+        let work_ws = Workspace::new("work").unwrap();
+        let work = FakeStore::new();
+        work.seed(
+            mem(
+                1,
+                "deploy staging on friday",
+                MemoryKind::Project,
+                Scope::Workspace,
+                false,
+            ),
+            vec![1.0, 0.0],
+        );
+        let hits = block_on(recall(
+            &FakeEmbedder::new(),
+            (&work_ws, &work),
+            None,
+            &RecallRequest {
+                query: "what about that one over there".to_string(),
+                project: None,
+                limit: 10,
+                links_in_scope: false,
+            },
+        ))
+        .unwrap();
+        assert!(hits.is_empty(), "{hits:?}");
     }
 
     #[test]

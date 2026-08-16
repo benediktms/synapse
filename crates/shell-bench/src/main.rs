@@ -3,7 +3,7 @@ use adapters_libsql::LibsqlStore;
 use clap::{Parser, ValueEnum};
 use domain::{
     Embedder, Importance, MIN_VECTOR_SIMILARITY, Memory, MemoryId, MemoryKind, RecallRequest,
-    Scope, ScopeFilter, Store, Timestamp, Workspace, embed_text, recall,
+    Scope, ScopeFilter, Store, Timestamp, Workspace, content_terms, embed_text, recall,
 };
 use std::{
     collections::HashSet,
@@ -40,6 +40,10 @@ struct Args {
     /// Print a line per query.
     #[arg(long)]
     verbose: bool,
+
+    /// Print the raw lane scores per query instead of scoring, to inspect the distributions.
+    #[arg(long)]
+    scores: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -103,7 +107,62 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    if args.scores {
+        return dump_scores(&args, &store, &embedder, &corpus).await;
+    }
+
     score(&args, &store, &embedder, &corpus).await
+}
+
+async fn dump_scores(
+    args: &Args,
+    store: &LibsqlStore,
+    embedder: &FastEmbedder,
+    corpus: &Corpus,
+) -> Result<(), Box<dyn Error>> {
+    let filter = ScopeFilter { project: None };
+    for query in &corpus.queries {
+        let query_vec = embedder.embed(&query.text).await?;
+        let vector = store
+            .vector_search(&query_vec, &filter, args.limit)
+            .await?
+            .into_iter()
+            .map(|hit| hit.similarity as f64)
+            .collect::<Vec<_>>();
+        let keyword = store
+            .keyword_search(&query.text, &filter, args.limit)
+            .await?
+            .into_iter()
+            .map(|hit| hit.rank)
+            .collect::<Vec<_>>();
+        let class = if query.expects_hits {
+            query.topic.as_str()
+        } else {
+            "[noise]"
+        };
+        println!("{class}\t{}", query.text);
+        println!("\tvec\t{}", spread(&vector));
+        println!("\tkw\t{}", spread(&keyword));
+    }
+    Ok(())
+}
+
+fn spread(scores: &[f64]) -> String {
+    let Some(&top) = scores.first() else {
+        return "n=0".to_string();
+    };
+    let last = scores[scores.len() - 1];
+    let drop = if top == 0.0 {
+        0.0
+    } else {
+        (top - last) / top.abs()
+    };
+    let listed = scores
+        .iter()
+        .map(|value| format!("{value:.3}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("n={} drop={drop:+.3} [{listed}]", scores.len())
 }
 
 async fn read_corpus(path: &Path) -> Result<Corpus, Box<dyn Error>> {
@@ -255,6 +314,9 @@ async fn search(
     limit: usize,
 ) -> Result<Vec<MemoryId>, Box<dyn Error>> {
     let filter = ScopeFilter { project: None };
+    let Some(terms) = content_terms(query) else {
+        return Ok(Vec::new());
+    };
     match lane {
         Lane::Both => {
             let req = RecallRequest {
@@ -270,7 +332,7 @@ async fn search(
                 .collect())
         }
         Lane::Vector => {
-            let query_vec = embedder.embed(query).await?;
+            let query_vec = embedder.embed(&terms).await?;
             Ok(store
                 .vector_search(&query_vec, &filter, limit)
                 .await?
@@ -280,7 +342,7 @@ async fn search(
                 .collect())
         }
         Lane::Keyword => Ok(store
-            .keyword_search(query, &filter, limit)
+            .keyword_search(&terms, &filter, limit)
             .await?
             .into_iter()
             .map(|hit| hit.id)

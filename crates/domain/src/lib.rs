@@ -5,6 +5,7 @@ mod fusion;
 mod links;
 mod memory;
 mod ports;
+mod query;
 mod similarity;
 mod usecases;
 mod workspace;
@@ -19,6 +20,7 @@ pub use memory::{
     short_form,
 };
 pub use ports::{Embedder, KeywordHit, ScopeFilter, Store, VectorHit};
+pub use query::content_terms;
 pub use similarity::cosine_similarity;
 pub use usecases::{
     ContextDigest, DIGEST_ENTRY_BUDGET, DigestEntry, EditRequest, GRAPH_EDGE_BUDGET,
