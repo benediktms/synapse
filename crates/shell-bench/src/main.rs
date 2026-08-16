@@ -3,10 +3,9 @@ use adapters_libsql::LibsqlStore;
 use clap::{Parser, ValueEnum};
 use domain::{
     Embedder, Importance, MIN_VECTOR_SIMILARITY, Memory, MemoryId, MemoryKind, RecallRequest,
-    Scope, ScopeFilter, Store, Timestamp, Workspace, cosine_similarity, embed_text, recall,
+    Scope, ScopeFilter, Store, Timestamp, Workspace, embed_text, recall,
 };
 use std::{
-    cmp::Ordering,
     collections::HashSet,
     error::Error,
     path::{Path, PathBuf},
@@ -93,10 +92,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if fresh {
         seed(&store, &embedder, &corpus.docs).await?;
     } else {
-        let held = store
-            .embeddings(&ScopeFilter { project: None })
-            .await?
-            .len();
+        let held = store.list().await?.len();
         if held != corpus.docs.len() {
             return Err(format!(
                 "{} holds {held} memories but the corpus has {}; pass --reseed",
@@ -275,22 +271,20 @@ async fn search(
         }
         Lane::Vector => {
             let query_vec = embedder.embed(query).await?;
-            let mut pool: Vec<(MemoryId, f32)> = store
-                .embeddings(&filter)
+            Ok(store
+                .vector_search(&query_vec, &filter, limit)
                 .await?
                 .into_iter()
-                .map(|(id, embedding)| (id, cosine_similarity(&query_vec, &embedding)))
-                .filter(|(_, score)| *score >= MIN_VECTOR_SIMILARITY)
-                .collect();
-            pool.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            pool.truncate(limit);
-            Ok(pool.into_iter().map(|(id, _)| id).collect())
+                .filter(|hit| hit.similarity >= MIN_VECTOR_SIMILARITY)
+                .map(|hit| hit.id)
+                .collect())
         }
-        Lane::Keyword => Ok(store.keyword_search(query, &filter, limit).await?),
+        Lane::Keyword => Ok(store
+            .keyword_search(query, &filter, limit)
+            .await?
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect()),
     }
 }
 

@@ -18,7 +18,7 @@ pub use memory::{
     Importance, Memory, MemoryId, MemoryKind, Scope, TITLE_MAX_CHARS, Timestamp, embed_text,
     short_form,
 };
-pub use ports::{Embedder, ScopeFilter, Store};
+pub use ports::{Embedder, KeywordHit, ScopeFilter, Store, VectorHit};
 pub use similarity::cosine_similarity;
 pub use usecases::{
     ContextDigest, DIGEST_ENTRY_BUDGET, DigestEntry, EditRequest, GRAPH_EDGE_BUDGET,

@@ -6,7 +6,6 @@ use crate::fusion::rrf_scores;
 use crate::links::{Link, Relation};
 use crate::memory::{Importance, Memory, MemoryId, MemoryKind, Scope, Timestamp};
 use crate::ports::{Embedder, ScopeFilter, Store};
-use crate::similarity::cosine_similarity;
 use crate::workspace::Workspace;
 
 pub const MIN_VECTOR_SIMILARITY: f32 = 0.65;
@@ -111,20 +110,12 @@ async fn link_candidates<S: Store>(
         },
     };
     let mut scored: Vec<(MemoryId, f32)> = store
-        .embeddings(&filter)
+        .vector_search(embedding, &filter, LINK_CANDIDATE_CAP + 1)
         .await?
         .into_iter()
-        .map(|(id, other)| {
-            let similarity = cosine_similarity(embedding, &other);
-            (id, similarity)
-        })
-        .filter(|(id, similarity)| *similarity >= LINK_CANDIDATE_SIMILARITY && *id != memory.id)
+        .filter(|hit| hit.similarity >= LINK_CANDIDATE_SIMILARITY && hit.id != memory.id)
+        .map(|hit| (hit.id, hit.similarity))
         .collect();
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
     scored.truncate(LINK_CANDIDATE_CAP);
 
     let mut candidates = Vec::new();
@@ -732,11 +723,13 @@ async fn hybrid_search<S: Store>(
     let mut origin: HashMap<MemoryId, usize> = HashMap::new();
     let mut vector_pool: Vec<(MemoryId, f32)> = Vec::new();
     for (side_idx, (_, store)) in sides.iter().enumerate() {
-        for (id, embedding) in store.embeddings(filter).await? {
-            let score = cosine_similarity(query_vec, &embedding);
-            if score >= MIN_VECTOR_SIMILARITY {
-                origin.entry(id.clone()).or_insert(side_idx);
-                vector_pool.push((id, score));
+        for hit in store
+            .vector_search(query_vec, filter, CANDIDATE_DEPTH)
+            .await?
+        {
+            if hit.similarity >= MIN_VECTOR_SIMILARITY {
+                origin.entry(hit.id.clone()).or_insert(side_idx);
+                vector_pool.push((hit.id, hit.similarity));
             }
         }
     }
@@ -749,9 +742,11 @@ async fn hybrid_search<S: Store>(
 
     let mut lists: Vec<Vec<MemoryId>> = vec![vector_pool.into_iter().map(|(id, _)| id).collect()];
     for (side_idx, (_, store)) in sides.iter().enumerate() {
-        let ids = store.keyword_search(query, filter, CANDIDATE_DEPTH).await?;
-        for id in &ids {
-            origin.entry(id.clone()).or_insert(side_idx);
+        let keyword_hits = store.keyword_search(query, filter, CANDIDATE_DEPTH).await?;
+        let mut ids = Vec::with_capacity(keyword_hits.len());
+        for hit in keyword_hits {
+            origin.entry(hit.id.clone()).or_insert(side_idx);
+            ids.push(hit.id);
         }
         lists.push(ids);
     }

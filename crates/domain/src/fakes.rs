@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use crate::error::Error;
 use crate::links::Link;
 use crate::memory::{Memory, MemoryId, Timestamp};
-use crate::ports::{Embedder, ScopeFilter, Store};
+use crate::ports::{Embedder, KeywordHit, ScopeFilter, Store, VectorHit};
 use crate::usecases::EditRequest;
 
 #[derive(Default)]
@@ -139,17 +139,31 @@ impl Store for FakeStore {
             .collect())
     }
 
-    async fn embeddings(&self, filter: &ScopeFilter) -> Result<Vec<(MemoryId, Vec<f32>)>, Error> {
-        let mut out: Vec<(MemoryId, Vec<f32>)> = self
+    async fn vector_search(
+        &self,
+        embedding: &[f32],
+        filter: &ScopeFilter,
+        limit: usize,
+    ) -> Result<Vec<VectorHit>, Error> {
+        let mut hits: Vec<VectorHit> = self
             .rows
             .lock()
             .unwrap()
             .values()
             .filter(|(memory, _)| filter.matches(&memory.scope))
-            .map(|(memory, embedding)| (memory.id.clone(), embedding.clone()))
+            .map(|(memory, stored)| VectorHit {
+                id: memory.id.clone(),
+                similarity: crate::similarity::cosine_similarity(embedding, stored),
+            })
             .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(out)
+        hits.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     async fn keyword_search(
@@ -157,7 +171,7 @@ impl Store for FakeStore {
         query: &str,
         filter: &ScopeFilter,
         limit: usize,
-    ) -> Result<Vec<MemoryId>, Error> {
+    ) -> Result<Vec<KeywordHit>, Error> {
         let query_tokens = tokenize(query);
         let mut scored: Vec<(usize, Memory)> = self
             .rows
@@ -181,7 +195,13 @@ impl Store for FakeStore {
                 .then_with(|| a.1.id.cmp(&b.1.id))
         });
         scored.truncate(limit);
-        Ok(scored.into_iter().map(|(_, memory)| memory.id).collect())
+        Ok(scored
+            .into_iter()
+            .map(|(overlap, memory)| KeywordHit {
+                id: memory.id,
+                rank: -(overlap as f64),
+            })
+            .collect())
     }
 
     async fn insert_link(&self, link: &Link) -> Result<(), Error> {
