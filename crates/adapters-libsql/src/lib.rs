@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use domain::{
-    EditRequest, Error, Link, Memory, MemoryId, MemoryKind, Relation, Scope, ScopeFilter, Store,
-    Timestamp, trim_keyword_tail,
+    EditRequest, Error, KeywordHit, Link, Memory, MemoryId, MemoryKind, Relation, Scope,
+    ScopeFilter, Store, Timestamp, VectorHit, cosine_similarity, trim_keyword_tail,
 };
 use libsql::{Builder, Connection, Database, Value, params};
 
@@ -497,7 +497,12 @@ impl Store for LibsqlStore {
         Ok(out)
     }
 
-    async fn embeddings(&self, filter: &ScopeFilter) -> Result<Vec<(MemoryId, Vec<f32>)>, Error> {
+    async fn vector_search(
+        &self,
+        embedding: &[f32],
+        filter: &ScopeFilter,
+        limit: usize,
+    ) -> Result<Vec<VectorHit>, Error> {
         let conn = self.conn()?;
         let project = filter.project.as_deref().unwrap_or("");
         let stmt = conn
@@ -505,13 +510,23 @@ impl Store for LibsqlStore {
             .await
             .map_err(store_err)?;
         let mut rows = stmt.query(params![project]).await.map_err(store_err)?;
-        let mut out = Vec::new();
+        let mut hits = Vec::new();
         while let Some(row) = rows.next().await.map_err(store_err)? {
             let id = MemoryId::parse(&row.get::<String>(0).map_err(store_err)?)?;
-            let embedding = decode_embedding(&row.get::<Vec<u8>>(1).map_err(store_err)?, self.dim)?;
-            out.push((id, embedding));
+            let stored = decode_embedding(&row.get::<Vec<u8>>(1).map_err(store_err)?, self.dim)?;
+            hits.push(VectorHit {
+                id,
+                similarity: cosine_similarity(embedding, &stored),
+            });
         }
-        Ok(out)
+        hits.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     async fn keyword_search(
@@ -519,7 +534,7 @@ impl Store for LibsqlStore {
         query: &str,
         filter: &ScopeFilter,
         limit: usize,
-    ) -> Result<Vec<MemoryId>, Error> {
+    ) -> Result<Vec<KeywordHit>, Error> {
         let Some(fts_query) = escape_fts_query(query) else {
             return Ok(Vec::new());
         };
@@ -546,7 +561,10 @@ impl Store for LibsqlStore {
             hits.push((id, row.get::<f64>(1).map_err(store_err)?));
         }
         trim_keyword_tail(&mut hits, query);
-        Ok(hits.into_iter().map(|(id, _)| id).collect())
+        Ok(hits
+            .into_iter()
+            .map(|(id, rank)| KeywordHit { id, rank })
+            .collect())
     }
 
     async fn insert_link(&self, link: &Link) -> Result<(), Error> {
@@ -1167,7 +1185,7 @@ mod tests {
             .keyword_search("deploy", &ScopeFilter::default(), 10)
             .await
             .unwrap();
-        assert_eq!(hits, vec![memory.id.clone()]);
+        assert_eq!(ids(hits), vec![memory.id.clone()]);
 
         let unrelated = Memory {
             id: MemoryId::parse("m_0000000000000000000001").unwrap(),
@@ -1189,7 +1207,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            hits,
+            ids(hits),
             vec![memory.id.clone()],
             "a row matching one term of three is noise, not a hit"
         );
@@ -1275,6 +1293,171 @@ mod tests {
         assert_eq!(embedding, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
+    fn ids(hits: Vec<KeywordHit>) -> Vec<MemoryId> {
+        hits.into_iter().map(|hit| hit.id).collect()
+    }
+
+    async fn store_with(rows: &[(&str, [f32; 4], Scope)]) -> (tempfile::TempDir, LibsqlStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = libsql::Builder::new_local(dir.path().join("s.db"))
+            .build()
+            .await
+            .unwrap();
+        let store = LibsqlStore::init(db, "test-model", 4).await.unwrap();
+        for (id, embedding, scope) in rows {
+            let memory = Memory {
+                id: MemoryId::parse(id).unwrap(),
+                content: format!("body of {id}"),
+                title: String::new(),
+                kind: MemoryKind::parse("reference").unwrap(),
+                scope: scope.clone(),
+                tags: Vec::new(),
+                pinned: false,
+                importance: domain::Importance::from_rank(1),
+                created_at: Timestamp::new("2026-08-07T00:00:00Z".to_string()),
+                updated_at: Timestamp::new("2026-08-07T00:00:00Z".to_string()),
+            };
+            store.insert(&memory, embedding).await.unwrap();
+        }
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn vector_search_orders_by_similarity_and_honours_the_limit() {
+        let (_dir, store) = store_with(&[
+            (
+                "m_0000000000000000000001",
+                [1.0, 0.0, 0.0, 0.0],
+                Scope::Workspace,
+            ),
+            (
+                "m_0000000000000000000002",
+                [0.0, 1.0, 0.0, 0.0],
+                Scope::Workspace,
+            ),
+            (
+                "m_0000000000000000000003",
+                [0.7, 0.7, 0.0, 0.0],
+                Scope::Workspace,
+            ),
+        ])
+        .await;
+
+        let hits = store
+            .vector_search(&[1.0, 0.0, 0.0, 0.0], &ScopeFilter::default(), 10)
+            .await
+            .unwrap();
+        let order: Vec<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "m_0000000000000000000001",
+                "m_0000000000000000000003",
+                "m_0000000000000000000002"
+            ],
+            "hits arrive best-first by cosine"
+        );
+        assert!(
+            hits[0].similarity > hits[1].similarity && hits[1].similarity > hits[2].similarity,
+            "the similarity travels with the hit: {hits:?}"
+        );
+
+        let capped = store
+            .vector_search(&[1.0, 0.0, 0.0, 0.0], &ScopeFilter::default(), 2)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 2, "the limit is the number of hits returned");
+    }
+
+    #[tokio::test]
+    async fn vector_search_returns_matches_below_any_threshold_the_domain_might_apply() {
+        let (_dir, store) = store_with(&[(
+            "m_0000000000000000000001",
+            [-1.0, 0.0, 0.0, 0.0],
+            Scope::Workspace,
+        )])
+        .await;
+
+        let hits = store
+            .vector_search(&[1.0, 0.0, 0.0, 0.0], &ScopeFilter::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the store applies no floor of its own");
+        assert!(
+            hits[0].similarity < 0.0,
+            "an opposed vector still comes back, for the domain to reject: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_search_honours_the_scope_filter() {
+        let (_dir, store) = store_with(&[
+            (
+                "m_0000000000000000000001",
+                [1.0, 0.0, 0.0, 0.0],
+                Scope::Workspace,
+            ),
+            (
+                "m_0000000000000000000002",
+                [1.0, 0.0, 0.0, 0.0],
+                Scope::parse("acme/alpha").unwrap(),
+            ),
+            (
+                "m_0000000000000000000003",
+                [1.0, 0.0, 0.0, 0.0],
+                Scope::parse("acme/beta").unwrap(),
+            ),
+        ])
+        .await;
+
+        let filter = ScopeFilter {
+            project: Some("acme/alpha".to_string()),
+        };
+        let hits = store
+            .vector_search(&[1.0, 0.0, 0.0, 0.0], &filter, 10)
+            .await
+            .unwrap();
+        let order: Vec<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["m_0000000000000000000001", "m_0000000000000000000002"],
+            "workspace scope plus the named project, never another project"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyword_search_carries_the_bm25_rank_in_the_order_it_returns_ids() {
+        let (_dir, store) = store_with(&[]).await;
+        for (id, content) in [
+            ("m_0000000000000000000001", "deploy staging deploy staging"),
+            ("m_0000000000000000000002", "deploy once in passing here"),
+        ] {
+            let memory = Memory {
+                id: MemoryId::parse(id).unwrap(),
+                content: content.to_string(),
+                title: String::new(),
+                kind: MemoryKind::parse("reference").unwrap(),
+                scope: Scope::Workspace,
+                tags: Vec::new(),
+                pinned: false,
+                importance: domain::Importance::from_rank(1),
+                created_at: Timestamp::new("2026-08-07T00:00:00Z".to_string()),
+                updated_at: Timestamp::new("2026-08-07T00:00:00Z".to_string()),
+            };
+            store.insert(&memory, &[0.1, 0.2, 0.3, 0.4]).await.unwrap();
+        }
+
+        let hits = store
+            .keyword_search("deploy", &ScopeFilter::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "both rows match: {hits:?}");
+        assert!(
+            hits[0].rank <= hits[1].rank,
+            "bm25 is negative and the stronger match is more negative: {hits:?}"
+        );
+    }
+
     async fn indexed_rows(store: &LibsqlStore) -> i64 {
         let conn = store.conn().unwrap();
         let stmt = conn
@@ -1308,10 +1491,10 @@ mod tests {
 
         assert_eq!(indexed_rows(&store).await, 1);
         assert_eq!(
-            store
+            ids(store
                 .keyword_search("deploy", &ScopeFilter::default(), 10)
                 .await
-                .unwrap(),
+                .unwrap()),
             vec![memory.id]
         );
     }
