@@ -47,3 +47,7 @@ agents-dry:
 # tail the daemon's log
 logs *args:
     syn daemon logs {{ args }}
+
+# score recall against a labelled synthetic corpus, e.g. `just bench --corpus path/to/synthetic.db`
+bench *args:
+    cargo run --release --quiet -p shell-bench --features devtools --bin recall-bench -- {{ args }}

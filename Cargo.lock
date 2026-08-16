@@ -2945,6 +2945,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell-bench"
+version = "0.1.0"
+dependencies = [
+ "adapters-fastembed",
+ "adapters-libsql",
+ "clap",
+ "domain",
+ "libsql",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
